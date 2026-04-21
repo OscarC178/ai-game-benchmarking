@@ -1,0 +1,621 @@
+<!-- REBUILT by Ross — replacing low-score build -->
+<!-- Tetris | spec:run6-gpt-gemini | built-by:ross-subagent -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Tetris</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #111111; display: flex; justify-content: center; align-items: center; min-height: 100vh; overflow: hidden; }
+  canvas { display: block; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="c" width="800" height="600"></canvas>
+<script>
+'use strict';
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+// ════════════════════════════════════════════════════════════════════════════
+// CONSTANTS
+// ════════════════════════════════════════════════════════════════════════════
+const COLS = 10, ROWS = 20, CS = 28; // cell size
+const PF_X = 240, PF_Y = 20;
+const PF_W = COLS * CS, PF_H = ROWS * CS;
+
+const COLORS = {
+  I: '#00FFFF', O: '#FFFF00', T: '#AA00FF',
+  S: '#00FF00', Z: '#FF0000', J: '#0000FF', L: '#FF8800'
+};
+
+// Piece shapes: 4 rotations, each an array of [col, row] offsets (0-indexed in a 4x4 box)
+const SHAPES = {
+  I: [
+    [[0,1],[1,1],[2,1],[3,1]],
+    [[2,0],[2,1],[2,2],[2,3]],
+    [[0,2],[1,2],[2,2],[3,2]],
+    [[1,0],[1,1],[1,2],[1,3]]
+  ],
+  O: [
+    [[1,0],[2,0],[1,1],[2,1]],
+    [[1,0],[2,0],[1,1],[2,1]],
+    [[1,0],[2,0],[1,1],[2,1]],
+    [[1,0],[2,0],[1,1],[2,1]]
+  ],
+  T: [
+    [[1,0],[0,1],[1,1],[2,1]],
+    [[1,0],[1,1],[2,1],[1,2]],
+    [[0,1],[1,1],[2,1],[1,2]],
+    [[1,0],[0,1],[1,1],[1,2]]
+  ],
+  S: [
+    [[1,0],[2,0],[0,1],[1,1]],
+    [[1,0],[1,1],[2,1],[2,2]],
+    [[1,1],[2,1],[0,2],[1,2]],
+    [[0,0],[0,1],[1,1],[1,2]]
+  ],
+  Z: [
+    [[0,0],[1,0],[1,1],[2,1]],
+    [[2,0],[1,1],[2,1],[1,2]],
+    [[0,1],[1,1],[1,2],[2,2]],
+    [[1,0],[0,1],[1,1],[0,2]]
+  ],
+  J: [
+    [[0,0],[0,1],[1,1],[2,1]],
+    [[1,0],[2,0],[1,1],[1,2]],
+    [[0,1],[1,1],[2,1],[2,2]],
+    [[1,0],[1,1],[0,2],[1,2]]
+  ],
+  L: [
+    [[2,0],[0,1],[1,1],[2,1]],
+    [[1,0],[1,1],[1,2],[2,2]],
+    [[0,1],[1,1],[2,1],[0,2]],
+    [[0,0],[1,0],[1,1],[1,2]]
+  ]
+};
+const TYPES = ['I','O','T','S','Z','J','L'];
+
+// SRS wall kick data: [fromRot][kick index] = [dx, dy]
+const WK_STANDARD = {
+  '0-1': [[0,0],[-1,0],[-1,1],[0,-2],[-1,-2]],
+  '1-0': [[0,0],[1,0],[1,-1],[0,2],[1,2]],
+  '1-2': [[0,0],[1,0],[1,-1],[0,2],[1,2]],
+  '2-1': [[0,0],[-1,0],[-1,1],[0,-2],[-1,-2]],
+  '2-3': [[0,0],[1,0],[1,1],[0,-2],[1,-2]],
+  '3-2': [[0,0],[-1,0],[-1,-1],[0,2],[-1,2]],
+  '3-0': [[0,0],[-1,0],[-1,-1],[0,2],[-1,2]],
+  '0-3': [[0,0],[1,0],[1,1],[0,-2],[1,-2]]
+};
+const WK_I = {
+  '0-1': [[0,0],[-2,0],[1,0],[-2,-1],[1,2]],
+  '1-0': [[0,0],[2,0],[-1,0],[2,1],[-1,-2]],
+  '1-2': [[0,0],[-1,0],[2,0],[-1,2],[2,-1]],
+  '2-1': [[0,0],[1,0],[-2,0],[1,-2],[-2,1]],
+  '2-3': [[0,0],[2,0],[-1,0],[2,1],[-1,-2]],
+  '3-2': [[0,0],[-2,0],[1,0],[-2,-1],[1,2]],
+  '3-0': [[0,0],[1,0],[-2,0],[1,-2],[-2,1]],
+  '0-3': [[0,0],[-1,0],[2,0],[-1,2],[2,-1]]
+};
+
+// ════════════════════════════════════════════════════════════════════════════
+// GAME STATE
+// ════════════════════════════════════════════════════════════════════════════
+let appState = 'IDLE'; // IDLE | PLAYING | PAUSED | GAME_OVER
+let board; // [ROWS][COLS] = null | colorString
+let cur, next; // current and next piece: {type, rot, col, row}
+let bag;
+let score, level, linesCleared, highScore;
+let gravAccum; // ms accumulator for gravity
+let lockAccum; // ms accumulator for lock delay
+let lockResets, grounded;
+let softDropping;
+let clearFlash; // {rows: [], timer: ms} — flash animation before clear
+let lastTS = 0;
+
+// ════════════════════════════════════════════════════════════════════════════
+// BAG RANDOMIZER
+// ════════════════════════════════════════════════════════════════════════════
+function refillBag() {
+  bag = [...TYPES];
+  for (let i = bag.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [bag[i], bag[j]] = [bag[j], bag[i]];
+  }
+}
+
+function drawFromBag() {
+  if (!bag.length) refillBag();
+  return bag.pop();
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// PIECE HELPERS
+// ════════════════════════════════════════════════════════════════════════════
+function cells(type, rot, col, row) {
+  return SHAPES[type][rot].map(([dc, dr]) => [col + dc, row + dr]);
+}
+
+function valid(type, rot, col, row) {
+  for (const [c, r] of cells(type, rot, col, row)) {
+    if (c < 0 || c >= COLS || r >= ROWS) return false;
+    if (r >= 0 && board[r][c] !== null) return false;
+  }
+  return true;
+}
+
+function ghostRow() {
+  let r = cur.row;
+  while (valid(cur.type, cur.rot, cur.col, r + 1)) r++;
+  return r;
+}
+
+function tryRotate(dir) {
+  const newRot = (cur.rot + dir + 4) % 4;
+  const key = `${cur.rot}-${newRot}`;
+  const kicks = cur.type === 'I' ? (WK_I[key] || [[0,0]]) : (WK_STANDARD[key] || [[0,0]]);
+  for (const [dx, dy] of kicks) {
+    if (valid(cur.type, newRot, cur.col + dx, cur.row + dy)) {
+      cur.rot = newRot;
+      cur.col += dx;
+      cur.row += dy;
+      onMove();
+      return true;
+    }
+  }
+  return false;
+}
+
+function tryMove(dx) {
+  if (valid(cur.type, cur.rot, cur.col + dx, cur.row)) {
+    cur.col += dx;
+    onMove();
+    return true;
+  }
+  return false;
+}
+
+function onMove() {
+  // Reset lock delay if grounded (up to 3 resets)
+  if (grounded && lockResets < 3) {
+    lockAccum = 0;
+    lockResets++;
+  }
+}
+
+function hardDrop() {
+  const gr = ghostRow();
+  const dropped = gr - cur.row;
+  score += dropped * 2;
+  cur.row = gr;
+  lockPiece();
+}
+
+function softDrop() {
+  if (valid(cur.type, cur.rot, cur.col, cur.row + 1)) {
+    cur.row++;
+    score++;
+    gravAccum = 0;
+    grounded = false;
+  }
+}
+
+function lockPiece() {
+  const cs = cells(cur.type, cur.rot, cur.col, cur.row);
+  for (const [c, r] of cs) {
+    if (r >= 0) board[r][c] = COLORS[cur.type];
+  }
+  checkLines();
+}
+
+function checkLines() {
+  const full = [];
+  for (let r = 0; r < ROWS; r++) {
+    if (board[r].every(c => c !== null)) full.push(r);
+  }
+  if (full.length > 0) {
+    clearFlash = {rows: full, timer: 120};
+    // Score
+    const pts = [0, 100, 300, 500, 800][full.length] * level;
+    score += pts;
+    linesCleared += full.length;
+    level = Math.floor(linesCleared / 10) + 1;
+    if (score > highScore) {
+      highScore = score;
+      localStorage.setItem('tetris6_hi', highScore);
+    }
+  } else {
+    spawnNext();
+  }
+}
+
+function doLineClear(rows) {
+  rows.sort((a, b) => b - a);
+  for (const r of rows) {
+    board.splice(r, 1);
+    board.unshift(Array(COLS).fill(null));
+  }
+}
+
+function spawnNext() {
+  const type = next ? next.type : drawFromBag();
+  const nextType = drawFromBag();
+  next = {type: nextType, rot: 0, col: 3, row: 0};
+  cur = {type, rot: 0, col: 3, row: 0};
+  gravAccum = 0;
+  lockAccum = 0;
+  lockResets = 0;
+  grounded = false;
+  if (!valid(cur.type, cur.rot, cur.col, cur.row)) {
+    // Game over
+    if (score > highScore) { highScore = score; localStorage.setItem('tetris6_hi', highScore); }
+    appState = 'GAME_OVER';
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// INIT
+// ════════════════════════════════════════════════════════════════════════════
+function initGame() {
+  board = Array.from({length: ROWS}, () => Array(COLS).fill(null));
+  score = 0; level = 1; linesCleared = 0;
+  highScore = parseInt(localStorage.getItem('tetris6_hi') || '0');
+  bag = [];
+  gravAccum = 0;
+  lockAccum = 0;
+  lockResets = 0;
+  grounded = false;
+  softDropping = false;
+  clearFlash = null;
+  refillBag();
+  next = {type: drawFromBag(), rot: 0, col: 3, row: 0};
+  spawnNext();
+  appState = 'PLAYING';
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// INPUT
+// ════════════════════════════════════════════════════════════════════════════
+const keysDown = new Set();
+const keysHeld = {};
+const DAS_DELAY = 167, DAS_REPEAT = 33;
+
+document.addEventListener('keydown', e => {
+  if (!keysDown.has(e.code)) {
+    keysDown.add(e.code);
+    keysHeld[e.code] = 0;
+    handleKey(e.code, true);
+  }
+  e.preventDefault();
+});
+document.addEventListener('keyup', e => {
+  keysDown.delete(e.code);
+  delete keysHeld[e.code];
+  if (e.code === 'ArrowDown' || e.code === 'KeyS') softDropping = false;
+});
+
+function handleKey(code, isFirst) {
+  if (code === 'Enter') {
+    if (appState === 'IDLE' || appState === 'GAME_OVER') initGame();
+    return;
+  }
+  if (code === 'KeyP') {
+    if (appState === 'PLAYING') appState = 'PAUSED';
+    else if (appState === 'PAUSED') appState = 'PLAYING';
+    return;
+  }
+  if (appState !== 'PLAYING' || clearFlash) return;
+  if (code === 'ArrowLeft' || code === 'KeyA') tryMove(-1);
+  if (code === 'ArrowRight' || code === 'KeyD') tryMove(1);
+  if (code === 'ArrowUp' || code === 'KeyW') { if (isFirst) tryRotate(1); }
+  if (code === 'KeyZ') { if (isFirst) tryRotate(-1); }
+  if (code === 'Space') { if (isFirst) hardDrop(); }
+  if (code === 'ArrowDown' || code === 'KeyS') {
+    softDropping = true;
+    if (isFirst) softDrop();
+  }
+}
+
+function processHeldKeys(dt) {
+  for (const code of ['ArrowLeft', 'ArrowRight', 'KeyA', 'KeyD', 'ArrowDown', 'KeyS']) {
+    if (keysDown.has(code)) {
+      keysHeld[code] = (keysHeld[code] || 0) + dt;
+      if (keysHeld[code] > DAS_DELAY) {
+        const excess = keysHeld[code] - DAS_DELAY;
+        const reps = Math.floor(excess / DAS_REPEAT);
+        if (reps > 0) {
+          keysHeld[code] = DAS_DELAY + (excess % DAS_REPEAT);
+          if (appState === 'PLAYING' && !clearFlash) {
+            if (code === 'ArrowLeft' || code === 'KeyA') for (let i = 0; i < reps; i++) tryMove(-1);
+            if (code === 'ArrowRight' || code === 'KeyD') for (let i = 0; i < reps; i++) tryMove(1);
+            if (code === 'ArrowDown' || code === 'KeyS') for (let i = 0; i < reps; i++) softDrop();
+          }
+        }
+      }
+    }
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// UPDATE
+// ════════════════════════════════════════════════════════════════════════════
+function gravityInterval() {
+  return Math.max(100, 1000 - 75 * (level - 1));
+}
+
+function update(dt) {
+  if (appState !== 'PLAYING') return;
+
+  processHeldKeys(dt);
+
+  // Flash animation before line clear
+  if (clearFlash) {
+    clearFlash.timer -= dt;
+    if (clearFlash.timer <= 0) {
+      doLineClear(clearFlash.rows);
+      clearFlash = null;
+      spawnNext();
+    }
+    return;
+  }
+
+  if (!cur) return;
+
+  const interval = softDropping ? 50 : gravityInterval();
+  gravAccum += dt;
+
+  // Check grounded
+  const isGrounded = !valid(cur.type, cur.rot, cur.col, cur.row + 1);
+
+  if (!isGrounded) {
+    grounded = false;
+    lockAccum = 0;
+    if (gravAccum >= interval) {
+      gravAccum -= interval;
+      cur.row++;
+    }
+  } else {
+    grounded = true;
+    lockAccum += dt;
+    if (lockAccum >= 500) {
+      lockPiece();
+    }
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// DRAW HELPERS
+// ════════════════════════════════════════════════════════════════════════════
+function colorWithAlpha(hex, a) {
+  const r = parseInt(hex.slice(1,3),16);
+  const g = parseInt(hex.slice(3,5),16);
+  const b = parseInt(hex.slice(5,7),16);
+  return `rgba(${r},${g},${b},${a})`;
+}
+
+function drawBlock(cx, cy, color, ghost = false) {
+  const x = PF_X + cx * CS, y = PF_Y + cy * CS;
+  if (ghost) {
+    ctx.fillStyle = colorWithAlpha(color, 0.18);
+    ctx.fillRect(x + 1, y + 1, CS - 2, CS - 2);
+    ctx.strokeStyle = colorWithAlpha(color, 0.55);
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(x + 1.5, y + 1.5, CS - 3, CS - 3);
+    return;
+  }
+  ctx.fillStyle = color;
+  ctx.fillRect(x + 1, y + 1, CS - 2, CS - 2);
+  // Highlight
+  ctx.fillStyle = 'rgba(255,255,255,0.28)';
+  ctx.fillRect(x + 2, y + 2, CS - 4, 4);
+  ctx.fillRect(x + 2, y + 2, 4, CS - 4);
+  // Shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  ctx.fillRect(x + CS - 5, y + 2, 3, CS - 4);
+  ctx.fillRect(x + 2, y + CS - 5, CS - 4, 3);
+}
+
+function drawFlashBlock(cx, cy, t) {
+  const x = PF_X + cx * CS, y = PF_Y + cy * CS;
+  ctx.fillStyle = t < 0.5 ? '#FFFFFF' : 'rgba(255,255,255,0.4)';
+  ctx.fillRect(x + 1, y + 1, CS - 2, CS - 2);
+}
+
+function drawPlayfield() {
+  // Background
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(PF_X, PF_Y, PF_W, PF_H);
+  // Grid lines
+  ctx.strokeStyle = '#1e1e1e';
+  ctx.lineWidth = 1;
+  for (let c = 1; c < COLS; c++) {
+    ctx.beginPath();
+    ctx.moveTo(PF_X + c * CS, PF_Y);
+    ctx.lineTo(PF_X + c * CS, PF_Y + PF_H);
+    ctx.stroke();
+  }
+  for (let r = 1; r < ROWS; r++) {
+    ctx.beginPath();
+    ctx.moveTo(PF_X, PF_Y + r * CS);
+    ctx.lineTo(PF_X + PF_W, PF_Y + r * CS);
+    ctx.stroke();
+  }
+  // Border
+  ctx.strokeStyle = '#555555';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(PF_X - 1, PF_Y - 1, PF_W + 2, PF_H + 2);
+}
+
+function drawBoard() {
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const cell = board[r][c];
+      if (!cell) continue;
+      if (clearFlash && clearFlash.rows.includes(r)) {
+        const t = clearFlash.timer / 120;
+        drawFlashBlock(c, r, t);
+      } else {
+        drawBlock(c, r, cell);
+      }
+    }
+  }
+}
+
+function drawCurrent() {
+  if (!cur) return;
+  const gr = ghostRow();
+  // Ghost
+  if (gr !== cur.row) {
+    for (const [c, r] of cells(cur.type, cur.rot, cur.col, gr)) {
+      if (r >= 0) drawBlock(c, r, COLORS[cur.type], true);
+    }
+  }
+  // Piece
+  for (const [c, r] of cells(cur.type, cur.rot, cur.col, cur.row)) {
+    if (r >= 0) drawBlock(c, r, COLORS[cur.type]);
+  }
+}
+
+function drawNextPanel() {
+  const nx = 560, ny = 60;
+  // Label
+  ctx.fillStyle = '#AAAAAA';
+  ctx.font = '13px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText('NEXT', nx, ny - 8);
+  // Box
+  ctx.fillStyle = '#0a0a0a';
+  ctx.fillRect(nx, ny, 112, 112);
+  ctx.strokeStyle = '#444444';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(nx, ny, 112, 112);
+
+  if (!next) return;
+  const shape = SHAPES[next.type][0];
+  const minC = Math.min(...shape.map(c => c[0]));
+  const maxC = Math.max(...shape.map(c => c[0]));
+  const minR = Math.min(...shape.map(c => c[1]));
+  const maxR = Math.max(...shape.map(c => c[1]));
+  const pw = (maxC - minC + 1) * CS, ph = (maxR - minR + 1) * CS;
+  const ox = nx + (112 - pw) / 2 - minC * CS;
+  const oy = ny + (112 - ph) / 2 - minR * CS;
+  for (const [dc, dr] of shape) {
+    const bx = ox + dc * CS, by = oy + dr * CS;
+    ctx.fillStyle = COLORS[next.type];
+    ctx.fillRect(bx + 1, by + 1, CS - 2, CS - 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.25)';
+    ctx.fillRect(bx + 2, by + 2, CS - 4, 3);
+    ctx.fillRect(bx + 2, by + 2, 3, CS - 4);
+  }
+}
+
+function drawHUD() {
+  ctx.textAlign = 'left';
+  const labelStyle = '#888888';
+  const valueStyle = '#FFFFFF';
+  const rows = [
+    {label: 'SCORE', val: score,        y: 210},
+    {label: 'LEVEL', val: level,        y: 290},
+    {label: 'LINES', val: linesCleared, y: 360},
+    {label: 'BEST',  val: highScore,    y: 430},
+  ];
+  for (const r of rows) {
+    ctx.fillStyle = labelStyle;
+    ctx.font = '13px monospace';
+    ctx.fillText(r.label, 560, r.y);
+    ctx.fillStyle = r.label === 'BEST' ? '#FFFF44' : valueStyle;
+    ctx.font = '20px monospace';
+    ctx.fillText(r.val, 560, r.y + 22);
+  }
+}
+
+function drawStartScreen() {
+  ctx.fillStyle = '#111111';
+  ctx.fillRect(0, 0, 800, 600);
+  // Playfield bg
+  drawPlayfield();
+  // Title
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = 'bold 52px monospace';
+  ctx.fillText('TETRIS', PF_X + PF_W/2, PF_Y + 140);
+  // Show 7 pieces
+  const px = PF_X + 10;
+  const py = PF_Y + 220;
+  const smallCS = 16;
+  TYPES.forEach((t, ti) => {
+    const shape = SHAPES[t][0];
+    const minC = Math.min(...shape.map(s => s[0]));
+    const minR = Math.min(...shape.map(s => s[1]));
+    for (const [dc, dr] of shape) {
+      ctx.fillStyle = COLORS[t];
+      ctx.fillRect(px + ti * 38 + (dc - minC) * smallCS, py + (dr - minR) * smallCS, smallCS - 1, smallCS - 1);
+    }
+  });
+  ctx.fillStyle = '#AAAAAA';
+  ctx.font = '17px monospace';
+  ctx.fillText('Press Enter to Start', PF_X + PF_W/2, PF_Y + 360);
+  ctx.fillStyle = '#555555';
+  ctx.font = '13px monospace';
+  ctx.fillText('Arrow/WASD: Move  Space: Hard Drop  P: Pause', PF_X + PF_W/2, PF_Y + 410);
+}
+
+function drawGameOver() {
+  ctx.fillStyle = 'rgba(0,0,0,0.8)';
+  ctx.fillRect(PF_X, PF_Y, PF_W, PF_H);
+  ctx.textAlign = 'center';
+  const cx = PF_X + PF_W/2, cy = PF_Y + PF_H/2;
+  ctx.fillStyle = '#FF4444';
+  ctx.font = 'bold 36px monospace';
+  ctx.fillText('GAME OVER', cx, cy - 55);
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = '22px monospace';
+  ctx.fillText('Score: ' + score, cx, cy - 10);
+  ctx.fillStyle = '#AAAAAA';
+  ctx.font = '15px monospace';
+  ctx.fillText('Press Enter to Restart', cx, cy + 30);
+}
+
+function drawPaused() {
+  ctx.fillStyle = 'rgba(0,0,0,0.78)';
+  ctx.fillRect(PF_X, PF_Y, PF_W, PF_H);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = 'bold 36px monospace';
+  ctx.fillText('PAUSED', PF_X + PF_W/2, PF_Y + PF_H/2);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// MAIN LOOP
+// ════════════════════════════════════════════════════════════════════════════
+function frame(ts) {
+  const dt = Math.min((ts - lastTS), 100); // ms, capped
+  lastTS = ts;
+
+  ctx.fillStyle = '#111111';
+  ctx.fillRect(0, 0, 800, 600);
+
+  if (appState === 'IDLE') {
+    drawStartScreen();
+  } else {
+    update(dt);
+    drawPlayfield();
+    drawBoard();
+    if (appState === 'PLAYING' || appState === 'GAME_OVER') {
+      drawCurrent();
+    }
+    drawNextPanel();
+    drawHUD();
+    if (appState === 'PAUSED') drawPaused();
+    if (appState === 'GAME_OVER') drawGameOver();
+  }
+
+  requestAnimationFrame(frame);
+}
+
+highScore = parseInt(localStorage.getItem('tetris6_hi') || '0');
+requestAnimationFrame(ts => { lastTS = ts; requestAnimationFrame(frame); });
+</script>
+</body>
+</html>

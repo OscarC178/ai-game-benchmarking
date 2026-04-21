@@ -1,0 +1,375 @@
+<!--
+  GAME:      Pong
+  RUN:       r2-gpt54
+  BUILDER:   anthropic/claude-sonnet-4.6
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Pong</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#000; display:flex; align-items:center; justify-content:center; width:100vw; height:100vh; overflow:hidden; }
+canvas { display:block; image-rendering:pixelated; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+'use strict';
+
+const W = 800, H = 600;
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+canvas.width = W;
+canvas.height = H;
+
+function resize(){
+  const s = Math.min(window.innerWidth/W, window.innerHeight/H);
+  canvas.style.width = (W*s)+'px';
+  canvas.style.height = (H*s)+'px';
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ---- Audio ----
+let AC = null;
+function initAC(){
+  if(AC) return;
+  try { AC = new (window.AudioContext||window.webkitAudioContext)(); } catch(e){}
+}
+function beep(freq, dur, gain, type){
+  if(!AC) return;
+  try {
+    const osc = AC.createOscillator();
+    const gn = AC.createGain();
+    osc.connect(gn); gn.connect(AC.destination);
+    osc.type = type||'square';
+    osc.frequency.value = freq;
+    gn.gain.setValueAtTime(gain||0.2, AC.currentTime);
+    gn.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime+dur);
+    osc.start(); osc.stop(AC.currentTime+dur+0.01);
+  } catch(e){}
+}
+
+// ---- Input ----
+const keys = {};
+const prevKeys = {};
+window.addEventListener('keydown', e => { keys[e.code]=true; e.preventDefault(); });
+window.addEventListener('keyup', e => { keys[e.code]=false; });
+
+// ---- Constants ----
+const PAD_W = 12, PAD_H = 84;
+const BALL_S = 12;
+const PLAYER_X = 32;
+const CPU_X = 756;
+const PAD_START_Y = 258;
+const BALL_START_X = 394, BALL_START_Y = 294;
+const PLAYER_SPD = 420, CPU_SPD = 320;
+const BALL_INIT_SPD = 340, BALL_MAX_SPD = 620;
+const WIN_SCORE = 7;
+
+// ---- State ----
+const ST = { TITLE:0, SERVE:1, PLAYING:2, PAUSED:3, GAME_OVER:4 };
+let state = ST.TITLE;
+
+let playerScore = 0, cpuScore = 0;
+let serveTimer = 0;
+let serveToPlayer = true; // serve direction
+let winner = ''; // 'player' or 'cpu'
+let totalTime = 0;
+
+// Paddle state
+let player = { x: PLAYER_X, y: PAD_START_Y, w: PAD_W, h: PAD_H };
+let cpu = { x: CPU_X, y: PAD_START_Y, w: PAD_W, h: PAD_H };
+
+// Ball state
+let ball = { x: BALL_START_X, y: BALL_START_Y, w: BALL_S, h: BALL_S, vx:0, vy:0, speed:BALL_INIT_SPD };
+
+// CPU AI
+let cpuTarget = H/2;
+let cpuUpdateTimer = 0;
+const CPU_REACT_DELAY = 0.08;
+
+function resetForServe(toPlayer){
+  player.y = PAD_START_Y;
+  cpu.y = PAD_START_Y;
+  ball.x = BALL_START_X;
+  ball.y = BALL_START_Y;
+  ball.vx = 0; ball.vy = 0;
+  ball.speed = BALL_INIT_SPD;
+  serveToPlayer = toPlayer;
+  serveTimer = 1.0;
+  state = ST.SERVE;
+}
+
+function launchBall(){
+  const dir = serveToPlayer ? -1 : 1;
+  const maxAngle = 28 * Math.PI/180;
+  const angle = (Math.random()*2-1)*maxAngle;
+  ball.vx = ball.speed * Math.cos(angle) * dir;
+  ball.vy = ball.speed * Math.sin(angle);
+}
+
+function startGame(){
+  initAC();
+  playerScore = 0; cpuScore = 0;
+  winner = '';
+  resetForServe(Math.random()<0.5);
+}
+
+// ---- Update ----
+let lastTime = 0;
+
+function update(dt){
+  totalTime += dt;
+
+  if(state === ST.TITLE) return;
+  if(state === ST.PAUSED) return;
+  if(state === ST.GAME_OVER) return;
+
+  if(state === ST.SERVE){
+    serveTimer -= dt;
+    // Allow paddle movement during serve
+    movePlayer(dt);
+    if(serveTimer <= 0){
+      launchBall();
+      state = ST.PLAYING;
+    }
+    return;
+  }
+
+  // PLAYING
+  movePlayer(dt);
+  moveCPU(dt);
+
+  // Move ball
+  ball.x += ball.vx * dt;
+  ball.y += ball.vy * dt;
+
+  // Top/bottom wall
+  if(ball.y < 0){
+    ball.y = 0;
+    ball.vy = Math.abs(ball.vy);
+    beep(280,0.03,0.15);
+  }
+  if(ball.y + ball.h > H){
+    ball.y = H - ball.h;
+    ball.vy = -Math.abs(ball.vy);
+    beep(280,0.03,0.15);
+  }
+
+  // Paddle collisions
+  checkPaddleCollision(player, true);
+  checkPaddleCollision(cpu, false);
+
+  // Scoring
+  if(ball.x < -ball.w){
+    playerScore++;
+    beep(160,0.25,0.3);
+    checkWin('player');
+  }
+  if(ball.x > W){
+    cpuScore++;
+    beep(160,0.25,0.3);
+    checkWin('cpu');
+  }
+}
+
+function checkWin(scorer){
+  if(playerScore >= WIN_SCORE){
+    winner='player'; state=ST.GAME_OVER; beep(660,0.5,0.25);
+  } else if(cpuScore >= WIN_SCORE){
+    winner='cpu'; state=ST.GAME_OVER; beep(140,0.5,0.25);
+  } else {
+    // Serve toward the one who lost the point
+    resetForServe(scorer === 'cpu'); // if cpu scored, serve to player
+  }
+}
+
+function movePlayer(dt){
+  let dy = 0;
+  if(keys['ArrowUp']||keys['KeyW']) dy = -PLAYER_SPD*dt;
+  if(keys['ArrowDown']||keys['KeyS']) dy = PLAYER_SPD*dt;
+  player.y += dy;
+  player.y = Math.max(0, Math.min(H-player.h, player.y));
+}
+
+function moveCPU(dt){
+  cpuUpdateTimer -= dt;
+  if(cpuUpdateTimer <= 0){
+    cpuUpdateTimer = CPU_REACT_DELAY;
+    // Only react meaningfully when ball moves toward CPU
+    if(ball.vx > 0){
+      // Predict with slight error
+      const err = (Math.random()-0.5)*30;
+      cpuTarget = ball.y + ball.h/2 - cpu.h/2 + err;
+    } else {
+      // Drift toward center
+      cpuTarget = H/2 - cpu.h/2;
+    }
+  }
+  // Move toward target
+  const diff = cpuTarget - cpu.y;
+  const maxMove = CPU_SPD * dt;
+  if(Math.abs(diff) > 4){
+    cpu.y += Math.sign(diff) * Math.min(maxMove, Math.abs(diff));
+  }
+  cpu.y = Math.max(0, Math.min(H-cpu.h, cpu.y));
+}
+
+function checkPaddleCollision(pad, isLeft){
+  // Only collide if ball moving toward paddle
+  const movingToward = isLeft ? ball.vx < 0 : ball.vx > 0;
+  if(!movingToward) return;
+
+  const ballL = ball.x, ballR = ball.x+ball.w, ballT = ball.y, ballB = ball.y+ball.h;
+  const padL = pad.x, padR = pad.x+pad.w, padT = pad.y, padB = pad.y+pad.h;
+
+  if(ballR >= padL && ballL <= padR && ballB >= padT && ballT <= padB){
+    // Hit!
+    const ballCenter = ball.y + ball.h/2;
+    const padCenter = pad.y + pad.h/2;
+    const hitRatio = (ballCenter - padCenter) / (pad.h/2);
+    const maxAngle = 60*Math.PI/180;
+    const angle = hitRatio * maxAngle;
+
+    ball.speed = Math.min(BALL_MAX_SPD, ball.speed+22);
+    const dir = isLeft ? 1 : -1;
+    ball.vx = ball.speed * Math.cos(angle) * dir;
+    ball.vy = ball.speed * Math.sin(angle);
+
+    // Reposition
+    if(isLeft) ball.x = padR;
+    else ball.x = padL - ball.w;
+
+    beep(480,0.045,0.3);
+  }
+}
+
+// ---- Draw ----
+function draw(){
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0,0,W,H);
+
+  // Center divider
+  ctx.fillStyle = '#fff';
+  const dashH=16, dashGap=10;
+  const cx = W/2-2;
+  for(let y=0; y<H; y+=dashH+dashGap){
+    ctx.fillRect(cx, y, 4, dashH);
+  }
+
+  if(state === ST.TITLE){
+    drawTitle();
+    return;
+  }
+
+  // Scores
+  drawScores();
+
+  // Paddles
+  ctx.fillStyle='#fff';
+  ctx.fillRect(player.x, player.y, player.w, player.h);
+  ctx.fillRect(cpu.x, cpu.y, cpu.w, cpu.h);
+
+  // Ball
+  if(state !== ST.SERVE || Math.floor(serveTimer*4)%2===0){
+    ctx.fillStyle='#fff';
+    ctx.fillRect(ball.x, ball.y, ball.w, ball.h);
+  }
+
+  if(state===ST.SERVE){
+    ctx.fillStyle='rgba(255,255,255,0.6)';
+    ctx.font='22px monospace';
+    ctx.textAlign='center';
+    ctx.fillText('READY', W/2, H/2+60);
+  }
+
+  if(state===ST.PAUSED){
+    ctx.fillStyle='rgba(0,0,0,0.5)';
+    ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#fff';
+    ctx.font='40px monospace';
+    ctx.textAlign='center';
+    ctx.fillText('PAUSED', W/2, H/2);
+    ctx.font='18px monospace';
+    ctx.fillStyle='#aaa';
+    ctx.fillText('P to resume', W/2, H/2+50);
+  }
+
+  if(state===ST.GAME_OVER){
+    ctx.fillStyle='rgba(0,0,0,0.6)';
+    ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#fff';
+    ctx.font='44px monospace';
+    ctx.textAlign='center';
+    const msg = winner==='player' ? 'PLAYER WINS' : 'CPU WINS';
+    ctx.fillText(msg, W/2, H/2-50);
+    ctx.font='28px monospace';
+    ctx.fillText(playerScore+' - '+cpuScore, W/2, H/2+10);
+    const blink = Math.floor(totalTime*2)%2===0;
+    ctx.fillStyle=blink?'#aaa':'#555';
+    ctx.font='18px monospace';
+    ctx.fillText('Press Enter to Restart', W/2, H/2+70);
+  }
+}
+
+function drawTitle(){
+  ctx.fillStyle='#fff';
+  ctx.font='bold 80px monospace';
+  ctx.textAlign='center';
+  ctx.fillText('PONG', W/2, 180);
+  ctx.font='20px monospace';
+  ctx.fillStyle='#ccc';
+  ctx.fillText('W / S  or  ↑ / ↓  to move', W/2, 300);
+  ctx.fillText('P to pause', W/2, 340);
+  const blink = Math.floor(totalTime*2)%2===0;
+  ctx.fillStyle=blink?'#fff':'#555';
+  ctx.font='22px monospace';
+  ctx.fillText('Press Enter to Start', W/2, 430);
+}
+
+function drawScores(){
+  ctx.fillStyle='#fff';
+  ctx.font='48px monospace';
+  ctx.textAlign='center';
+  ctx.fillText(playerScore, W/4, 70);
+  ctx.fillText(cpuScore, 3*W/4, 70);
+}
+
+// ---- Main loop ----
+function loop(now){
+  requestAnimationFrame(loop);
+  const dt = Math.min((now-lastTime)/1000, 0.05);
+  lastTime = now;
+
+  // Edge triggers
+  const enterDown = keys['Enter'] && !prevKeys['Enter'];
+  const pDown = keys['KeyP'] && !prevKeys['KeyP'];
+  const spaceDown = keys['Space'] && !prevKeys['Space'];
+
+  if(enterDown||spaceDown){
+    if(state===ST.TITLE) startGame();
+    else if(state===ST.GAME_OVER) startGame();
+  }
+  if(pDown){
+    if(state===ST.PLAYING) state=ST.PAUSED;
+    else if(state===ST.PAUSED) state=ST.PLAYING;
+  }
+
+  Object.assign(prevKeys, keys);
+
+  update(dt);
+  draw();
+}
+
+requestAnimationFrame(ts=>{ lastTime=ts; requestAnimationFrame(loop); });
+
+})();
+</script>
+</body>
+</html>

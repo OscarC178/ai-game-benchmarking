@@ -1,0 +1,1238 @@
+<!--
+  GAME:      Frogger
+  RUN:       r1-opus
+  BUILDER:   openai/gpt-5.4
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Frogger</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background: #000;
+      overflow: hidden;
+      font-family: monospace;
+    }
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    canvas {
+      display: block;
+      background: #000;
+      image-rendering: pixelated;
+      box-shadow: 0 0 28px rgba(0, 255, 64, 0.12);
+    }
+  </style>
+</head>
+<body>
+<canvas id="game" width="644" height="740" aria-label="Frogger game canvas"></canvas>
+<script>
+(() => {
+  'use strict';
+
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  const W = 644;
+  const H = 740;
+  const CELL = 46;
+  const GRID_ORIGIN_Y = 26;
+  const COLS = 14;
+  const ROWS = 13;
+  const PLAY_ROWS = 13;
+  const START_COL = 7;
+  const START_ROW = 12;
+  const HOME_SLOT_COLS = [1, 4, 7, 10, 13];
+  const HOME_SLOT_CENTERS = HOME_SLOT_COLS.map(col => col * CELL + CELL / 2);
+  const HOP_DURATION = 0.08;
+  const DEATH_DURATION = 0.5;
+  const RESPAWN_DELAY = 1.0;
+  const LEVEL_CLEAR_DURATION = 1.5;
+  const EXTRA_LIFE_SCORE = 10000;
+  const MAX_LIVES = 6;
+  const DT_CAP = 0.05;
+
+  const STATES = {
+    TITLE: 'TITLE',
+    PLAYING: 'PLAYING',
+    PAUSED: 'PAUSED',
+    DEATH: 'DEATH',
+    LEVEL_CLEAR: 'LEVEL_CLEAR',
+    GAME_OVER: 'GAME_OVER'
+  };
+
+  const keyState = Object.create(null);
+  const prevKeyState = Object.create(null);
+  let touchDir = null;
+
+  let state = STATES.TITLE;
+  let pausedFrom = STATES.PLAYING;
+  let lastTime = 0;
+  let score = 0;
+  let best = loadBest();
+  let level = 1;
+  let lives = 3;
+  let extraLifeGranted = false;
+  let newBest = false;
+  let stateTimer = 0;
+  let timerWarningTick = 0;
+  let rippleTime = 0;
+  let attractTime = 0;
+  let flyTimer = 0;
+  let fly = null;
+  let croc = null;
+  let snake = null;
+  let medianPebbles = createPebbles();
+  let particles = [];
+  let audioCtx = null;
+
+  const frog = {
+    x: colToX(START_COL),
+    row: START_ROW,
+    dir: 'up',
+    hop: null,
+    queuedDir: null,
+    alive: true,
+    timer: levelTimer(level),
+    farthestRow: START_ROW,
+    deathCause: 'impact'
+  };
+
+  let vehicles = [];
+  let logs = [];
+  let turtles = [];
+  let homes = HOME_SLOT_CENTERS.map(x => ({ x, filled: false }));
+
+  function resize() {
+    const scale = Math.min(window.innerWidth / W, window.innerHeight / H);
+    canvas.style.width = `${W * scale}px`;
+    canvas.style.height = `${H * scale}px`;
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  function loadBest() {
+    try {
+      const raw = localStorage.getItem('frogger_best');
+      const n = raw ? parseInt(raw, 10) : 0;
+      return Number.isFinite(n) ? n : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  function saveBest() {
+    try { localStorage.setItem('frogger_best', String(best)); } catch {}
+  }
+
+  function ensureAudio() {
+    if (!audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) {
+        try { audioCtx = new AC(); } catch {}
+      }
+    }
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+  }
+
+  function tone(freq, duration, gainValue, type = 'sine', endFreq = null, delay = 0) {
+    if (!audioCtx) return;
+    try {
+      const t = audioCtx.currentTime + delay;
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, t);
+      if (endFreq !== null) osc.frequency.linearRampToValueAtTime(endFreq, t + duration);
+      gain.gain.setValueAtTime(Math.max(0.0001, gainValue), t);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + duration);
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start(t);
+      osc.stop(t + duration);
+    } catch {}
+  }
+
+  function noise(duration, gainValue, highpass = false) {
+    if (!audioCtx) return;
+    try {
+      const buffer = audioCtx.createBuffer(1, Math.floor(audioCtx.sampleRate * duration), audioCtx.sampleRate);
+      const data = buffer.getChannelData(0);
+      for (let i = 0; i < data.length; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / data.length);
+      const src = audioCtx.createBufferSource();
+      const filter = audioCtx.createBiquadFilter();
+      const gain = audioCtx.createGain();
+      src.buffer = buffer;
+      filter.type = highpass ? 'highpass' : 'lowpass';
+      filter.frequency.setValueAtTime(highpass ? 1200 : 2400, audioCtx.currentTime);
+      filter.frequency.exponentialRampToValueAtTime(highpass ? 120 : 500, audioCtx.currentTime + duration);
+      gain.gain.setValueAtTime(gainValue, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + duration);
+      src.connect(filter);
+      filter.connect(gain);
+      gain.connect(audioCtx.destination);
+      src.start();
+    } catch {}
+  }
+
+  const sfx = {
+    hop() { tone(300, 0.03, 0.12, 'square'); },
+    home() { tone(523, 0.08, 0.18, 'sine'); tone(784, 0.08, 0.18, 'sine', null, 0.09); },
+    level() { [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.07, 0.2, 'sine', null, i * 0.08)); },
+    crunch() { tone(150, 0.15, 0.22, 'square'); noise(0.05, 0.18); },
+    splash() { noise(0.2, 0.2, true); },
+    tick() { tone(800, 0.015, 0.1, 'square'); },
+    fly() { tone(880, 0.1, 0.18, 'sine', 1320); },
+    extra() { tone(880, 0.08, 0.18, 'sine'); tone(1100, 0.08, 0.18, 'sine', null, 0.09); }
+  };
+
+  function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  function colToX(col) {
+    return col * CELL + CELL / 2;
+  }
+
+  function rowToY(row) {
+    return GRID_ORIGIN_Y + row * CELL + CELL / 2;
+  }
+
+  function rowTop(row) {
+    return GRID_ORIGIN_Y + row * CELL;
+  }
+
+  function frogVisual() {
+    if (!frog.hop) return { x: frog.x, y: rowToY(frog.row), sx: 1, sy: 1 };
+    const t = frog.hop.t / HOP_DURATION;
+    const fromX = frog.hop.fromX;
+    const toX = frog.hop.toX;
+    const fromY = rowToY(frog.hop.fromRow);
+    const toY = rowToY(frog.hop.toRow);
+    let sx = 1, sy = 1;
+    if (t < 0.375) {
+      sy = 0.8;
+      sx = 1.05;
+    } else if (t < 0.75) {
+      sx = frog.hop.dir === 'left' || frog.hop.dir === 'right' ? 1.15 : 1.02;
+      sy = frog.hop.dir === 'up' || frog.hop.dir === 'down' ? 1.15 : 0.92;
+    }
+    return { x: lerp(fromX, toX, Math.min(1, t)), y: lerp(fromY, toY, Math.min(1, t)), sx, sy };
+  }
+
+  function levelVehicleMult(lv) {
+    if (lv <= 5) return [1, 1.15, 1.3, 1.45, 1.6][lv - 1];
+    return Math.min(2.5, 1.6 + (lv - 5) * 0.1);
+  }
+
+  function levelRiverMult(lv) {
+    if (lv <= 5) return [1, 1.1, 1.2, 1.3, 1.4][lv - 1];
+    return Math.min(2.0, 1.4 + (lv - 5) * 0.1);
+  }
+
+  function levelTimer(lv) {
+    if (lv <= 5) return [30, 28, 26, 24, 22][lv - 1];
+    return 20;
+  }
+
+  function tightenedGap(baseGap, lv) {
+    return Math.max(60, baseGap * Math.max(0.55, 1 - (lv - 1) * 0.1));
+  }
+
+  function makeLaneObject(kind, row, x, width, height, dir, speed, color, extra = {}) {
+    return { kind, row, x, y: rowTop(row) + (CELL - height) / 2, width, height, dir, speed, color, ...extra };
+  }
+
+  function createPebbles() {
+    const arr = [];
+    for (let i = 0; i < 30; i++) {
+      arr.push({ x: Math.random() * W, y: rowTop(6) + Math.random() * CELL, s: 1 + Math.random() * 2 });
+    }
+    return arr;
+  }
+
+  function createLevelObjects() {
+    vehicles = [];
+    logs = [];
+    turtles = [];
+    snake = null;
+    croc = null;
+    fly = null;
+    flyTimer = 5;
+
+    const vm = levelVehicleMult(level);
+    const rm = levelRiverMult(level);
+
+    const roadDefs = [
+      { row: 7, kind: 'sedan', width: 42, height: 36, color: '#FFCC00', dir: -1, speed: 80, gap: 140 },
+      { row: 8, kind: 'race', width: 42, height: 36, color: '#FF4444', dir: 1, speed: 130, gap: 160 },
+      { row: 9, kind: 'truck', width: 88, height: 36, color: '#CCCCCC', dir: -1, speed: 60, gap: 200 },
+      { row: 10, kind: 'sedan', width: 42, height: 36, color: '#FF8800', dir: 1, speed: 100, gap: 120 },
+      { row: 11, kind: 'race', width: 42, height: 36, color: '#FF44FF', dir: -1, speed: 140, gap: 180 }
+    ];
+
+    roadDefs.forEach(def => {
+      const gap = tightenedGap(def.gap, level);
+      const span = def.width + gap;
+      const count = Math.ceil((W + 400) / span) + 1;
+      let x = def.dir === 1 ? -200 : W + 200 - def.width;
+      for (let i = 0; i < count; i++) {
+        vehicles.push(makeLaneObject(def.kind, def.row, x, def.width, def.height, def.dir, def.speed * vm, def.color, { laneGap: gap }));
+        x += def.dir === 1 ? span : -span;
+      }
+    });
+
+    const logDefs = [
+      { row: 1, width: 138, height: 40, color: '#8B4513', dir: 1, speed: 70, count: 3 },
+      { row: 3, width: 184, height: 40, color: '#A0522D', dir: 1, speed: 50, count: 3 },
+      { row: 5, width: 92, height: 40, color: '#6B3410', dir: 1, speed: 100, count: 4 }
+    ];
+
+    logDefs.forEach(def => {
+      const spacing = W / def.count;
+      for (let i = 0; i < def.count; i++) {
+        const x = i * spacing - def.width * 0.2;
+        logs.push(makeLaneObject('log', def.row, x, def.width, def.height, def.dir, def.speed * rm, def.color, {
+          barkLines: Array.from({ length: 3 }, () => 8 + Math.random() * (def.height - 16)),
+          knots: Array.from({ length: 2 }, () => ({ x: 20 + Math.random() * (def.width - 40), y: 10 + Math.random() * (def.height - 20) }))
+        }));
+      }
+    });
+
+    const turtleDefs = [
+      { row: 2, width: 138, height: 38, count: 4, turtles: 3, speed: 60 },
+      { row: 4, width: 92, height: 38, count: 4, turtles: 2, speed: 90 }
+    ];
+
+    turtleDefs.forEach(def => {
+      const spacing = W / def.count;
+      const divingIndex = Math.floor(Math.random() * def.count);
+      for (let i = 0; i < def.count; i++) {
+        turtles.push(makeLaneObject('turtles', def.row, i * spacing + 10, def.width, def.height, -1, def.speed * rm, '#00AA44', {
+          turtleCount: def.turtles,
+          diving: i === divingIndex,
+          diveTimer: Math.random() * 4,
+          diveState: 'SURFACED',
+          opacity: 1,
+          yOffset: 0
+        }));
+      }
+    });
+  }
+
+  function resetFrog(full = false) {
+    frog.x = colToX(START_COL);
+    frog.row = START_ROW;
+    frog.dir = 'up';
+    frog.hop = null;
+    frog.queuedDir = null;
+    frog.alive = true;
+    frog.timer = levelTimer(level);
+    frog.farthestRow = START_ROW;
+    frog.deathCause = 'impact';
+    if (full) frog.timer = levelTimer(level);
+  }
+
+  function resetHomes() {
+    homes = HOME_SLOT_CENTERS.map(x => ({ x, filled: false }));
+    fly = null;
+    croc = null;
+  }
+
+  function startGame() {
+    score = 0;
+    level = 1;
+    lives = 3;
+    extraLifeGranted = false;
+    newBest = false;
+    resetHomes();
+    createLevelObjects();
+    resetFrog(true);
+    state = STATES.PLAYING;
+    stateTimer = 0;
+  }
+
+  function award(points) {
+    score += points;
+    if (score > best) {
+      best = score;
+      newBest = true;
+      saveBest();
+    }
+    if (!extraLifeGranted && score >= EXTRA_LIFE_SCORE) {
+      extraLifeGranted = true;
+      lives = Math.min(MAX_LIVES, lives + 1);
+      ensureAudio();
+      sfx.extra();
+    }
+  }
+
+  function keyEdge(code) {
+    return !!keyState[code] && !prevKeyState[code];
+  }
+
+  function pressedDirection() {
+    const order = [
+      ['ArrowUp', 'KeyW', 'up'],
+      ['ArrowLeft', 'KeyA', 'left'],
+      ['ArrowRight', 'KeyD', 'right'],
+      ['ArrowDown', 'KeyS', 'down']
+    ];
+    for (const [a, b, dir] of order) {
+      if (keyEdge(a) || keyEdge(b)) return dir;
+    }
+    if (touchDir) {
+      const d = touchDir;
+      touchDir = null;
+      return d;
+    }
+    return null;
+  }
+
+  function updatePrevKeys() {
+    ['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','KeyW','KeyA','KeyS','KeyD','Enter','KeyP','Escape'].forEach(k => {
+      prevKeyState[k] = !!keyState[k];
+    });
+  }
+
+  function beginHop(dir) {
+    if (!frog.alive || state !== STATES.PLAYING) return false;
+    let targetRow = frog.row;
+    let targetX = frog.x;
+    if (dir === 'up') targetRow -= 1;
+    if (dir === 'down') targetRow += 1;
+    if (dir === 'left') targetX -= CELL;
+    if (dir === 'right') targetX += CELL;
+
+    if (targetRow < 0 || targetRow > START_ROW) return false;
+    targetX = clamp(targetX, colToX(0), colToX(COLS - 1));
+    if ((dir === 'left' || dir === 'right') && targetX === frog.x) return false;
+    if ((dir === 'up' || dir === 'down') && targetRow === frog.row) return false;
+
+    ensureAudio();
+    sfx.hop();
+    frog.dir = dir;
+    frog.hop = {
+      dir,
+      fromX: frog.x,
+      toX: targetX,
+      fromRow: frog.row,
+      toRow: targetRow,
+      t: 0
+    };
+    return true;
+  }
+
+  function currentPlatformAt(x, row) {
+    const center = x;
+    if (row === 1 || row === 3 || row === 5) {
+      return logs.find(log => log.row === row && center >= log.x && center <= log.x + log.width) || null;
+    }
+    if (row === 2 || row === 4) {
+      return turtles.find(group => group.row === row && group.diveState !== 'SUBMERGED' && center >= group.x && center <= group.x + group.width) || null;
+    }
+    return null;
+  }
+
+  function resolveHomeEntry(x) {
+    const slotIndex = homes.findIndex(slot => Math.abs(x - slot.x) <= 20);
+    if (slotIndex === -1) {
+      triggerDeath('impact');
+      return;
+    }
+    const slot = homes[slotIndex];
+    if (slot.filled) {
+      triggerDeath('impact');
+      return;
+    }
+    if (croc && croc.slotIndex === slotIndex && croc.open) {
+      triggerDeath('impact');
+      return;
+    }
+
+    slot.filled = true;
+    let bonus = Math.floor(frog.timer) * 10;
+    award(50 + bonus);
+    ensureAudio();
+    sfx.home();
+
+    if (fly && fly.slotIndex === slotIndex) {
+      award(200);
+      sfx.fly();
+      fly = null;
+    }
+
+    if (homes.every(h => h.filled)) {
+      award(1000);
+      state = STATES.LEVEL_CLEAR;
+      stateTimer = LEVEL_CLEAR_DURATION;
+      ensureAudio();
+      sfx.level();
+    } else {
+      resetFrog(true);
+    }
+  }
+
+  function triggerDeath(cause) {
+    if (state !== STATES.PLAYING || !frog.alive) return;
+    frog.alive = false;
+    frog.deathCause = cause;
+    frog.hop = null;
+    state = STATES.DEATH;
+    stateTimer = DEATH_DURATION + RESPAWN_DELAY;
+    createDeathParticles(frog.x, rowToY(frog.row), cause === 'water' ? '#66ccff' : '#ff6666');
+    ensureAudio();
+    if (cause === 'water') sfx.splash(); else sfx.crunch();
+  }
+
+  function createDeathParticles(x, y, color) {
+    for (let i = 0; i < 6; i++) {
+      const a = (Math.PI * 2 * i) / 6;
+      particles.push({
+        x, y,
+        vx: Math.cos(a) * (40 + Math.random() * 30),
+        vy: Math.sin(a) * (40 + Math.random() * 30),
+        life: 0.3,
+        maxLife: 0.3,
+        color
+      });
+    }
+  }
+
+  function updateParticles(dt) {
+    for (const p of particles) {
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.life -= dt;
+    }
+    particles = particles.filter(p => p.life > 0);
+  }
+
+  function updateObjects(arr, dt) {
+    for (const obj of arr) {
+      obj.x += obj.speed * obj.dir * dt;
+      if (obj.dir < 0 && obj.x + obj.width < -50) obj.x = W + 50;
+      if (obj.dir > 0 && obj.x > W + 50) obj.x = -obj.width - 50;
+    }
+  }
+
+  function updateTurtles(dt) {
+    updateObjects(turtles, dt);
+    for (const group of turtles) {
+      if (!group.diving) continue;
+      group.diveTimer += dt;
+      const cycle = group.diveTimer % 7;
+      if (cycle < 4) {
+        group.diveState = 'SURFACED';
+        group.opacity = 1;
+        group.yOffset = 0;
+      } else if (cycle < 4.5) {
+        const t = (cycle - 4) / 0.5;
+        group.diveState = 'SINKING';
+        group.opacity = lerp(1, 0.4, t);
+        group.yOffset = lerp(0, 4, t);
+      } else if (cycle < 6.5) {
+        group.diveState = 'SUBMERGED';
+        group.opacity = 0;
+        group.yOffset = 5;
+      } else {
+        const t = (cycle - 6.5) / 0.5;
+        group.diveState = 'SURFACING';
+        group.opacity = lerp(0.4, 1, t);
+        group.yOffset = lerp(4, 0, t);
+      }
+    }
+  }
+
+  function maybeSpawnFly(dt) {
+    if (homes.filter(h => h.filled).length < 1) return;
+    if (fly) {
+      fly.time -= dt;
+      if (fly.time <= 0) fly = null;
+      return;
+    }
+    flyTimer -= dt;
+    if (flyTimer <= 0) {
+      flyTimer = 5;
+      if (Math.random() < 0.3) {
+        const empty = homes.map((h, i) => ({ ...h, i })).filter(h => !homes[h.i].filled && (!croc || croc.slotIndex !== h.i));
+        if (empty.length) {
+          const pick = empty[(Math.random() * empty.length) | 0];
+          fly = { slotIndex: pick.i, time: 8, pulse: 0 };
+        }
+      }
+    }
+    if (fly) fly.pulse += dt * 3;
+  }
+
+  function maybeSpawnCroc(dt) {
+    if (level < 4) return;
+    if (croc) {
+      croc.time -= dt;
+      croc.anim += dt;
+      croc.open = Math.floor(croc.anim / 0.3) % 2 === 0;
+      if (croc.time <= 0 || homes[croc.slotIndex].filled) croc = null;
+      return;
+    }
+    if (Math.random() < dt * 0.08) {
+      const empty = homes.map((h, i) => ({ ...h, i })).filter(h => !homes[h.i].filled);
+      if (empty.length) {
+        const pick = empty[(Math.random() * empty.length) | 0];
+        croc = { slotIndex: pick.i, time: 6, anim: 0, open: true };
+      }
+    }
+  }
+
+  function maybeSpawnSnake(dt) {
+    if (level < 3) return;
+    if (snake) {
+      snake.time -= dt;
+      if (snake.log) {
+        snake.x = snake.log.x + snake.offset;
+        snake.row = snake.log.row;
+      }
+      if (snake.time <= 0) snake = null;
+      return;
+    }
+    if (Math.random() < dt * 0.05) {
+      const visibleLogs = logs.filter(log => log.x + log.width > 0 && log.x < W);
+      if (visibleLogs.length) {
+        const log = visibleLogs[(Math.random() * visibleLogs.length) | 0];
+        snake = {
+          log,
+          offset: 18 + Math.random() * Math.max(10, log.width - 48),
+          x: log.x,
+          row: log.row,
+          time: 8 + Math.random() * 7
+        };
+      }
+    }
+  }
+
+  function checkVehicleCollision() {
+    const fy = rowToY(frog.row);
+    const frogBox = { x: frog.x - 15, y: fy - 15, w: 30, h: 30 };
+    for (const v of vehicles) {
+      if (v.row !== frog.row) continue;
+      const box = { x: v.x, y: v.y, w: v.width, h: v.height };
+      if (frogBox.x < box.x + box.w && frogBox.x + frogBox.w > box.x && frogBox.y < box.y + box.h && frogBox.y + frogBox.h > box.y) {
+        triggerDeath('impact');
+        return;
+      }
+    }
+  }
+
+  function checkRiverState(dt) {
+    if (frog.row < 1 || frog.row > 5) return;
+    const platform = currentPlatformAt(frog.x, frog.row);
+    if (!platform) {
+      triggerDeath('water');
+      return;
+    }
+    if (platform.kind === 'turtles' && platform.diveState === 'SUBMERGED') {
+      triggerDeath('water');
+      return;
+    }
+    frog.x += platform.speed * platform.dir * dt;
+    if (frog.x < -20 || frog.x > 660) {
+      triggerDeath('water');
+      return;
+    }
+    if (snake && snake.row === frog.row) {
+      const sx = snake.x;
+      if (frog.x > sx && frog.x < sx + 30) {
+        triggerDeath('impact');
+      }
+    }
+  }
+
+  function finalizeHop() {
+    if (!frog.hop) return;
+    frog.x = frog.hop.toX;
+    frog.row = frog.hop.toRow;
+    frog.hop = null;
+
+    if (frog.row < frog.farthestRow) {
+      frog.farthestRow = frog.row;
+      award(10);
+    }
+
+    if (frog.row === 0) {
+      resolveHomeEntry(frog.x);
+      return;
+    }
+
+    if (frog.row >= 1 && frog.row <= 5) {
+      frog.x = clamp(frog.x, -20, 660);
+      const platform = currentPlatformAt(frog.x, frog.row);
+      if (!platform || (platform.kind === 'turtles' && platform.diveState === 'SUBMERGED')) {
+        triggerDeath('water');
+        return;
+      }
+    }
+
+    if (frog.queuedDir && state === STATES.PLAYING && frog.alive) {
+      const dir = frog.queuedDir;
+      frog.queuedDir = null;
+      beginHop(dir);
+    }
+  }
+
+  function updateHop(dt) {
+    if (!frog.hop) return;
+    frog.hop.t += dt;
+    if (frog.hop.t >= HOP_DURATION) finalizeHop();
+  }
+
+  function updateTimer(dt) {
+    if (state !== STATES.PLAYING || !frog.alive || frog.hop) return;
+    frog.timer -= dt;
+    if (frog.timer <= 0) {
+      frog.timer = 0;
+      triggerDeath('impact');
+      return;
+    }
+    if (frog.timer < 5) {
+      timerWarningTick -= dt;
+      if (timerWarningTick <= 0) {
+        timerWarningTick = 0.5;
+        ensureAudio();
+        sfx.tick();
+      }
+    } else {
+      timerWarningTick = 0;
+    }
+  }
+
+  function updateTitle(dt) {
+    updateObjects(vehicles, dt);
+    updateObjects(logs, dt);
+    updateTurtles(dt);
+    updateParticles(dt);
+    maybeSpawnSnake(dt);
+    rippleTime += dt;
+    attractTime += dt;
+  }
+
+  function advanceLevel() {
+    level++;
+    resetHomes();
+    createLevelObjects();
+    resetFrog(true);
+    state = STATES.PLAYING;
+  }
+
+  function handleInput() {
+    if (keyEdge('Enter')) {
+      ensureAudio();
+      if (state === STATES.TITLE) startGame();
+      else if (state === STATES.GAME_OVER) {
+        resetHomes();
+        createLevelObjects();
+        resetFrog(true);
+        state = STATES.TITLE;
+      }
+    }
+
+    if (keyEdge('KeyP') || keyEdge('Escape')) {
+      if (state === STATES.PLAYING) {
+        pausedFrom = state;
+        state = STATES.PAUSED;
+      } else if (state === STATES.PAUSED) {
+        state = pausedFrom;
+      }
+    }
+
+    if (state === STATES.PLAYING) {
+      const dir = pressedDirection();
+      if (dir) {
+        if (frog.hop) {
+          if (!frog.queuedDir) frog.queuedDir = dir;
+        } else {
+          beginHop(dir);
+        }
+      }
+    }
+  }
+
+  function update(dt) {
+    rippleTime += dt;
+    updateParticles(dt);
+
+    if (state === STATES.TITLE) {
+      updateTitle(dt);
+      return;
+    }
+    if (state === STATES.PAUSED) return;
+
+    updateObjects(vehicles, dt);
+    updateObjects(logs, dt);
+    updateTurtles(dt);
+    maybeSpawnFly(dt);
+    maybeSpawnSnake(dt);
+    maybeSpawnCroc(dt);
+
+    if (state === STATES.PLAYING) {
+      updateHop(dt);
+      updateTimer(dt);
+      if (frog.alive && !frog.hop) {
+        checkRiverState(dt);
+        if (state === STATES.PLAYING) checkVehicleCollision();
+      }
+    } else if (state === STATES.DEATH) {
+      stateTimer -= dt;
+      if (stateTimer <= RESPAWN_DELAY) {
+        if (lives > 0 && stateTimer <= 0) {
+          lives--;
+          if (lives > 0) {
+            resetFrog(true);
+            state = STATES.PLAYING;
+          } else {
+            state = STATES.GAME_OVER;
+            stateTimer = 0;
+          }
+        }
+      }
+    } else if (state === STATES.LEVEL_CLEAR) {
+      stateTimer -= dt;
+      if (stateTimer <= 0) advanceLevel();
+    } else if (state === STATES.GAME_OVER) {
+      attractTime += dt;
+    }
+  }
+
+  function drawRoundedRect(x, y, w, h, r, color) {
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  function drawBackground() {
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.fillStyle = '#226622';
+    ctx.fillRect(0, rowTop(0), W, CELL);
+
+    ctx.fillStyle = '#003388';
+    ctx.fillRect(0, rowTop(1), W, CELL * 5);
+
+    ctx.fillStyle = '#332244';
+    ctx.fillRect(0, rowTop(6), W, CELL);
+    ctx.fillStyle = '#443355';
+    medianPebbles.forEach(p => ctx.fillRect(p.x, p.y, p.s, p.s));
+
+    for (let row = 7; row <= 11; row++) {
+      ctx.fillStyle = row % 2 ? '#1f1f1f' : '#242424';
+      ctx.fillRect(0, rowTop(row), W, CELL);
+    }
+
+    ctx.fillStyle = '#33AA33';
+    ctx.fillRect(0, rowTop(12), W, CELL);
+
+    drawWaterRipples();
+    drawRoadMarks();
+    drawHomeUnderlay();
+  }
+
+  function drawWaterRipples() {
+    ctx.strokeStyle = '#0055BB';
+    ctx.lineWidth = 1;
+    for (let i = 0; i < 4; i++) {
+      const baseY = rowTop(1) + 18 + i * 52;
+      ctx.beginPath();
+      for (let x = 0; x <= W; x += 8) {
+        const y = baseY + Math.sin(x / 40 + rippleTime * 2 + i) * 2;
+        if (x === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+  }
+
+  function drawRoadMarks() {
+    ctx.fillStyle = '#444';
+    for (let row = 7; row < 11; row++) {
+      const y = rowTop(row + 1) - 1;
+      for (let x = 0; x < W; x += 16) {
+        ctx.fillRect(x, y, 8, 1);
+      }
+    }
+  }
+
+  function drawHomeUnderlay() {
+    homes.forEach((slot, i) => {
+      const x = slot.x - 22;
+      const y = rowTop(0) + 2;
+      drawRoundedRect(x, y, 44, 42, 12, '#001a00');
+      if (slot.filled) {
+        drawMiniFrog(slot.x, rowTop(0) + 23, 0.55, state === STATES.LEVEL_CLEAR && Math.floor(stateTimer * 12) % 2 === 0 ? '#AAFF66' : '#22CC22');
+      } else {
+        ctx.fillStyle = '#33AA33';
+        ctx.beginPath();
+        ctx.ellipse(slot.x, rowTop(0) + 26, 10, 6, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      if (fly && fly.slotIndex === i && !slot.filled) drawFly(slot.x, rowTop(0) + 18);
+      if (croc && croc.slotIndex === i && !slot.filled) drawCrocHead(slot.x, rowTop(0) + 23, croc.open);
+    });
+  }
+
+  function drawHomeOverlay() {
+    ctx.fillStyle = '#226622';
+    for (let x = 0; x < W; x += 28) {
+      ctx.fillRect(x, rowTop(0), 18, 12);
+      ctx.fillRect(x + 6, rowTop(0) + 8, 22, 8);
+    }
+    homes.forEach(slot => {
+      ctx.clearRect(slot.x - 24, rowTop(0), 48, 16);
+      ctx.fillStyle = '#226622';
+      ctx.fillRect(slot.x - 28, rowTop(0), 4, 46);
+      ctx.fillRect(slot.x + 24, rowTop(0), 4, 46);
+    });
+  }
+
+  function drawVehicle(v) {
+    drawRoundedRect(v.x, v.y, v.width, v.height, 8, v.color);
+    ctx.fillStyle = 'rgba(255,255,255,0.45)';
+    const wx = v.dir > 0 ? v.x + v.width - 14 : v.x + 4;
+    ctx.fillRect(wx, v.y + 7, 10, 16);
+    if (v.kind === 'truck') {
+      ctx.fillStyle = '#999';
+      ctx.fillRect(v.x + 10, v.y + 8, v.width - 26, 8);
+    }
+  }
+
+  function drawLog(log) {
+    drawRoundedRect(log.x, log.y, log.width, log.height, 10, log.color);
+    ctx.strokeStyle = '#5C2D0A';
+    ctx.lineWidth = 1;
+    log.barkLines.forEach(lineY => {
+      ctx.beginPath();
+      ctx.moveTo(log.x + 6, log.y + lineY);
+      ctx.lineTo(log.x + log.width - 6, log.y + lineY);
+      ctx.stroke();
+    });
+    ctx.fillStyle = '#6B3410';
+    log.knots.forEach(k => {
+      ctx.beginPath();
+      ctx.arc(log.x + k.x, log.y + k.y, 2, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+
+  function drawTurtleGroup(group) {
+    if (group.diveState === 'SUBMERGED') return;
+    ctx.save();
+    ctx.globalAlpha = group.opacity;
+    const segment = group.width / group.turtleCount;
+    for (let i = 0; i < group.turtleCount; i++) {
+      const x = group.x + i * segment + 2;
+      const y = group.y + group.yOffset;
+      ctx.fillStyle = '#00AA44';
+      ctx.beginPath();
+      ctx.ellipse(x + 19, y + 16, 18, 14, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#33CC66';
+      ctx.strokeRect(x + 12, y + 10, 14, 10);
+      ctx.fillStyle = '#00AA44';
+      ctx.beginPath();
+      ctx.arc(x + (group.dir < 0 ? 4 : 34), y + 16, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillRect(x + 4, y + 26, 4, 5);
+      ctx.fillRect(x + 30, y + 26, 4, 5);
+    }
+    ctx.restore();
+  }
+
+  function drawSnake() {
+    if (!snake) return;
+    const x = snake.x;
+    const y = rowTop(snake.row) + 16;
+    ctx.strokeStyle = '#CC2222';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    for (let i = 0; i <= 30; i += 4) {
+      const px = x + i;
+      const py = y + Math.sin((i / 30) * Math.PI * 2 + attractTime * 8) * 5;
+      if (i === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+  }
+
+  function drawFly(x, y) {
+    const scale = 1 + Math.sin(attractTime * 18) * 0.1;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(scale, scale);
+    ctx.fillStyle = '#FFD700';
+    ctx.beginPath();
+    ctx.arc(0, 0, 5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#FF4444';
+    ctx.fillRect(-2, -6, 4, 12);
+    ctx.restore();
+  }
+
+  function drawCrocHead(x, y, open) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.fillStyle = '#557733';
+    ctx.fillRect(-16, -8, 32, 16);
+    ctx.fillStyle = '#88AA55';
+    if (open) {
+      ctx.beginPath();
+      ctx.moveTo(-16, -8);
+      ctx.lineTo(16, -16);
+      ctx.lineTo(16, -8);
+      ctx.closePath();
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(-16, 8);
+      ctx.lineTo(16, 16);
+      ctx.lineTo(16, 8);
+      ctx.closePath();
+      ctx.fill();
+    } else {
+      ctx.fillRect(-16, -10, 32, 20);
+    }
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(8, -5, 3, 3);
+    ctx.restore();
+  }
+
+  function drawMiniFrog(x, y, scale = 1, color = '#22CC22') {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(scale, scale);
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.roundRect(-14, -10, 28, 20, 8);
+    ctx.fill();
+    ctx.fillRect(-17, -8, 6, 10);
+    ctx.fillRect(11, -8, 6, 10);
+    ctx.fillRect(-17, 2, 6, 10);
+    ctx.fillRect(11, 2, 6, 10);
+    ctx.fillStyle = '#AAFFAA';
+    ctx.beginPath(); ctx.arc(-6, -8, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(6, -8, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawFrog() {
+    const vis = frogVisual();
+    ctx.save();
+    ctx.translate(vis.x, vis.y);
+    let rot = 0;
+    if (frog.dir === 'left') rot = -Math.PI / 2;
+    if (frog.dir === 'right') rot = Math.PI / 2;
+    if (frog.dir === 'down') rot = Math.PI;
+    ctx.rotate(rot);
+    ctx.scale(vis.sx, vis.sy);
+
+    const dying = state === STATES.DEATH;
+    const color = dying ? '#FF4444' : '#22CC22';
+    const dark = dying ? '#AA2222' : '#114411';
+    const bodyH = dying ? 18 : 24;
+
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.roundRect(-14, -12, 28, bodyH, 8);
+    ctx.fill();
+    ctx.fillRect(-19, -10, 6, 10);
+    ctx.fillRect(13, -10, 6, 10);
+    ctx.fillRect(-19, 2, 6, 10);
+    ctx.fillRect(13, 2, 6, 10);
+    ctx.fillStyle = dark;
+    ctx.fillRect(-6, -1, 12, 6);
+    ctx.fillStyle = '#AAFFAA';
+    ctx.beginPath(); ctx.arc(-6, -10, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(6, -10, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawParticles() {
+    particles.forEach(p => {
+      ctx.save();
+      ctx.globalAlpha = p.life / p.maxLife;
+      ctx.strokeStyle = p.color;
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      ctx.lineTo(p.x - p.vx * 0.04, p.y - p.vy * 0.04);
+      ctx.stroke();
+      ctx.restore();
+    });
+  }
+
+  function drawHUD() {
+    ctx.fillStyle = '#fff';
+    ctx.font = '16px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`Score: ${score}`, 16, 20);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#888';
+    ctx.font = '14px monospace';
+    ctx.fillText(`Best: ${best}`, 322, 20);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#aaa';
+    ctx.fillText(`Lv ${level}`, 620, 20);
+
+    const icons = Math.min(5, Math.max(0, lives - (state === STATES.DEATH || state === STATES.GAME_OVER ? 1 : 0)));
+    for (let i = 0; i < icons; i++) drawMiniFrog(24 + i * 22, 720, 0.45);
+
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#aaa';
+    ctx.font = '11px monospace';
+    ctx.fillText('TIME', 260, 724);
+    ctx.strokeStyle = '#333';
+    ctx.strokeRect(300, 710, 200, 10);
+    const maxT = levelTimer(level);
+    const ratio = clamp(frog.timer / maxT, 0, 1);
+    const color = frog.timer > 10 ? '#00CC00' : frog.timer > 5 ? '#FFCC00' : '#FF4444';
+    ctx.fillStyle = color;
+    ctx.fillRect(300, 710, 200 * ratio, 10);
+  }
+
+  function drawWorld() {
+    drawBackground();
+    logs.forEach(drawLog);
+    turtles.forEach(drawTurtleGroup);
+    vehicles.forEach(drawVehicle);
+    drawSnake();
+    drawHomeUnderlay();
+    if (state !== STATES.TITLE || Math.floor(attractTime * 2) % 2 === 0) drawFrog();
+    drawHomeOverlay();
+    drawParticles();
+    drawHUD();
+  }
+
+  function drawTitle() {
+    drawWorld();
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.fillRect(0, 160, W, 360);
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 48px monospace';
+    ctx.fillStyle = Math.floor(attractTime * 2) % 2 === 0 ? '#22CC22' : '#FFFF44';
+    ctx.fillText('FROGGER', W / 2, 250);
+    const t = (attractTime % 0.5) / 0.5;
+    ctx.save();
+    ctx.translate(W / 2, 340);
+    let sx = 1, sy = 1;
+    if (t < 0.33) { sy = 0.8; sx = 1.05; }
+    else if (t < 0.66) { sx = 1.15; sy = 0.9; }
+    ctx.scale(sx, sy);
+    drawMiniFrog(0, 0, 1.2);
+    ctx.restore();
+    if (Math.floor(attractTime * 2) % 2 === 0) {
+      ctx.fillStyle = '#AAAAAA';
+      ctx.font = '18px monospace';
+      ctx.fillText('Press Enter to Start', W / 2, 450);
+    }
+    ctx.fillStyle = '#555555';
+    ctx.font = '14px monospace';
+    ctx.fillText(`Best: ${best}`, W / 2, 490);
+  }
+
+  function drawPaused() {
+    drawWorld();
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff';
+    ctx.font = '36px monospace';
+    ctx.fillText('PAUSED', W / 2, 340);
+    ctx.fillStyle = '#aaa';
+    ctx.font = '14px monospace';
+    ctx.fillText('P to resume', W / 2, 372);
+  }
+
+  function drawGameOver() {
+    drawWorld();
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#FF4444';
+    ctx.font = '40px monospace';
+    ctx.fillText('GAME OVER', W / 2, 300);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = '24px monospace';
+    ctx.fillText(`Score: ${score}`, W / 2, 350);
+    if (newBest) {
+      ctx.fillStyle = '#FFD700';
+      ctx.font = '18px monospace';
+      ctx.fillText('NEW BEST!', W / 2, 385);
+    }
+    ctx.fillStyle = '#AAAAAA';
+    ctx.font = '16px monospace';
+    ctx.fillText(`Level reached: ${level}`, W / 2, 415);
+    if (Math.floor(attractTime * 2) % 2 === 0) {
+      ctx.fillStyle = '#888888';
+      ctx.fillText('Enter to restart', W / 2, 460);
+    }
+  }
+
+  function render() {
+    if (state === STATES.TITLE) drawTitle();
+    else if (state === STATES.PAUSED) drawPaused();
+    else if (state === STATES.GAME_OVER) drawGameOver();
+    else drawWorld();
+  }
+
+  function loop(ts) {
+    if (!lastTime) lastTime = ts;
+    const dt = Math.min(DT_CAP, (ts - lastTime) / 1000);
+    lastTime = ts;
+
+    handleInput();
+    update(dt);
+    render();
+    updatePrevKeys();
+    requestAnimationFrame(loop);
+  }
+
+  window.addEventListener('keydown', e => {
+    keyState[e.code] = true;
+    if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','KeyW','KeyA','KeyS','KeyD','Enter','KeyP','Escape'].includes(e.code)) e.preventDefault();
+    ensureAudio();
+  });
+  window.addEventListener('keyup', e => {
+    keyState[e.code] = false;
+  });
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    ensureAudio();
+    const rect = canvas.getBoundingClientRect();
+    const t = e.touches[0];
+    const x = (t.clientX - rect.left) * (canvas.width / rect.width);
+    const y = (t.clientY - rect.top) * (canvas.height / rect.height);
+    if (y > rowTop(12)) {
+      if (x < W * 0.33) touchDir = 'left';
+      else if (x > W * 0.66) touchDir = 'right';
+      else touchDir = 'up';
+    } else {
+      touchDir = x < W / 2 ? 'left' : 'right';
+    }
+  }, { passive: false });
+
+  resetHomes();
+  createLevelObjects();
+  resetFrog(true);
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

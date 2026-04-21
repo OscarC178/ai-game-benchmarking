@@ -1,0 +1,403 @@
+<!--
+  GAME:      Frogger
+  RUN:       r3-gemini-pro
+  BUILDER:   anthropic/claude-opus-4.6
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Frogger</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;display:flex;justify-content:center;align-items:center;height:100vh;overflow:hidden}
+canvas{display:block}
+</style>
+</head>
+<body>
+<canvas id="c" width="600" height="650"></canvas>
+<script>
+(function(){
+'use strict';
+const cv=document.getElementById('c'),cx=cv.getContext('2d');
+const W=600,H=650,RH=46,COLS=15,CW=40;
+const PLAY_X=0,PLAY_W=W;
+
+let ac=null;
+function ia(){if(ac)return;try{ac=new(AudioContext||webkitAudioContext)();}catch(e){}}
+function tone(f,d,v,t){if(!ac)return;try{const o=ac.createOscillator(),g=ac.createGain();o.type=t||'square';o.frequency.value=f;g.gain.value=v||0.05;g.gain.linearRampToValueAtTime(0,ac.currentTime+d);o.connect(g);g.connect(ac.destination);o.start();o.stop(ac.currentTime+d);}catch(e){}}
+function sndHop(){if(!ac)return;try{const o=ac.createOscillator(),g=ac.createGain();o.type='sine';o.frequency.setValueAtTime(300,ac.currentTime);o.frequency.linearRampToValueAtTime(600,ac.currentTime+0.06);g.gain.value=0.08;g.gain.linearRampToValueAtTime(0,ac.currentTime+0.06);o.connect(g);g.connect(ac.destination);o.start();o.stop(ac.currentTime+0.06);}catch(e){}}
+function sndDie(){tone(200,0.3,0.1,'sawtooth');}
+function sndHome(){tone(800,0.05,0.1,'sine');setTimeout(()=>tone(1000,0.05,0.1,'sine'),60);setTimeout(()=>tone(1200,0.08,0.1,'sine'),120);}
+function sndTick(){tone(1200,0.02,0.04,'square');}
+
+// Row layout (top to bottom): 0=HUD, 1=Goal, 2-6=River, 7=Median, 8-12=Road, 13=Start
+function rowY(r){return r*RH+24;}
+
+const ST_TITLE=0,ST_PLAY=1,ST_DEAD=2,ST_OVER=3,ST_WIN=4;
+let state=ST_TITLE;
+
+let frog,score,hiScore,lives,level,timer,maxTimer;
+let homes,vehicles,riverObjs,deathTimer,highestRow;
+let tickTimer;
+
+hiScore=0;
+try{const v=localStorage.getItem('frog3_best');if(v)hiScore=parseInt(v)||0;}catch(e){}
+function saveHi(){if(score>hiScore){hiScore=score;try{localStorage.setItem('frog3_best',String(hiScore));}catch(e){}}}
+
+// Vehicle definitions per lane: {row, dir, speed, width, color, spacing, count}
+function makeLanes(lvl){
+  const sp=1+lvl*0.12;
+  vehicles=[];
+  const defs=[
+    {row:12,dir:1,speed:50*sp,w:80,color:'#e0e040',count:3,gap:200},
+    {row:11,dir:-1,speed:80*sp,w:50,color:'#ff4444',count:3,gap:180},
+    {row:10,dir:1,speed:60*sp,w:120,color:'#aa44cc',count:2,gap:280},
+    {row:9,dir:-1,speed:110*sp,w:40,color:'#ffffff',count:4,gap:160},
+    {row:8,dir:1,speed:70*sp,w:60,color:'#ff8800',count:3,gap:200}
+  ];
+  for(const d of defs){
+    for(let i=0;i<d.count;i++){
+      const x=d.dir>0?-d.w-i*d.gap:W+i*d.gap;
+      vehicles.push({x,y:rowY(d.row)+3,w:d.w,h:RH-6,speed:d.speed*d.dir,color:d.color,row:d.row});
+    }
+  }
+}
+
+function makeRiver(lvl){
+  const sp=1+lvl*0.08;
+  riverObjs=[];
+  const defs=[
+    {row:6,dir:-1,speed:40*sp,w:120,type:'log',count:3,gap:210},
+    {row:5,dir:1,speed:55*sp,w:0,type:'turtle',count:4,gap:160,groupSize:3,dive:lvl>1},
+    {row:4,dir:-1,speed:65*sp,w:160,type:'log',count:2,gap:300},
+    {row:3,dir:1,speed:45*sp,w:0,type:'turtle',count:3,gap:200,groupSize:2,dive:lvl>2},
+    {row:2,dir:-1,speed:75*sp,w:Math.max(80,130-lvl*10),type:'log',count:3,gap:220}
+  ];
+  for(const d of defs){
+    for(let i=0;i<d.count;i++){
+      if(d.type==='log'){
+        const x=d.dir>0?-d.w-i*d.gap:W+i*d.gap;
+        riverObjs.push({x,y:rowY(d.row)+3,w:d.w,h:RH-6,speed:d.speed*d.dir,color:'#8B4513',type:'log',row:d.row,safe:true});
+      }else{
+        const gs=d.groupSize||3;
+        const tw=gs*32+8;
+        const x=d.dir>0?-tw-i*d.gap:W+i*d.gap;
+        riverObjs.push({x,y:rowY(d.row)+3,w:tw,h:RH-6,speed:d.speed*d.dir,color:'#cc3333',
+          type:'turtle',row:d.row,groupSize:gs,
+          dive:d.dive&&(i%2===0),diveTimer:Math.random()*4+2,diveState:0,safe:true});
+      }
+    }
+  }
+}
+
+function initHomes(){
+  homes=[];
+  const slotW=40,gap=(W-5*slotW)/6;
+  for(let i=0;i<5;i++){
+    homes.push({x:gap+i*(slotW+gap),y:rowY(1)+4,w:slotW,h:RH-8,filled:false});
+  }
+}
+
+function resetFrog(){
+  frog={x:W/2-15,y:rowY(13)+5,w:30,h:30,dir:0,alive:true,riding:null};
+  highestRow=13;
+  timer=maxTimer;
+}
+
+function startGame(){
+  score=0;lives=3;level=1;maxTimer=35;
+  initHomes();makeLanes(level);makeRiver(level);
+  resetFrog();tickTimer=0;
+  state=ST_PLAY;
+}
+
+function nextLevel(){
+  level++;maxTimer=Math.max(20,35-level);
+  makeLanes(level);makeRiver(level);
+  initHomes();resetFrog();
+}
+
+function killFrog(){
+  if(!frog.alive)return;
+  frog.alive=false;sndDie();lives--;
+  state=ST_DEAD;deathTimer=1.2;
+}
+
+function homeReached(h){
+  h.filled=true;
+  score+=50+Math.floor(timer*10);saveHi();sndHome();
+  if(homes.every(h=>h.filled)){score+=1000;saveHi();state=ST_WIN;deathTimer=2;return;}
+  resetFrog();
+}
+
+const keys={},prevKeys={};
+addEventListener('keydown',e=>{keys[e.code]=true;ia();e.preventDefault();});
+addEventListener('keyup',e=>{keys[e.code]=false;});
+function edge(c){return keys[c]&&!prevKeys[c];}
+
+function update(dt){
+  if(state===ST_TITLE){
+    if(edge('Enter')||edge('Space'))startGame();
+    Object.assign(prevKeys,keys);return;
+  }
+  if(state===ST_OVER){
+    if(edge('Enter')||edge('Space')){state=ST_TITLE;}
+    Object.assign(prevKeys,keys);return;
+  }
+  if(state===ST_DEAD){
+    deathTimer-=dt;
+    if(deathTimer<=0){
+      if(lives<=0){state=ST_OVER;saveHi();Object.assign(prevKeys,keys);return;}
+      resetFrog();state=ST_PLAY;
+    }
+    Object.assign(prevKeys,keys);return;
+  }
+  if(state===ST_WIN){
+    deathTimer-=dt;
+    if(deathTimer<=0)nextLevel();
+    Object.assign(prevKeys,keys);return;
+  }
+
+  // Timer
+  timer-=dt;
+  if(timer<=5){tickTimer+=dt;if(tickTimer>=0.25){tickTimer=0;sndTick();}}
+  if(timer<=0){killFrog();Object.assign(prevKeys,keys);return;}
+
+  // Move vehicles
+  for(const v of vehicles){
+    v.x+=v.speed*dt;
+    if(v.speed>0&&v.x>W+10)v.x=-v.w-10;
+    if(v.speed<0&&v.x<-v.w-10)v.x=W+10;
+  }
+
+  // Move river objects
+  for(const r of riverObjs){
+    r.x+=r.speed*dt;
+    if(r.speed>0&&r.x>W+10)r.x=-r.w-10;
+    if(r.speed<0&&r.x<-r.w-10)r.x=W+10;
+    if(r.type==='turtle'&&r.dive){
+      r.diveTimer-=dt;
+      if(r.diveTimer<=0){
+        r.diveState=(r.diveState+1)%3; // 0=surface,1=submerging,2=submerged
+        r.diveTimer=r.diveState===2?1.5:r.diveState===1?0.6:3+Math.random()*2;
+        r.safe=r.diveState!==2;
+      }
+    }
+  }
+
+  // Frog movement
+  if(frog.alive){
+    let moved=false;
+    if(edge('ArrowUp')||edge('KeyW')){if(frog.y>rowY(1)){frog.y-=RH;frog.dir=0;moved=true;}}
+    if(edge('ArrowDown')||edge('KeyS')){if(frog.y<rowY(13)){frog.y+=RH;frog.dir=2;moved=true;}}
+    if(edge('ArrowLeft')||edge('KeyA')){if(frog.x>5){frog.x-=CW;frog.dir=3;moved=true;}}
+    if(edge('ArrowRight')||edge('KeyD')){if(frog.x<W-frog.w-5){frog.x+=CW;frog.dir=1;moved=true;}}
+    if(moved){
+      sndHop();
+      const currentRow=Math.round((frog.y-24)/RH);
+      if(currentRow<highestRow){score+=10*(highestRow-currentRow);highestRow=currentRow;saveHi();}
+    }
+
+    // Determine frog's row
+    const fr=Math.round((frog.y-24)/RH);
+
+    // Goal row
+    if(fr<=1){
+      let landed=false;
+      for(const h of homes){
+        if(!h.filled&&frog.x+frog.w>h.x+6&&frog.x<h.x+h.w-6){
+          frog.x=h.x+5;frog.y=h.y;landed=true;homeReached(h);break;
+        }
+      }
+      if(!landed)killFrog();
+      Object.assign(prevKeys,keys);return;
+    }
+
+    // River zone (rows 2-6)
+    if(fr>=2&&fr<=6){
+      let onPlatform=false;
+      for(const r of riverObjs){
+        if(r.row!==fr)continue;
+        if(!r.safe)continue;
+        if(frog.x+frog.w-4>r.x&&frog.x+4<r.x+r.w){
+          onPlatform=true;
+          frog.x+=r.speed*dt;
+          frog.riding=r;
+          break;
+        }
+      }
+      if(!onPlatform){killFrog();Object.assign(prevKeys,keys);return;}
+      if(frog.x<-frog.w||frog.x>W){killFrog();Object.assign(prevKeys,keys);return;}
+    }else{
+      frog.riding=null;
+    }
+
+    // Road zone (rows 8-12)
+    if(fr>=8&&fr<=12){
+      for(const v of vehicles){
+        if(v.row!==fr)continue;
+        if(frog.x+frog.w-6>v.x&&frog.x+6<v.x+v.w&&
+           frog.y+frog.h-4>v.y&&frog.y+4<v.y+v.h){
+          killFrog();Object.assign(prevKeys,keys);return;
+        }
+      }
+    }
+  }
+
+  Object.assign(prevKeys,keys);
+}
+
+function render(){
+  cx.fillStyle='#000';cx.fillRect(0,0,W,H);
+
+  if(state===ST_TITLE){
+    cx.fillStyle='#0a0';cx.font='bold 52px monospace';cx.textAlign='center';
+    cx.fillText('FROGGER',W/2,240);
+    cx.fillStyle='#ccc';cx.font='16px monospace';
+    cx.fillText('Guide the frog across road and river!',W/2,320);
+    cx.fillText('Arrow keys to hop. Fill all 5 home slots.',W/2,350);
+    cx.fillStyle='#fff';cx.font='22px monospace';
+    if(Math.floor(Date.now()/600)%2)cx.fillText('Press Enter / Space',W/2,440);
+    if(hiScore>0){cx.fillStyle='#666';cx.font='14px monospace';cx.fillText('Best: '+hiScore,W/2,510);}
+    return;
+  }
+
+  // Background regions
+  // River (rows 2-6)
+  cx.fillStyle='#0000aa';cx.fillRect(0,rowY(2),W,RH*5);
+  // Median (row 7)
+  cx.fillStyle='#224422';cx.fillRect(0,rowY(7),W,RH);
+  // Road (rows 8-12)
+  cx.fillStyle='#222';cx.fillRect(0,rowY(8),W,RH*5);
+  // Road lane lines
+  cx.fillStyle='#555';
+  for(let r=8;r<12;r++){
+    for(let x=0;x<W;x+=50)cx.fillRect(x,rowY(r)+RH-1,30,2);
+  }
+  // Start (row 13)
+  cx.fillStyle='#224422';cx.fillRect(0,rowY(13),W,RH);
+  // Goal row (row 1) - bank with slots
+  cx.fillStyle='#224422';cx.fillRect(0,rowY(1),W,RH);
+  // Home slots
+  for(const h of homes){
+    cx.fillStyle=h.filled?'#0a0':'#003388';
+    cx.fillRect(h.x,h.y,h.w,h.h);
+    if(h.filled)drawFrogAt(h.x+5,h.y+2,26,0);
+  }
+
+  // River objects
+  for(const r of riverObjs){
+    if(r.type==='log'){
+      cx.fillStyle='#8B4513';cx.fillRect(r.x,r.y,r.w,r.h);
+      cx.fillStyle='#a0652f';cx.fillRect(r.x+2,r.y+2,r.w-4,4);
+      cx.fillStyle='#6e3610';cx.fillRect(r.x+2,r.y+r.h-6,r.w-4,4);
+    }else{
+      const gs=r.groupSize||3;
+      const tw=28;
+      if(r.diveState===2){/* submerged, don't draw */}
+      else{
+        const alpha=r.diveState===1?0.4:1;
+        cx.globalAlpha=alpha;
+        for(let i=0;i<gs;i++){
+          const tx=r.x+4+i*34;
+          cx.fillStyle='#33aa33';
+          cx.beginPath();cx.ellipse(tx+tw/2,r.y+r.h/2,tw/2,r.h/2-1,0,0,Math.PI*2);cx.fill();
+          cx.fillStyle='#228822';
+          cx.beginPath();cx.ellipse(tx+tw/2,r.y+r.h/2,tw/2-3,r.h/2-4,0,0,Math.PI*2);cx.fill();
+        }
+        cx.globalAlpha=1;
+      }
+    }
+  }
+
+  // Vehicles
+  for(const v of vehicles){
+    cx.fillStyle=v.color;
+    cx.fillRect(v.x,v.y,v.w,v.h);
+    cx.fillStyle='rgba(0,0,0,0.3)';
+    cx.fillRect(v.x+2,v.y+v.h-4,v.w-4,3);
+    // Headlights
+    cx.fillStyle='#ff0';
+    if(v.speed>0){cx.fillRect(v.x+v.w-4,v.y+4,3,4);cx.fillRect(v.x+v.w-4,v.y+v.h-8,3,4);}
+    else{cx.fillRect(v.x+1,v.y+4,3,4);cx.fillRect(v.x+1,v.y+v.h-8,3,4);}
+  }
+
+  // Frog
+  if(frog.alive&&state!==ST_DEAD)drawFrogAt(frog.x,frog.y,frog.w,frog.dir);
+
+  // Death animation
+  if(state===ST_DEAD&&deathTimer>0.4){
+    cx.fillStyle='#f00';cx.font='bold 28px monospace';cx.textAlign='center';
+    cx.fillText('💀',frog.x+frog.w/2,frog.y+frog.h/2+10);
+  }
+
+  // HUD
+  cx.fillStyle='#000';cx.fillRect(0,0,W,24);
+  cx.fillStyle='#fff';cx.font='16px monospace';cx.textAlign='left';
+  cx.fillText('SCORE: '+score,10,18);
+  cx.textAlign='center';
+  cx.fillText('LEVEL '+level,W/2,18);
+  cx.textAlign='right';
+  cx.fillText('BEST: '+hiScore,W-10,18);
+  // Lives
+  for(let i=0;i<lives;i++)drawFrogAt(10+i*22,H-30,18,0);
+  // Timer bar
+  const tw=W-20,tp=Math.max(0,timer/maxTimer);
+  cx.fillStyle='#333';cx.fillRect(10,H-10,tw,6);
+  cx.fillStyle=tp>0.25?'#0f0':tp>0.1?'#ff0':'#f00';
+  cx.fillRect(10,H-10,tw*tp,6);
+
+  // Overlays
+  if(state===ST_WIN){
+    cx.fillStyle='#ff0';cx.font='bold 32px monospace';cx.textAlign='center';
+    cx.fillText('LEVEL COMPLETE!',W/2,H/2);
+  }
+  if(state===ST_OVER){
+    cx.fillStyle='rgba(0,0,0,0.6)';cx.fillRect(0,0,W,H);
+    cx.fillStyle='#f44';cx.font='bold 42px monospace';cx.textAlign='center';
+    cx.fillText('GAME OVER',W/2,H/2-30);
+    cx.fillStyle='#fff';cx.font='22px monospace';
+    cx.fillText('Score: '+score,W/2,H/2+10);
+    cx.fillStyle='#aaa';cx.font='18px monospace';
+    if(Math.floor(Date.now()/600)%2)cx.fillText('Press Enter',W/2,H/2+60);
+  }
+}
+
+function drawFrogAt(fx,fy,sz,dir){
+  cx.save();cx.translate(fx+sz/2,fy+sz/2);
+  cx.rotate([0,Math.PI/2,Math.PI,-Math.PI/2][dir||0]);
+  cx.translate(-sz/2,-sz/2);
+  // Body
+  cx.fillStyle='#00cc00';
+  cx.beginPath();cx.ellipse(sz/2,sz/2+2,sz/2-2,sz/2-1,0,0,Math.PI*2);cx.fill();
+  // Head
+  cx.fillStyle='#00ee00';
+  cx.beginPath();cx.ellipse(sz/2,sz*0.25,sz*0.3,sz*0.22,0,0,Math.PI*2);cx.fill();
+  // Eyes
+  cx.fillStyle='#fff';
+  cx.beginPath();cx.arc(sz*0.32,sz*0.18,sz*0.1,0,Math.PI*2);cx.fill();
+  cx.beginPath();cx.arc(sz*0.68,sz*0.18,sz*0.1,0,Math.PI*2);cx.fill();
+  cx.fillStyle='#000';
+  cx.beginPath();cx.arc(sz*0.32,sz*0.18,sz*0.05,0,Math.PI*2);cx.fill();
+  cx.beginPath();cx.arc(sz*0.68,sz*0.18,sz*0.05,0,Math.PI*2);cx.fill();
+  // Legs
+  cx.fillStyle='#00aa00';
+  cx.fillRect(1,sz*0.6,sz*0.18,sz*0.35);
+  cx.fillRect(sz-sz*0.18-1,sz*0.6,sz*0.18,sz*0.35);
+  cx.restore();
+}
+
+let lastTime=0;
+function loop(now){
+  requestAnimationFrame(loop);
+  if(!lastTime){lastTime=now;return;}
+  let dt=(now-lastTime)/1000;lastTime=now;
+  if(dt>0.05)dt=0.05;
+  update(dt);render();
+}
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

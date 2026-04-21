@@ -1,0 +1,104 @@
+<!--
+  GAME:      Space Invaders
+  RUN:       r1-opus
+  BUILDER:   openai/gpt-5.4-mini
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Space Invaders</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;display:flex;align-items:center;justify-content:center;overflow:hidden;}
+  canvas{display:block;background:#000;image-rendering:pixelated;}
+</style>
+</head>
+<body>
+<canvas id="cv" width="760" height="640"></canvas>
+<script>
+(()=>{
+const W=760,H=640,HUDT=32,HUDB=620,BASEY=588;
+const ctx=cv.getContext('2d');
+let keys=Object.create(null),spaceLatch=false,last=performance.now(),paused=false,state='TITLE',sub='';
+let score=0,best=+localStorage.getItem('invaders_best')||0,lives=3,wave=1,extraLifeGiven=false;
+let player={x:364,y:558,w:32,h:26,inv:0,dead:0,dx:0};
+let pBullet=null,alienBullets=[],aliens=[],alienFrame=0,alienDir=1,alienDownNext=false,marchAcc=0,baseInterval=800,marchCount=0,aliveCount=55,stepInterval=800,shootChance=0.02;
+let shieldDefs=[152,304,456,608],shields=[],mystery=null,mysteryTimer=25,afterMystery=0,mysteryDir=1,mysteryText=[],explosions=[],floatTexts=[],deathFrame=0,deathT=0;
+let levelFlash=0,titleAttract=[],titleAttractAcc=0,titleBlink=0;
+let audio=null;
+const rowInfo=[{c:'#ff0000',p:30,t:'small'},{c:'#ff0000',p:30,t:'small'},{c:'#ffe700',p:20,t:'medium'},{c:'#ffe700',p:20,t:'medium'},{c:'#00ff00',p:10,t:'large'}];
+function acq(){if(audio)return; try{audio=new (window.AudioContext||window.webkitAudioContext)();}catch(e){audio=null;}}
+function tone(list){if(!audio)return; const t=audio.currentTime; for(const s of list){const o=audio.createOscillator(),g=audio.createGain(); o.type=s.type||'square'; o.frequency.setValueAtTime(s.f0,t+(s.dl||0)/1000); if(s.f1!=null) o.frequency.exponentialRampToValueAtTime(s.f1,t+(s.dl||0+s.du)/1000); g.gain.setValueAtTime(s.g||0.2,t+(s.dl||0)/1000); g.gain.exponentialRampToValueAtTime(0.001,t+(s.dl||0+s.du)/1000); o.connect(g).connect(audio.destination); o.start(t+(s.dl||0)/1000); o.stop(t+(s.dl||0+s.du)/1000+0.03);} }
+const S={march:i=>tone([{f0:[80,72,64,56][i%4],du:80,g:0.3,type:'square'}]),fire:()=>tone([{f0:1200,f1:400,du:60,g:0.2,type:'square'}]),alien:()=>tone([{f0:300,f1:100,du:80,g:0.25,type:'square'}]),boom:()=>tone([{f0:120,du:600,g:0.35,type:'square'}]),ufo:()=>tone([{f0:500,du:120,g:0.15,type:'sine'}]),ufoHit:()=>tone([{f0:1000,f1:200,du:300,g:0.2,type:'sine'}]),extra:()=>tone([{f0:880,du:80,g:0.2,type:'sine'},{f0:1100,du:80,g:0.2,dl:80,type:'sine'}])};
+function rand(a,b){return a+Math.random()*(b-a);} function clamp(v,a,b){return v<a?a:v>b?b:v;}
+function resetPlayer(){player.x=364;player.y=558;player.w=32;player.h=26;player.inv=1;player.dead=0;deathT=0;deathFrame=0;}
+function makeAlien(row,col,y0){const ri=rowInfo[row]; return {alive:true,row,col,type:ri.t,color:ri.c,points:ri.p,x:96+col*48,y:y0+row*36,ox:96+col*48,oy:y0+row*36,frame:0};}
+function buildWave(){aliens=[]; const y0=Math.min(176,96+(wave-1)*20); for(let r=0;r<5;r++)for(let c=0;c<11;c++)aliens.push(makeAlien(r,c,y0)); aliveCount=55; baseInterval=Math.max(500,800-(wave-1)*50); stepInterval=baseInterval; shootChance=Math.min(0.06,0.02+(wave-1)*0.005); alienDir=1; alienDownNext=false; marchAcc=0; alienFrame=0; buildShields(); if(wave===1){titleAttract=[];} }
+function buildShields(){shields=[]; for(const x of shieldDefs){const cvs=document.createElement('canvas'); cvs.width=52; cvs.height=36; const sctx=cvs.getContext('2d'); sctx.fillStyle='#000'; sctx.fillRect(0,0,52,36); sctx.fillStyle='#00ff00'; sctx.fillRect(0,8,52,28); sctx.clearRect(18,24,16,12); shields.push({x:x-26,y:480,canvas:cvs,w:52,h:36});}}
+function resetGame(){score=0;lives=3;wave=1;extraLifeGiven=false;best=best||0;buildWave();resetPlayer();pBullet=null;alienBullets=[];mystery=null;mysteryTimer=25;afterMystery=0;floatTexts=[];explosions=[];levelFlash=0;state='PLAYING';paused=false;}
+function countAlive(){return aliens.filter(a=>a.alive).length;}
+function updateBest(){if(score>best){best=score;try{localStorage.setItem('invaders_best',String(best));}catch(e){}}}
+function firePlayer(){if(pBullet||player.dead||player.inv>0)return; pBullet={x:player.x+14.5,y:player.y-2,w:3,h:12,vy:-450}; S.fire();}
+function startDeath(){if(player.dead||player.inv>0)return; player.dead=1; deathT=1; deathFrame=0; alienBullets=[]; pBullet=null; S.boom();}
+function respawnOrOver(){if(lives>0){resetPlayer();} else state='GAME_OVER';}
+function alienBottomEdge(){let max=-1; for(const a of aliens) if(a.alive && a.y+10>max) max=a.y+10; return max;}
+function bottomShooters(){const shooters=[]; for(let c=0;c<11;c++){for(let r=4;r>=0;r--){const a=aliens[r*11+c]; if(a&&a.alive){shooters.push(a); break;}}} return shooters;}
+function maybeFireAlien(){if(alienBullets.length>=3) return; const shooters=bottomShooters(); if(!shooters.length) return; const elig=[]; for(const a of shooters) if(Math.random()<shootChance) elig.push(a); if(!elig.length) return; const a=elig[Math.floor(Math.random()*elig.length)]; alienBullets.push({x:a.x+8,y:a.y+10,w:3,h:10,vy:180});}
+function stepAliens(){alienFrame^=1; marchCount++; S.march(marchCount); aliveCount=countAlive(); if(alienDownNext){for(const a of aliens) if(a.alive) a.y+=20; alienDownNext=false; alienDir*=-1;} else {for(const a of aliens) if(a.alive) a.x+=2*alienDir;} const living=aliens.filter(a=>a.alive); if(living.length){let left=1e9,right=-1e9; for(const a of living){left=Math.min(left,a.x); right=Math.max(right,a.x+16);} if(left<=10||right>=740) alienDownNext=true;} maybeFireAlien(); }
+function updateIntervals(){aliveCount=countAlive(); stepInterval=Math.max(50,baseInterval*(aliveCount/55)); }
+function makeExplosion(x,y){explosions.push({x,y,t:0});}
+function makeFloat(txt,x,y){floatTexts.push({txt,x,y,t:0});}
+function shieldHit(b){for(const s of shields){if(b.x+b.w<s.x||b.x>s.x+s.w||b.y+b.h<s.y||b.y>s.y+s.h) continue; const cx=clamp(Math.floor(b.x+b.w/2),0,51), cy=clamp(Math.floor(b.y+b.h/2)- (s.y-480),0,35); const g=s.canvas.getContext('2d'); g.globalCompositeOperation='destination-out'; g.beginPath(); g.arc(cx,cy,6,0,Math.PI*2); g.fill(); g.globalCompositeOperation='source-over'; return true;} return false;}
+function alienOverlapShields(){for(const a of aliens){if(!a.alive) continue; for(const s of shields){if(a.x+16<s.x||a.x>s.x+s.w||a.y+10<s.y||a.y>s.y+s.h) continue; const g=s.canvas.getContext('2d'); g.globalCompositeOperation='destination-out'; g.fillRect(Math.max(0,a.x-s.x),Math.max(0,a.y-s.y),16,10); g.globalCompositeOperation='source-over'; }}}
+function fireMystery(){if(mystery || countAlive()<8) return; if(mysteryTimer>0){mysteryTimer-=0;} }
+function spawnMystery(){mystery={x:mysteryDir===1?-40:W+40,y:52,w:32,h:14,dir:mysteryDir,points:[50,100,100,100,150,150,300][Math.floor(Math.random()*7)]}; mysteryDir*=-1; afterMystery=0; S.ufo();}
+function stepMystery(dt){if(mystery){mystery.x+=mystery.dir*100*dt; if((mystery.dir===1&&mystery.x>W+40)||(mystery.dir===-1&&mystery.x<-40)){mystery=null; mysteryTimer=rand(20,30); afterMystery=0;}} else {if(afterMystery===0) afterMystery=25; if(countAlive()>=8){mysteryTimer-=dt; if(mysteryTimer<=0) spawnMystery();}} }
+function titleInit(){state='TITLE'; if(titleAttract.length===0){titleAttract=[makeAlien(0,0,92),makeAlien(1,1,92),makeAlien(2,2,92),makeAlien(3,3,92),makeAlien(4,4,92)]; titleAttract.forEach((a,i)=>{a.x=120+i*90; a.y=80+Math.floor(i/2)*28; a.col=i; a.row=i%5;}); }}
+function updateTitle(dt){titleBlink+=dt; titleAttractAcc+=dt; if(titleAttractAcc>0.8){titleAttractAcc-=0.8; for(const a of titleAttract) a.frame^=1; titleAttract.forEach((a,i)=>{a.x+= (i%2?2:-2); if(a.x<60||a.x>650) a.x=clamp(a.x,60,650);}); }}
+function updatePlay(dt){if(player.inv>0) player.inv-=dt; if(player.dead){deathT-=dt; if(deathT<=0){lives=Math.max(0,lives-1); if(lives>0){resetPlayer();} else state='GAME_OVER'; } return; }
+ if(keys['ArrowLeft']||keys['KeyA']) player.x-=200*dt; if(keys['ArrowRight']||keys['KeyD']) player.x+=200*dt; player.x=clamp(player.x,10,750-player.w);
+ if(pBullet){pBullet.y+=pBullet.vy*dt; if(pBullet.y+pBullet.h<32){pBullet=null;} }
+ for(const b of alienBullets){b.y+=b.vy*dt;}
+ if(mystery) stepMystery(dt);
+ if(state==='PLAYING' && !paused){
+  marchAcc+=dt;
+  updateIntervals();
+  let steps=0; while(marchAcc>=stepInterval && steps<1){marchAcc-=stepInterval; stepAliens(); steps++;}
+ }
+ if(alienBottomEdge()>=558){state='GAME_OVER';}
+ alienOverlapShields();
+ handleCollisions(dt);
+ if(aliveCount===0){levelClear();}
+}
+function handleCollisions(dt){if(pBullet){for(const a of aliens){if(!a.alive) continue; if(pBullet.x<pBullet.w+a.x && pBullet.x+pBullet.w>a.x && pBullet.y<pBullet.h+a.y && pBullet.y+pBullet.h>a.y){a.alive=false; score+=a.points; updateBest(); makeExplosion(a.x+8,a.y+5); S.alien(); pBullet=null; updateIntervals(); break;}} if(pBullet){if(shieldHit(pBullet)) pBullet=null; else if(mystery && pBullet.x<mystery.x+mystery.w && pBullet.x+pBullet.w>mystery.x && pBullet.y<mystery.y+mystery.h && pBullet.y+pBullet.h>mystery.y){makeFloat(String(mystery.points),mystery.x+8,mystery.y-4); score+=mystery.points; updateBest(); S.ufoHit(); mystery=null; pBullet=null; mysteryTimer=rand(20,30);}} }
+ for(let i=alienBullets.length-1;i>=0;i--){const b=alienBullets[i]; if(b.y>588){alienBullets.splice(i,1); continue;} if(shieldHit(b)){alienBullets.splice(i,1); continue;} if(!player.dead && player.inv<=0 && rectsOverlap(b.x,b.y,b.w,b.h,player.x,player.y,player.w,player.h)){alienBullets.splice(i,1); startDeath(); continue;}}
+ if(pBullet && pBullet.y<32) pBullet=null;
+ if(score>=1500 && !extraLifeGiven){extraLifeGiven=true; if(lives<5){lives++; S.extra();}}
+}
+function levelClear(){levelFlash=0.06; wave++; buildWave(); player.inv=1; pBullet=null; alienBullets=[]; mystery=null; mysteryTimer=25;}
+function rectsOverlap(ax,ay,aw,ah,bx,by,bw,bh){return ax<bx+bw && ax+aw>bx && ay<by+bh && ay+ah>by;}
+function drawAlien(a){const f=a.frame?1:0; const shapes={small:[[[2,0,8,2],[0,2,12,2],[0,4,12,2],[2,6,2,2],[8,6,2,2],[0,8,12,2]],[[2,0,8,2],[0,2,12,2],[2,4,8,2],[0,6,3,2],[9,6,3,2],[2,8,2,2],[8,8,2,2]]],medium:[[[3,0,10,2],[2,2,12,2],[0,4,16,2],[0,6,16,2],[3,8,2,2],[11,8,2,2]],[[4,0,2,2],[10,0,2,2],[2,2,12,2],[0,4,16,2],[2,6,3,2],[11,6,3,2],[4,8,2,2],[10,8,2,2]]],large:[[[2,0,14,2],[0,2,18,2],[0,4,18,2],[0,6,18,2],[3,8,2,2],[13,8,2,2]],[[2,0,14,2],[0,2,18,2],[2,4,14,2],[0,6,3,2],[15,6,3,2],[3,8,2,2],[13,8,2,2]]]};
+ ctx.fillStyle=a.color; const arr=shapes[a.type][f]; for(const r of arr) ctx.fillRect(a.x+r[0],a.y+r[1],r[2],r[3]); }
+function drawPlayer(){const blink=player.inv>0 && Math.floor(performance.now()/125)%2===0; if(blink) return; ctx.fillStyle='#00ff00'; ctx.fillRect(player.x,player.y+18,32,8); ctx.fillRect(player.x+6,player.y+10,20,8); ctx.fillRect(player.x+14,player.y,4,10);} 
+function drawShield(s){ctx.drawImage(s.canvas,s.x,s.y);} 
+function drawBullet(b,col='white'){ctx.fillStyle=col; ctx.fillRect(b.x,b.y,b.w,b.h);} 
+function render(){ctx.clearRect(0,0,W,H); ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H); ctx.strokeStyle='#333'; ctx.strokeRect(0,0,W,H); ctx.fillStyle='#00ff00'; ctx.fillRect(0,BASEY,W,2); drawHUD(); if(state==='TITLE'){drawTitle();} else {drawPlay();} if(levelFlash>0){ctx.fillStyle='rgba(255,255,255,1)'; ctx.fillRect(0,0,W,H);} if(state==='PAUSED') drawPaused(); if(state==='GAME_OVER') drawGameOver(); }
+function drawHUD(){ctx.fillStyle='#fff'; ctx.font='13px monospace'; ctx.textAlign='left'; ctx.fillText('SCORE',20,14); ctx.fillText('HI-SCORE',350,14); ctx.fillStyle='#00ff00'; ctx.font='17px monospace'; ctx.fillText(score,20,30); ctx.fillStyle='#ff0000'; ctx.fillText(best,350,30); ctx.fillStyle='#fff'; ctx.font='14px monospace'; ctx.textAlign='left'; ctx.fillText(''+lives,20,608); for(let i=0;i<Math.min(4,lives-1);i++){drawMiniCannon(48+i*18,602);} ctx.textAlign='right'; ctx.fillStyle='#aaa'; ctx.fillText('WAVE '+wave,730,608); }
+function drawMiniCannon(x,y){ctx.fillStyle='#00ff00'; ctx.fillRect(x,y+6,12,3); ctx.fillRect(x+3,y+3,6,3); ctx.fillRect(x+5,y,2,3); }
+function drawTitle(){ctx.save(); ctx.textAlign='center'; ctx.fillStyle='#fff'; ctx.font='42px monospace'; ctx.fillText('SPACE INVADERS',W/2,140); const items=[{y:220,t:'30 points',a:'small',c:'#ff0000'},{y:265,t:'20 points',a:'medium',c:'#ffe700'},{y:310,t:'10 points',a:'large',c:'#00ff00'},{y:355,t:'mystery',a:'mystery',c:'#ff0000'}]; for(const it of items){if(it.a!=='mystery'){let a=makeAlien(0,0,0); a.type=it.a;a.color=it.c; a.frame=0; a.x=220; a.y=it.y-10; drawAlien(a); ctx.fillStyle='#fff'; ctx.font='16px monospace'; ctx.textAlign='left'; ctx.fillText(it.t,300,it.y);} else {drawMystery(220,it.y-8); ctx.fillStyle='#fff'; ctx.font='16px monospace'; ctx.textAlign='left'; ctx.fillText('= ? MYSTERY',300,it.y);} } ctx.font='20px monospace'; ctx.fillStyle='#aaa'; ctx.globalAlpha=0.4+0.6*(0.5+0.5*Math.sin(titleBlink*Math.PI)); ctx.fillText('Press Enter to Start',W/2,450); ctx.globalAlpha=1; ctx.font='16px monospace'; ctx.fillStyle='#555'; ctx.fillText('Best: '+best,W/2,500); if(titleAttract.length){for(const a of titleAttract) drawAlien(a);} ctx.restore(); }
+function drawMystery(x,y){ctx.fillStyle='#ff0000'; ctx.fillRect(x,y+4,32,6); ctx.fillRect(x+6,y,20,6); }
+function drawPlay(){for(const s of shields) drawShield(s); for(const ex of explosions){ctx.save(); ctx.globalAlpha=1-ex.t/0.2; ctx.strokeStyle='#fff'; ctx.lineWidth=2; for(let i=0;i<8;i++){ctx.beginPath(); ctx.moveTo(ex.x,ex.y); const ang=i*Math.PI/4; ctx.lineTo(ex.x+Math.cos(ang)*(6+2*Math.sin(i)), ex.y+Math.sin(ang)*(6+2*Math.sin(i))); ctx.stroke();} ctx.restore();} for(const ft of floatTexts){ctx.save(); const a=ft.t<0.7?1:1-clamp((ft.t-0.7)/0.3,0,1); ctx.globalAlpha=a; ctx.fillStyle='#fff'; ctx.font='16px monospace'; ctx.textAlign='center'; ctx.fillText(ft.txt,ft.x,ft.y-ft.t*20); ctx.restore();} aliens.forEach(a=>{if(a.alive) drawAlien(a);}); if(mystery) drawUfo(); if(pBullet) drawBullet(pBullet,'#fff'); alienBullets.forEach(b=>drawBullet(b,'#fff')); if(!player.dead && player.inv<=0) drawPlayer(); else drawDeath(); }
+function drawUfo(){ctx.fillStyle='#ff0000'; ctx.fillRect(mystery.x,mystery.y+5,32,6); ctx.fillRect(mystery.x+7,mystery.y,18,5); }
+function drawDeath(){const blink=player.inv>0 && Math.floor(performance.now()/125)%2===0; if(blink && state!=='GAME_OVER'){drawPlayer(); return;} ctx.fillStyle='#00ff00'; const f= Math.floor(deathT*10)%2; if(f===0){ctx.fillRect(player.x,player.y+18,32,8); ctx.fillRect(player.x+2,player.y+8,8,8); ctx.fillRect(player.x+22,player.y+6,8,8); ctx.fillRect(player.x+10,player.y,4,8);} else {ctx.fillRect(player.x+2,player.y+16,28,6); ctx.fillRect(player.x,player.y+4,6,8); ctx.fillRect(player.x+24,player.y+8,6,8); ctx.fillRect(player.x+12,player.y+10,6,6);} }
+function drawPaused(){ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(0,HUDT,W,558); ctx.fillStyle='#fff'; ctx.textAlign='center'; ctx.font='36px monospace'; ctx.fillText('PAUSED',W/2,300); ctx.font='14px monospace'; ctx.fillStyle='#888'; ctx.fillText('P to resume',W/2,330);} 
+function drawGameOver(){ctx.save(); ctx.fillStyle='rgba(0,0,0,0.7)'; ctx.fillRect(0,HUDT,W,558); ctx.textAlign='center'; ctx.font='44px monospace'; ctx.fillStyle='#ff0000'; ctx.fillText('GAME OVER',W/2,270); ctx.font='24px monospace'; ctx.fillStyle='#fff'; ctx.fillText('Score: '+score,W/2,330); if(score>=best){ctx.font='18px monospace'; ctx.fillStyle='#ffe700'; ctx.globalAlpha=0.5+0.5*Math.sin(performance.now()/500*Math.PI); ctx.fillText('HIGH SCORE!',W/2,365); ctx.globalAlpha=1;} ctx.font='16px monospace'; ctx.fillStyle='#888'; ctx.fillText('Wave reached: '+wave,W/2,395); if(Math.floor(performance.now()/250)%2===0){ctx.fillStyle='#666'; ctx.fillText('Enter to play again',W/2,450);} ctx.restore(); }
+function tick(now){let dt=Math.min(0.05,(now-last)/1000); last=now; if(levelFlash>0) levelFlash-=dt; if(state==='TITLE') updateTitle(dt); else if(state==='PLAYING'){if(!paused) updatePlay(dt);} else if(state==='PAUSED'){} else if(state==='GAME_OVER'){} for(const ex of explosions) ex.t+=dt; explosions=explosions.filter(e=>e.t<0.2); for(const ft of floatTexts) ft.t+=dt; floatTexts=floatTexts.filter(f=>f.t<1.0); if(mystery) mysteryTimer=Math.max(0,mysteryTimer); if(state==='TITLE' && !titleAttract.length) titleInit(); render(); requestAnimationFrame(tick); }
+addEventListener('keydown',e=>{keys[e.code]=true; if(['ArrowLeft','ArrowRight','KeyA','KeyD','Space','Enter','KeyP','Escape'].includes(e.code)) e.preventDefault(); acq(); if(e.code==='Space'){ if(!spaceLatch && state==='PLAYING' && !player.dead && player.inv<=0){firePlayer();} spaceLatch=true; } if(e.code==='Enter'){ if(state==='TITLE'){resetGame();} else if(state==='GAME_OVER'){titleInit(); state='TITLE'; score=0; lives=3; wave=1; extraLifeGiven=false; buildWave(); } } if((e.code==='KeyP'||e.code==='Escape') && state==='PLAYING'){paused=!paused; state=paused?'PAUSED':'PLAYING'; } else if((e.code==='KeyP'||e.code==='Escape') && state==='PAUSED'){paused=false; state='PLAYING'; } });
+addEventListener('keyup',e=>{keys[e.code]=false; if(e.code==='Space') spaceLatch=false;});
+function titleInit(){state='TITLE'; paused=false; titleBlink=0; titleAttractAcc=0; titleAttract=[]; const a1=makeAlien(0,0,0),a2=makeAlien(2,0,0),a3=makeAlien(4,0,0); a1.x=140;a1.y=60;a2.x=240;a2.y=60;a3.x=340;a3.y=60; titleAttract=[a1,a2,a3]; }
+buildWave(); titleInit(); requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,821 @@
+<!--
+  GAME:           Galaga
+  RUN:            run3-opus-isolated
+  BUILDER:        anthropic/claude-opus-4-6
+  PLANNER:        anthropic/claude-opus-4-6
+  TIMESTAMP:      2026-03-31T04:16:00Z
+  TASKS DONE:     T01,T02,T03,T04,T05,T06,T07,T08,T09,T10,T11,T12,T13
+  FIRST FAILURE:  none
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Galaga</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;display:flex;justify-content:center;align-items:center;height:100vh;overflow:hidden}
+canvas{display:block}
+</style>
+</head>
+<body>
+<canvas id="c" width="800" height="600"></canvas>
+<script>
+'use strict';
+(function(){
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const W = 800, H = 600;
+
+/* ═══════ Audio ═══════ */
+let audioCtx = null;
+function ac(){ if(!audioCtx){const A=window.AudioContext||window.webkitAudioContext;if(A)audioCtx=new A();}if(audioCtx&&audioCtx.state==='suspended')audioCtx.resume();return audioCtx; }
+function sfxFire(){const a=ac();if(!a)return;try{const o=a.createOscillator(),g=a.createGain(),t=a.currentTime;o.type='square';o.frequency.setValueAtTime(1200,t);g.gain.setValueAtTime(0.04,t);g.gain.exponentialRampToValueAtTime(0.0001,t+0.03);o.connect(g);g.connect(a.destination);o.start(t);o.stop(t+0.03);}catch(e){}}
+function sfxHit(){const a=ac();if(!a)return;try{const dur=0.05,buf=a.createBuffer(1,a.sampleRate*dur|0,a.sampleRate),d=buf.getChannelData(0);for(let i=0;i<d.length;i++)d[i]=(Math.random()*2-1)*0.06*(1-i/d.length);const s=a.createBufferSource();s.buffer=buf;s.connect(a.destination);s.start();}catch(e){}}
+function sfxDeath(){const a=ac();if(!a)return;try{const o=a.createOscillator(),g=a.createGain(),t=a.currentTime;o.type='sawtooth';o.frequency.setValueAtTime(660,t);o.frequency.exponentialRampToValueAtTime(55,t+0.4);g.gain.setValueAtTime(0.08,t);g.gain.exponentialRampToValueAtTime(0.0001,t+0.4);o.connect(g);g.connect(a.destination);o.start(t);o.stop(t+0.4);}catch(e){}}
+function sfxStageClear(){const a=ac();if(!a)return;try{[523,659,784,1047].forEach((f,i)=>{const o=a.createOscillator(),g=a.createGain(),t=a.currentTime+i*0.08;o.type='square';o.frequency.setValueAtTime(f,t);g.gain.setValueAtTime(0.04,t);g.gain.exponentialRampToValueAtTime(0.0001,t+0.12);o.connect(g);g.connect(a.destination);o.start(t);o.stop(t+0.12);});}catch(e){}}
+let beamOsc=null,beamGain=null;
+function startBeamSfx(){const a=ac();if(!a||beamOsc)return;try{beamOsc=a.createOscillator();beamGain=a.createGain();const lfo=a.createOscillator(),lg=a.createGain();beamOsc.type='sine';beamOsc.frequency.setValueAtTime(330,a.currentTime);lfo.type='sine';lfo.frequency.value=6;lg.gain.value=110;lfo.connect(lg);lg.connect(beamOsc.frequency);beamGain.gain.value=0.04;beamOsc.connect(beamGain);beamGain.connect(a.destination);beamOsc.start();lfo.start();beamOsc._lfo=lfo;}catch(e){}}
+function stopBeamSfx(){try{if(beamOsc){beamOsc.stop();if(beamOsc._lfo)beamOsc._lfo.stop();}}catch(e){}beamOsc=null;beamGain=null;}
+
+/* ═══════ Constants ═══════ */
+const IDLE=0, PLAYING=1, PAUSED=2, GAME_OVER=3;
+const COLS=10, ROWS=5;
+const COL_SP=48, ROW_SP=40;
+const GRID_CX=400, GRID_CY=160;
+const LS_KEY='galaga_hs_r3';
+
+/* ═══════ Starfield ═══════ */
+const stars=[];
+for(let i=0;i<80;i++) stars.push({x:Math.random()*W,y:Math.random()*H,s:1+Math.random()});
+
+/* ═══════ Dive Path Templates ═══════ */
+// Each path is [cp1x,cp1y, cp2x,cp2y, endx,endy] for cubic bezier from start
+// We'll compute start dynamically from enemy position
+function makeDivePath(sx,sy,playerX){
+  const templates=[
+    // Swoop left then right toward player
+    (sx,sy,px)=>[
+      {x:sx,y:sy},{x:sx-180,y:sy+120},{x:px+80,y:400},{x:px,y:560}
+    ],
+    // Swoop right then left toward player
+    (sx,sy,px)=>[
+      {x:sx,y:sy},{x:sx+180,y:sy+120},{x:px-80,y:400},{x:px,y:560}
+    ],
+    // Loop-the-loop
+    (sx,sy,px)=>[
+      {x:sx,y:sy},{x:sx+150,y:sy-60},{x:sx-150,y:sy+200},{x:px,y:560}
+    ],
+    // S-curve
+    (sx,sy,px)=>[
+      {x:sx,y:sy},{x:sx-120,y:sy+180},{x:sx+120,y:350},{x:px,y:560}
+    ],
+  ];
+  const t = templates[Math.floor(Math.random()*templates.length)];
+  return t(sx,sy,playerX);
+}
+
+// Evaluate cubic bezier at parameter t (0..1)
+function bezPt(p0,p1,p2,p3,t){
+  const u=1-t;
+  return {
+    x: u*u*u*p0.x + 3*u*u*t*p1.x + 3*u*t*t*p2.x + t*t*t*p3.x,
+    y: u*u*u*p0.y + 3*u*u*t*p1.y + 3*u*t*t*p2.y + t*t*t*p3.y
+  };
+}
+
+// Compute bezier arc length for uniform speed
+function bezLen(pts,segs){
+  let len=0;
+  let prev=bezPt(pts[0],pts[1],pts[2],pts[3],0);
+  for(let i=1;i<=segs;i++){
+    const cur=bezPt(pts[0],pts[1],pts[2],pts[3],i/segs);
+    len+=Math.hypot(cur.x-prev.x,cur.y-prev.y);
+    prev=cur;
+  }
+  return len;
+}
+
+/* ═══════ State ═══════ */
+let state=IDLE;
+let score=0, highScore=0, lives=0, stage=0;
+let player, enemies, playerBullets, enemyBullets, particles;
+let diveTimer, respawnTimer, stageTransTimer;
+let capturedShip, dualShip;
+let beamActive, beamBoss, beamTimer, beamX, beamY;
+let swayTime;
+let divingEnemies; // track which enemies are currently diving
+
+try{highScore=parseInt(localStorage.getItem(LS_KEY))||0;}catch(e){}
+function saveHS(){try{localStorage.setItem(LS_KEY,highScore);}catch(e){}}
+
+/* ═══════ Input ═══════ */
+const keys={};
+document.addEventListener('keydown',e=>{
+  const c=e.code;
+  if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Space','Enter','KeyA','KeyD','KeyP'].includes(c))e.preventDefault();
+  if(c==='Enter'){
+    if(state===IDLE||state===GAME_OVER){startGame();return;}
+  }
+  if(c==='KeyP'){
+    if(state===PLAYING)state=PAUSED;
+    else if(state===PAUSED)state=PLAYING;
+    return;
+  }
+  keys[c]=true;
+},{passive:false});
+document.addEventListener('keyup',e=>{keys[e.code]=false;});
+function isDown(a,b){return keys[a]||keys[b];}
+
+/* ═══════ Helpers ═══════ */
+function clamp(v,lo,hi){return v<lo?lo:v>hi?hi:v;}
+function aabb(a,b){return a.x<b.x+b.w&&a.x+a.w>b.x&&a.y<b.y+b.h&&a.y+a.h>b.y;}
+function randRange(lo,hi){return lo+Math.random()*(hi-lo);}
+
+/* ═══════ Particles ═══════ */
+function spawnParticles(x,y,color,count){
+  for(let i=0;i<count;i++){
+    const a=Math.random()*Math.PI*2, sp=randRange(40,140);
+    particles.push({x,y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,life:randRange(0.2,0.5),maxLife:0.5,color});
+  }
+}
+
+/* ═══════ Enemy Types ═══════ */
+// row 0: boss, row 1: butterfly, row 2-3: bee, row 4: bee-blue
+function enemyType(row){
+  if(row===0)return{type:'boss',color:'#00CC00',w:28,h:24,hp:2,fPts:150,dPts:400};
+  if(row===1)return{type:'butterfly',color:'#FF4444',w:24,h:20,hp:1,fPts:80,dPts:160};
+  if(row<=3)return{type:'bee',color:'#FFCC00',w:20,h:18,hp:1,fPts:50,dPts:100};
+  return{type:'bee-blue',color:'#00BBFF',w:20,h:18,hp:1,fPts:50,dPts:100};
+}
+
+function gridPos(col,row){
+  const startX=GRID_CX-((COLS-1)/2)*COL_SP;
+  const startY=GRID_CY-((ROWS-1)/2)*ROW_SP;
+  return{x:startX+col*COL_SP, y:startY+row*ROW_SP};
+}
+
+/* ═══════ Game Init ═══════ */
+function startGame(){
+  ac();
+  score=0; lives=3; stage=0;
+  player={x:400,y:550,w:28,h:30,alive:true};
+  playerBullets=[]; enemyBullets=[]; particles=[];
+  enemies=[]; divingEnemies=[];
+  capturedShip=false; dualShip=false;
+  beamActive=false; beamBoss=null; beamTimer=0;
+  beamX=0; beamY=0;
+  swayTime=0; diveTimer=randRange(2,3);
+  respawnTimer=0; stageTransTimer=0;
+  nextStage();
+  state=PLAYING;
+}
+
+function nextStage(){
+  stage++;
+  enemies=[];
+  divingEnemies=[];
+  for(let r=0;r<ROWS;r++){
+    for(let c=0;c<COLS;c++){
+      const et=enemyType(r);
+      const gp=gridPos(c,r);
+      enemies.push({
+        col:c, row:r,
+        type:et.type, color:et.color,
+        w:et.w, h:et.h,
+        hp:et.hp, maxHp:et.hp,
+        fPts:et.fPts, dPts:et.dPts,
+        alive:true,
+        // Position
+        gx:gp.x, gy:gp.y, // grid home
+        x:gp.x, y:gp.y,
+        // Dive state
+        diving:false,
+        divePath:null, diveT:0, diveLen:0, diveSpeed:250+(stage-1)*20,
+        diveFired:0, diveMaxFire:0,
+        returning:false, returnT:0,
+        // Boss special
+        hasCaptured:false,
+        doingBeam:false,
+      });
+    }
+  }
+  diveTimer=randRange(2,3);
+  beamActive=false; beamBoss=null;
+  stopBeamSfx();
+}
+
+/* ═══════ Drawing ═══════ */
+function drawStars(dt){
+  ctx.fillStyle='#FFFFFF';
+  for(const s of stars){
+    s.y+=20*dt;
+    if(s.y>H){s.y=0;s.x=Math.random()*W;}
+    ctx.fillRect(s.x,s.y,s.s,s.s);
+  }
+}
+
+function drawPlayer(){
+  if(!player.alive) return;
+  // 5-point fighter polygon
+  const cx=player.x, cy=player.y;
+  const drawOne=(ox)=>{
+    ctx.fillStyle='#FFFFFF';
+    ctx.beginPath();
+    ctx.moveTo(ox+0, cy-16);
+    ctx.lineTo(ox-8, cy-4);
+    ctx.lineTo(ox-14, cy+14);
+    ctx.lineTo(ox+14, cy+14);
+    ctx.lineTo(ox+8, cy-4);
+    ctx.closePath();
+    ctx.fill();
+  };
+  if(dualShip){
+    drawOne(cx-14);
+    drawOne(cx+14);
+  } else {
+    drawOne(cx);
+  }
+}
+
+function drawEnemy(e){
+  if(!e.alive) return;
+  const ex=e.x-e.w/2, ey=e.y-e.h/2;
+  // Damaged boss = gray
+  let col=e.color;
+  if(e.type==='boss'&&e.hp===1) col='#888888';
+  if(e.hasCaptured) col='#00FF88'; // slight glow if holding captured ship
+
+  ctx.fillStyle=col;
+
+  if(e.type==='boss'){
+    // Pentagon + antennae
+    ctx.beginPath();
+    const pts=5;
+    for(let i=0;i<pts;i++){
+      const a=-Math.PI/2+i*(Math.PI*2/pts);
+      const px=e.x+Math.cos(a)*12;
+      const py=e.y+Math.sin(a)*12;
+      if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);
+    }
+    ctx.closePath();ctx.fill();
+    // Antennae
+    ctx.strokeStyle=col;ctx.lineWidth=2;
+    ctx.beginPath();ctx.moveTo(e.x-6,e.y-12);ctx.lineTo(e.x-10,e.y-18);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(e.x+6,e.y-12);ctx.lineTo(e.x+10,e.y-18);ctx.stroke();
+  } else if(e.type==='butterfly'){
+    // Body + wings
+    ctx.fillRect(e.x-3,e.y-8,6,16);
+    ctx.beginPath();
+    ctx.ellipse(e.x-7,e.y-2,5,8,0,0,Math.PI*2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(e.x+7,e.y-2,5,8,0,0,Math.PI*2);
+    ctx.fill();
+  } else {
+    // Bee / Bee-blue: diamond shape
+    ctx.beginPath();
+    ctx.moveTo(e.x, e.y-e.h/2);
+    ctx.lineTo(e.x+e.w/2, e.y);
+    ctx.lineTo(e.x, e.y+e.h/2);
+    ctx.lineTo(e.x-e.w/2, e.y);
+    ctx.closePath();
+    ctx.fill();
+  }
+}
+
+function drawBeam(){
+  if(!beamActive||!beamBoss) return;
+  const bx=beamBoss.x;
+  const by=beamBoss.y+beamBoss.h/2;
+  const bw=40, bh=200;
+  // Oscillating alpha
+  const alpha=0.3+0.3*Math.sin(performance.now()*0.01);
+  ctx.fillStyle=`rgba(0,255,0,${alpha})`;
+  ctx.fillRect(bx-bw/2,by,bw,bh);
+  // Bright edges
+  ctx.strokeStyle=`rgba(0,255,0,${alpha+0.2})`;
+  ctx.lineWidth=2;
+  ctx.strokeRect(bx-bw/2,by,bw,bh);
+}
+
+function drawLives(){
+  ctx.fillStyle='#FFFFFF';
+  ctx.font='14px monospace';
+  ctx.textAlign='left';
+  for(let i=0;i<lives;i++){
+    const lx=20+i*22, ly=H-20;
+    ctx.beginPath();
+    ctx.moveTo(lx,ly-8);
+    ctx.lineTo(lx-5,ly+4);
+    ctx.lineTo(lx+5,ly+4);
+    ctx.closePath();
+    ctx.fill();
+  }
+}
+
+function drawHUD(){
+  // Score
+  ctx.fillStyle='#FFFFFF';
+  ctx.font='16px monospace';
+  ctx.textAlign='left';
+  ctx.textBaseline='top';
+  ctx.fillText('Score: '+score, 10, 8);
+
+  // High Score
+  ctx.fillStyle='#AAAAAA';
+  ctx.font='14px monospace';
+  ctx.textAlign='center';
+  ctx.fillText('High Score: '+highScore, W/2, 8);
+
+  // Stage
+  ctx.textAlign='right';
+  ctx.fillText('Stage '+stage, W-10, H-22);
+
+  // Lives
+  drawLives();
+}
+
+function drawStartScreen(dt){
+  ctx.fillStyle='#000000';
+  ctx.fillRect(0,0,W,H);
+  drawStars(dt);
+
+  // Title
+  ctx.fillStyle='#FFCC00';
+  ctx.font='bold 56px monospace';
+  ctx.textAlign='center';
+  ctx.textBaseline='middle';
+  ctx.fillText('GALAGA',W/2,200);
+
+  // Enemy legend
+  const legend=[
+    {color:'#00CC00',name:'Boss Galaga',pts:'150 / 400'},
+    {color:'#FF4444',name:'Butterfly',pts:'80 / 160'},
+    {color:'#FFCC00',name:'Bee',pts:'50 / 100'},
+    {color:'#00BBFF',name:'Bee Variant',pts:'50 / 100'},
+  ];
+  let ly=280;
+  ctx.font='16px monospace';
+  for(const l of legend){
+    ctx.fillStyle=l.color;
+    ctx.fillRect(W/2-140,ly-6,12,12);
+    ctx.fillStyle='#FFFFFF';
+    ctx.textAlign='left';
+    ctx.fillText(l.name+'  '+l.pts, W/2-120, ly);
+    ly+=30;
+  }
+
+  // Start prompt
+  ctx.fillStyle='#AAAAAA';
+  ctx.font='20px monospace';
+  ctx.textAlign='center';
+  ctx.fillText('Press Enter to Start',W/2,420);
+
+  if(highScore>0){
+    ctx.fillStyle='#FFFF00';
+    ctx.font='14px monospace';
+    ctx.fillText('High Score: '+highScore,W/2,460);
+  }
+}
+
+function drawPause(){
+  ctx.fillStyle='rgba(0,0,0,0.8)';
+  ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#FFFFFF';
+  ctx.font='bold 36px monospace';
+  ctx.textAlign='center';
+  ctx.textBaseline='middle';
+  ctx.fillText('PAUSED',W/2,H/2);
+}
+
+function drawGameOver(){
+  ctx.fillStyle='rgba(0,0,0,0.8)';
+  ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#FFFFFF';
+  ctx.font='bold 40px monospace';
+  ctx.textAlign='center';
+  ctx.textBaseline='middle';
+  ctx.fillText('GAME OVER',W/2,H/2-50);
+  ctx.font='24px monospace';
+  ctx.fillText('Score: '+score,W/2,H/2+10);
+  ctx.fillText('High Score: '+highScore,W/2,H/2+45);
+  ctx.fillStyle='#AAAAAA';
+  ctx.font='20px monospace';
+  ctx.fillText('Press Enter to Restart',W/2,H/2+90);
+}
+
+/* ═══════ Update ═══════ */
+function update(dt){
+  if(state!==PLAYING) return;
+  swayTime+=dt;
+
+  // -- Stage transition delay --
+  if(stageTransTimer>0){
+    stageTransTimer-=dt;
+    if(stageTransTimer<=0){
+      nextStage();
+    }
+    return;
+  }
+
+  // -- Player movement --
+  if(player.alive){
+    const pw=dualShip?56:28;
+    if(isDown('ArrowLeft','KeyA')) player.x-=350*dt;
+    if(isDown('ArrowRight','KeyD')) player.x+=350*dt;
+    player.x=clamp(player.x, pw/2, W-pw/2);
+    player.w=pw;
+
+    // Fire
+    if(keys['Space']){
+      keys['Space']=false;
+      const maxB=dualShip?4:2;
+      if(playerBullets.length<maxB){
+        sfxFire();
+        if(dualShip){
+          playerBullets.push({x:player.x-14,y:player.y-16,w:3,h:14});
+          playerBullets.push({x:player.x+14,y:player.y-16,w:3,h:14});
+        } else {
+          playerBullets.push({x:player.x,y:player.y-16,w:3,h:14});
+        }
+      }
+    }
+  } else {
+    // Respawn
+    respawnTimer-=dt;
+    if(respawnTimer<=0){
+      player.alive=true;
+      player.x=400; player.y=550;
+      if(dualShip) player.w=56; else player.w=28;
+    }
+  }
+
+  // -- Player bullets --
+  for(let i=playerBullets.length-1;i>=0;i--){
+    playerBullets[i].y-=550*dt;
+    if(playerBullets[i].y<-20) playerBullets.splice(i,1);
+  }
+
+  // -- Enemy bullets --
+  for(let i=enemyBullets.length-1;i>=0;i--){
+    enemyBullets[i].y+=300*dt;
+    if(enemyBullets[i].y>H+20) enemyBullets.splice(i,1);
+  }
+
+  // -- Formation sway --
+  const swayOff=Math.sin(swayTime*Math.PI)*20; // 0.5Hz
+
+  // -- Update enemies --
+  for(const e of enemies){
+    if(!e.alive) continue;
+
+    if(e.diving){
+      // Move along bezier path
+      const pts=e.divePath;
+      const pathLen=e.diveLen;
+      if(pathLen>0){
+        e.diveT+=e.diveSpeed*dt/pathLen;
+      }
+
+      if(e.diveT>=1){
+        // Passed end of path — wrap from bottom to top and return to grid
+        e.diving=false;
+        e.returning=true;
+        e.returnT=0;
+        // Set return start from top of screen
+        e.x=e.gx+swayOff;
+        e.y=-30;
+        const idx=divingEnemies.indexOf(e);
+        if(idx>=0) divingEnemies.splice(idx,1);
+      } else {
+        const p=bezPt(pts[0],pts[1],pts[2],pts[3],Math.min(e.diveT,1));
+        e.x=p.x; e.y=p.y;
+
+        // Fire during dive
+        if(e.diveFired<e.diveMaxFire && e.diveT>0.3 && Math.random()<dt*2){
+          enemyBullets.push({x:e.x,y:e.y+e.h/2,w:3,h:10});
+          e.diveFired++;
+        }
+      }
+    } else if(e.returning){
+      // Lerp back to grid position
+      e.returnT+=dt*1.5; // takes ~0.67s to return
+      const targetX=e.gx+swayOff;
+      const targetY=e.gy;
+      if(e.returnT>=1){
+        e.returning=false;
+        e.x=targetX;
+        e.y=targetY;
+      } else {
+        const t=e.returnT;
+        // Smooth ease
+        const ease=t*t*(3-2*t);
+        e.x=e.x+(targetX-e.x)*ease*dt*5;
+        e.y=e.y+(targetY-e.y)*ease*dt*5;
+      }
+    } else {
+      // In formation — follow sway
+      e.x=e.gx+swayOff;
+      e.y=e.gy;
+    }
+  }
+
+  // -- Tractor beam update --
+  if(beamActive && beamBoss){
+    if(!beamBoss.alive){
+      beamActive=false;
+      stopBeamSfx();
+    } else {
+      beamTimer+=dt;
+      if(beamTimer>=3){
+        // Beam finishes
+        beamActive=false;
+        beamBoss.doingBeam=false;
+        stopBeamSfx();
+        // Boss returns to formation
+        beamBoss.diving=false;
+        beamBoss.returning=true;
+        beamBoss.returnT=0;
+        const idx=divingEnemies.indexOf(beamBoss);
+        if(idx>=0)divingEnemies.splice(idx,1);
+      } else if(player.alive && !dualShip && !capturedShip){
+        // Check beam overlap with player
+        const bx=beamBoss.x-20, by=beamBoss.y+beamBoss.h/2;
+        const bw=40, bh=200;
+        const pw=player.w, ph=player.h;
+        const prect={x:player.x-pw/2,y:player.y-ph/2,w:pw,h:ph};
+        const brect={x:bx,y:by,w:bw,h:bh};
+        if(aabb(prect,brect) && beamTimer>=1.5){
+          // Capture!
+          capturedShip=true;
+          beamBoss.hasCaptured=true;
+          player.alive=false;
+          lives--;
+          if(lives<=0){
+            state=GAME_OVER;
+            if(score>highScore){highScore=score;saveHS();}
+            stopBeamSfx();
+            return;
+          }
+          respawnTimer=1.5;
+          beamActive=false;
+          beamBoss.doingBeam=false;
+          stopBeamSfx();
+          beamBoss.diving=false;
+          beamBoss.returning=true;
+          beamBoss.returnT=0;
+          const idx=divingEnemies.indexOf(beamBoss);
+          if(idx>=0)divingEnemies.splice(idx,1);
+        }
+      }
+    }
+  }
+
+  // -- Dive timer --
+  diveTimer-=dt;
+  if(diveTimer<=0 && !beamActive){
+    diveTimer=randRange(2,3)/(1+stage*0.1); // faster dives at higher stages
+    const aliveInForm=enemies.filter(e=>e.alive&&!e.diving&&!e.returning);
+    if(aliveInForm.length>0){
+      // Chance for boss tractor beam
+      const bosses=aliveInForm.filter(e=>e.type==='boss'&&!e.hasCaptured);
+      if(bosses.length>0 && !capturedShip && !dualShip && Math.random()<0.15){
+        // Boss tractor beam attack
+        const boss=bosses[Math.floor(Math.random()*bosses.length)];
+        boss.diving=true;
+        boss.doingBeam=true;
+        divingEnemies.push(boss);
+        // Path: dive to above player then hold
+        const targetX=player.alive?player.x:400;
+        boss.divePath=[
+          {x:boss.x,y:boss.y},
+          {x:boss.x,y:boss.y+100},
+          {x:targetX,y:300},
+          {x:targetX,y:340}
+        ];
+        boss.diveLen=bezLen(boss.divePath,30);
+        boss.diveT=0;
+        boss.diveFired=0;
+        boss.diveMaxFire=0;
+        // Beam activates when boss reaches end
+      } else {
+        // Normal dive
+        const count=Math.min(1+Math.floor(Math.random()*3),aliveInForm.length);
+        for(let i=0;i<count;i++){
+          const idx=Math.floor(Math.random()*aliveInForm.length);
+          const e=aliveInForm.splice(idx,1)[0];
+          e.diving=true;
+          e.diveT=0;
+          e.diveFired=0;
+          e.diveMaxFire=1+Math.floor(Math.random()*2);
+          e.divePath=makeDivePath(e.x,e.y,player.alive?player.x:400);
+          e.diveLen=bezLen(e.divePath,30);
+          divingEnemies.push(e);
+        }
+      }
+    }
+  }
+
+  // -- Boss beam activation check --
+  for(const e of enemies){
+    if(e.alive && e.doingBeam && e.diveT>=1 && !beamActive){
+      // Boss reached position, activate beam
+      beamActive=true;
+      beamBoss=e;
+      beamTimer=0;
+      e.diving=false; // hold position
+      startBeamSfx();
+    }
+  }
+
+  // -- Particles --
+  for(let i=particles.length-1;i>=0;i--){
+    const p=particles[i];
+    p.x+=p.vx*dt; p.y+=p.vy*dt;
+    p.life-=dt;
+    if(p.life<=0) particles.splice(i,1);
+  }
+
+  /* ═══════ Collisions ═══════ */
+
+  // Player bullet ↔ Enemy
+  for(let bi=playerBullets.length-1;bi>=0;bi--){
+    const b=playerBullets[bi];
+    const brect={x:b.x-b.w/2,y:b.y-b.h/2,w:b.w,h:b.h};
+    let hit=false;
+    for(const e of enemies){
+      if(!e.alive) continue;
+      const erect={x:e.x-e.w/2,y:e.y-e.h/2,w:e.w,h:e.h};
+      if(aabb(brect,erect)){
+        playerBullets.splice(bi,1);
+        hit=true;
+        e.hp--;
+        if(e.hp<=0){
+          e.alive=false;
+          // Score: diving or formation?
+          const pts=e.diving||e.doingBeam ? e.dPts : e.fPts;
+          score+=pts;
+          if(score>highScore){highScore=score;saveHS();}
+          sfxHit();
+          spawnParticles(e.x,e.y,e.color,10);
+          // Remove from diving list
+          const di=divingEnemies.indexOf(e);
+          if(di>=0)divingEnemies.splice(di,1);
+          // Check if this boss had captured ship
+          if(e.hasCaptured && capturedShip){
+            capturedShip=false;
+            dualShip=true;
+            player.w=56;
+            // Visual feedback
+            spawnParticles(e.x,e.y,'#00FF00',15);
+          }
+          // If boss was doing beam, cancel
+          if(e===beamBoss){
+            beamActive=false;
+            beamBoss=null;
+            stopBeamSfx();
+          }
+        } else {
+          // Damaged (boss first hit)
+          sfxHit();
+        }
+        break;
+      }
+    }
+    if(hit) continue;
+  }
+
+  // Enemy bullet ↔ Player
+  if(player.alive){
+    const pw=player.w, ph=player.h;
+    const prect={x:player.x-pw/2,y:player.y-ph/2,w:pw,h:ph};
+    for(let i=enemyBullets.length-1;i>=0;i--){
+      const b=enemyBullets[i];
+      const brect={x:b.x-b.w/2,y:b.y-b.h/2,w:b.w,h:b.h};
+      if(aabb(prect,brect)){
+        enemyBullets.splice(i,1);
+        killPlayer();
+        break;
+      }
+    }
+  }
+
+  // Diving enemy ↔ Player
+  if(player.alive){
+    const pw=player.w, ph=player.h;
+    const prect={x:player.x-pw/2,y:player.y-ph/2,w:pw,h:ph};
+    for(const e of enemies){
+      if(!e.alive||!e.diving) continue;
+      const erect={x:e.x-e.w/2,y:e.y-e.h/2,w:e.w,h:e.h};
+      if(aabb(prect,erect)){
+        e.alive=false;
+        const di=divingEnemies.indexOf(e);
+        if(di>=0)divingEnemies.splice(di,1);
+        spawnParticles(e.x,e.y,e.color,8);
+        killPlayer();
+        break;
+      }
+    }
+  }
+
+  // -- Check wave clear --
+  const aliveCount=enemies.filter(e=>e.alive).length;
+  if(aliveCount===0 && stageTransTimer<=0){
+    sfxStageClear();
+    stageTransTimer=2;
+    stopBeamSfx();
+  }
+}
+
+function killPlayer(){
+  if(!player.alive) return;
+  player.alive=false;
+  sfxDeath();
+  spawnParticles(player.x,player.y,'#FFFFFF',20);
+  if(dualShip){
+    dualShip=false;
+    player.w=28;
+  }
+  lives--;
+  if(lives<=0){
+    state=GAME_OVER;
+    if(score>highScore){highScore=score;saveHS();}
+    stopBeamSfx();
+  } else {
+    respawnTimer=1.5;
+  }
+}
+
+/* ═══════ Render ═══════ */
+function render(dt){
+  ctx.fillStyle='#000000';
+  ctx.fillRect(0,0,W,H);
+
+  if(state===IDLE){
+    drawStartScreen(dt);
+    return;
+  }
+
+  drawStars(dt);
+
+  // Enemies
+  for(const e of enemies) drawEnemy(e);
+
+  // Beam
+  drawBeam();
+
+  // Player bullets
+  ctx.fillStyle='#FFFFFF';
+  for(const b of playerBullets){
+    ctx.fillRect(b.x-b.w/2,b.y-b.h/2,b.w,b.h);
+  }
+
+  // Enemy bullets
+  ctx.fillStyle='#FF6666';
+  for(const b of enemyBullets){
+    ctx.fillRect(b.x-b.w/2,b.y-b.h/2,b.w,b.h);
+  }
+
+  // Particles
+  for(const p of particles){
+    ctx.globalAlpha=Math.max(0,p.life/p.maxLife);
+    ctx.fillStyle=p.color;
+    ctx.fillRect(p.x-1,p.y-1,3,3);
+  }
+  ctx.globalAlpha=1;
+
+  // Player
+  drawPlayer();
+
+  // HUD
+  drawHUD();
+
+  // Stage transition message
+  if(stageTransTimer>0){
+    ctx.fillStyle='#FFFFFF';
+    ctx.font='bold 28px monospace';
+    ctx.textAlign='center';
+    ctx.textBaseline='middle';
+    ctx.fillText('STAGE '+(stage+1),W/2,H/2);
+  }
+
+  if(state===PAUSED) drawPause();
+  if(state===GAME_OVER) drawGameOver();
+}
+
+/* ═══════ Main Loop ═══════ */
+let lastTs=0;
+function loop(ts){
+  const dt=Math.min((ts-(lastTs||ts))/1000,0.05);
+  lastTs=ts;
+  if(state===PLAYING) update(dt);
+  render(dt);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>

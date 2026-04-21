@@ -1,0 +1,1245 @@
+<!-- frogger | spec:run8-gpt-mini-nano | built-by:gpt-5.4-nano -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Frogger</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #000;
+      height: 100%;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+    #wrap{
+      width: 600px;
+      margin: 0 auto;
+      padding-top: 0;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      user-select: none;
+    }
+    canvas{
+      width: 600px;
+      height: 700px;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+      display: block;
+      background: #000;
+    }
+    .hint {
+      position: absolute;
+      left: -9999px;
+      top: -9999px;
+    }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="game" width="600" height="700" aria-label="Frogger game"></canvas>
+  </div>
+
+  <script>
+    (() => {
+      const canvas = document.getElementById('game');
+      const ctx = canvas.getContext('2d', { alpha: false });
+
+      const W = canvas.width, H = canvas.height;
+
+      // Grid
+      const COLS = 15, ROWS = 13;
+      const CELL = 40; // 40x40 cells => 15*40=600, 13*40=520; top portion + timer/lives within same canvas.
+      const TOP_SAFE_ROW_Y = 520; // spec: starting y=520 for frog on bottom safe row (grid row 13*? not exact). We'll map frog y to exact pixels.
+      // We'll define logical lanes based on spec y positions: vehicles at y=480,440,400,360,320 (5 lanes)
+      // River platforms at y=240,160,80. Turtle groups at y=200 and 120.
+      const LANE_Y = {
+        road: [480, 440, 400, 360, 320],
+        riverLogs: [240, 160, 80],
+        turtle: [200, 120]
+      };
+
+      const homeY = 40;
+
+      const leftMargin = 0;
+      const rightEdge = W;
+
+      // Frog
+      const FROG_CELL = 1; // one grid cell per hop
+      const FROG_SIZE = 32;
+      const FROG_IN_CELL_OFFSET = (CELL - FROG_SIZE)/2; // 4px
+
+      // Entities
+      const DIR_LEFT = -1, DIR_RIGHT = 1;
+
+      const state = {
+        mode: 'IDLE', // IDLE, PLAYING, PAUSED, GAME_OVER
+        lastTime: 0,
+        dt: 0,
+        pausedAt: 0,
+        level: 1,
+        score: 0,
+        highScore: 0,
+        lives: 3,
+        furthestRow: 0, // track forward progress: number of hops beyond start
+        timer: 30,
+        timerMax: 30,
+        filledHomesCount: 0,
+        pendingDeath: false
+      };
+
+      // Persistent audio (optional)
+      let audioCtx = null;
+      function ensureAudio() {
+        if (!audioCtx) {
+          try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+          catch { audioCtx = null; }
+        }
+      }
+      function beep({freq=440, dur=0.06, type='square', gain=0.05, slideTo=null, volume=1}) {
+        if (!audioCtx) return;
+        const t0 = audioCtx.currentTime;
+        const osc = audioCtx.createOscillator();
+        const g = audioCtx.createGain();
+        osc.type = type;
+        osc.frequency.value = freq;
+        if (slideTo !== null) {
+          osc.frequency.setValueAtTime(freq, t0);
+          osc.frequency.exponentialRampToValueAtTime(Math.max(1, slideTo), t0 + dur);
+        }
+        g.gain.setValueAtTime(gain * volume, t0);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+        osc.connect(g);
+        g.connect(audioCtx.destination);
+        osc.start(t0);
+        osc.stop(t0 + dur + 0.02);
+      }
+      function playHop() {
+        ensureAudio();
+        beep({freq:600, dur:0.05, type:'square', gain:0.04});
+      }
+      function playSplash() {
+        ensureAudio();
+        // descending noise burst
+        if (!audioCtx) return;
+        const bufferSize = audioCtx.sampleRate * 0.08;
+        const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+        const data = buffer.getChannelData(0);
+        for (let i=0;i<bufferSize;i++) {
+          const t = i/bufferSize;
+          data[i] = (Math.random()*2-1) * (1-t);
+        }
+        const src = audioCtx.createBufferSource();
+        src.buffer = buffer;
+
+        const filter = audioCtx.createBiquadFilter();
+        filter.type = 'highpass';
+        filter.frequency.value = 400;
+
+        const g = audioCtx.createGain();
+        g.gain.value = 0.04;
+
+        // frequency sweep feel
+        filter.frequency.setValueAtTime(900, audioCtx.currentTime);
+        filter.frequency.exponentialRampToValueAtTime(100, audioCtx.currentTime + 0.08);
+
+        src.connect(filter);
+        filter.connect(g);
+        g.connect(audioCtx.destination);
+
+        src.start();
+        src.stop(audioCtx.currentTime + 0.1);
+      }
+      function playSquash() {
+        ensureAudio();
+        beep({freq:110, dur:0.08, type:'sine', gain:0.05});
+      }
+      function playHomeFill() {
+        ensureAudio();
+        // ascending tone 440->880
+        beep({freq:440, dur:0.10, type:'square', gain:0.04, slideTo:880});
+      }
+
+      function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+      // Deterministic PRNG for lane objects
+      let seed = 1337;
+      function rand() {
+        // LCG
+        seed = (seed * 1664525 + 1013904223) >>> 0;
+        return seed / 4294967296;
+      }
+
+      // Home bays: x=20, 140, 260, 380, 500 and size 48x36. y=40.
+      const homeBays = [
+        {x:20,  y:homeY, w:48, h:36, filled:false},
+        {x:140, y:homeY, w:48, h:36, filled:false},
+        {x:260, y:homeY, w:48, h:36, filled:false},
+        {x:380, y:homeY, w:48, h:36, filled:false},
+        {x:500, y:homeY, w:48, h:36, filled:false},
+      ];
+
+      function resetHomes() {
+        for (const b of homeBays) b.filled = false;
+        state.filledHomesCount = 0;
+      }
+
+      const frog = {
+        // logical cell column and row index
+        // Starting position: column 7, bottom safe row at y=520.
+        cellX: 7, // column
+        cellY: 13 - 0.5, // unused; pixel-based y below
+        x: 7 * CELL,
+        y: TOP_SAFE_ROW_Y,
+        w: FROG_SIZE,
+        h: FROG_SIZE,
+        hopLockMs: 80,
+        hopT: 0,
+        hopFrom: {x:0,y:0},
+        hopTo: {x:0,y:0},
+        alive: true,
+        lastSupportVelX: 0
+      };
+
+      // Road vehicles and river platforms
+      const vehicles = []; // cars/trucks
+      const logs = [];
+      const turtles = [];
+
+      // Speeds base (tuned for readability; multiplied by level *1.0 with +15% per level progression after fill)
+      // Spec: "Lane speeds increase by 15% on each new level."
+      // We'll implement speed = base * (1 + 0.15*(level-1)) in PLAYING.
+      const roadLaneDefs = [
+        // y, dir, baseSpeedPxPerSec, size pattern & count
+        {y:LANE_Y.road[0], dir:DIR_LEFT,  base:140, type:'car',  sizes:[48], windows:true},
+        {y:LANE_Y.road[1], dir:DIR_RIGHT, base:160, type:'car', sizes:[48], windows:true},
+        {y:LANE_Y.road[2], dir:DIR_LEFT,  base:130, type:'car',  sizes:[64], windows:true},
+        {y:LANE_Y.road[3], dir:DIR_RIGHT, base:175, type:'truck',sizes:[96], windows:false},
+        {y:LANE_Y.road[4], dir:DIR_LEFT,  base:150, type:'car',  sizes:[48], windows:true}
+      ];
+      const riverLogDefs = [
+        {y:LANE_Y.riverLogs[0], base:65,  dir:DIR_RIGHT,  speedVar:10, lengths:[120,160,200], color:'#885522'},
+        {y:LANE_Y.riverLogs[1], base:85,  dir:DIR_LEFT,   speedVar:12, lengths:[120,160,200], color:'#774411'},
+        {y:LANE_Y.riverLogs[2], base:55,  dir:DIR_RIGHT,  speedVar:9, lengths:[120,160,200], color:'#885522'}
+      ];
+      const turtleDefs = [
+        {y:LANE_Y.turtle[0], base:70,  dir:DIR_LEFT,  speedVar:11, count:3, groupSize:[2,2,2], color:'#448844'},
+        {y:LANE_Y.turtle[1], base:90,  dir:DIR_RIGHT, speedVar:13, count:2, groupSize:[3,2], color:'#448844'}
+      ];
+
+      function makeVehicle(x, lane, lenW, w, h, color, dir, speed, isTruck=false) {
+        return {x, y:lane.y, w, h, color, dir, speed, win:lane.windows, truck:isTruck};
+      }
+      function makeLog(x, lane, w, h=32, dir, speed, color) {
+        return {x, y:lane.y, w, h, dir, speed, color};
+      }
+      function makeTurtleGroup(x, lane, w, h=32, dir, speed, color, groupIndex=0) {
+        // Dive cycle: visible -> about-to-dive -> submerged -> rising -> visible
+        // Deterministic offsets per groupIndex
+        const period = 5.6; // seconds
+        const visibleFrac = 0.45;
+        const submergedFrac = 0.35;
+        const riseFrac = 0.20;
+        return {
+          x, y:lane.y, w, h, dir, speed, color,
+          dive: {
+            period,
+            t0: groupIndex * 0.9 + 0.2,
+            // states computed from phase
+            visibleFrac,
+            submergedFrac,
+            riseFrac
+          }
+        };
+      }
+
+      function resetLevel(nextLevel=true) {
+        // Clear objects and rebuild
+        vehicles.length = 0;
+        logs.length = 0;
+        turtles.length = 0;
+
+        state.level = nextLevel ? (state.level) : state.level;
+
+        // rebuild lanes with deterministic x positions
+        let localIndex = 0;
+        for (const lane of roadLaneDefs) {
+          // create 4 vehicles in lane spaced
+          const count = 4;
+          const speed = lane.base * (1 + 0.15*(state.level-1));
+          const y = lane.y;
+          for (let i=0;i<count;i++) {
+            const ww = lane.lengths ? lane.lengths[i%lane.lengths.length] : lane.sizes[0];
+            const w = lane.type === 'truck' ? 96 : (lane.type === 'car' ? (lane.sizes[0] || 48) : 48);
+            const h = 32;
+            const spread = (W + 250);
+            const x = -spread/2 + (i*(spread/(count))) + rand()*35;
+            const color = (lane===roadLaneDefs[0]) ? '#CCCC00' :
+                          (lane===roadLaneDefs[1]) ? '#3344AA' :
+                          (lane===roadLaneDefs[2]) ? '#DD2222' :
+                          (lane===roadLaneDefs[3]) ? '#CCCCCC' :
+                          '#FF66AA';
+            vehicles.push(makeVehicle(x, lane, 0, w, h, color, lane.dir, speed*(0.9 + rand()*0.25), lane.type==='truck'));
+            localIndex++;
+          }
+        }
+
+        for (const lane of riverLogDefs) {
+          const speed = lane.base * (1 + 0.15*(state.level-1));
+          const h = 32;
+          const count = 3;
+          for (let i=0;i<count;i++) {
+            const ww = lane.lengths ? lane.lengths[i%lane.lengths.length] : lane.lengths[0];
+            const w = [120,160,200][i % 3];
+            const x = -W*0.2 + i*(W/2) + rand()*90;
+            logs.push(makeLog(x, lane, w, h, lane.dir, speed*(0.9 + rand()*0.25), lane.color));
+          }
+        }
+
+        for (const lane of turtleDefs) {
+          const speed = lane.base * (1 + 0.15*(state.level-1));
+          const groupCount = lane.count === 2 ? 3 : 3;
+          // y lane
+          // Create groups where width differs (80 for 2 turtles, 120 for 3 turtles).
+          for (let i=0;i<groupCount;i++) {
+            const w = (i % 2 === 0) ? 80 : 120;
+            const x = -W*0.25 + i*(W/2) + rand()*110;
+            turtles.push(makeTurtleGroup(x, lane, w, 32, lane.dir, speed*(0.9 + rand()*0.25), lane.color, i));
+          }
+        }
+
+        // Frog position
+        state.timer = state.timerMax;
+        frog.x = frog.cellX * CELL + (CELL/2 - FROG_SIZE/2) - (CELL/2 - FROG_SIZE/2);
+        frog.y = TOP_SAFE_ROW_Y;
+        frog.hopT = 0;
+        frog.alive = true;
+        frog.hopLockMs = 80;
+        frog.lastSupportVelX = 0;
+
+        // Ensure frog aligned to cell
+        frog.x = frog.cellX * CELL + FROG_IN_CELL_OFFSET; // inside cell
+      }
+
+      function startNewGame() {
+        state.mode = 'PLAYING';
+        state.level = 1;
+        state.score = 0;
+        state.lives = 3;
+        state.furthestRow = 0;
+        state.timerMax = 30;
+        state.timer = state.timerMax;
+        state.filledHomesCount = 0;
+        resetHomes();
+        seed = 1337 + Math.floor(Math.random()*1000);
+        resetLevel(true);
+        // Align frog
+        frog.cellX = 7;
+        frog.x = frog.cellX * CELL + FROG_IN_CELL_OFFSET;
+        frog.y = TOP_SAFE_ROW_Y;
+        frog.lastSupportVelX = 0;
+        state.pendingDeath = false;
+        console.log('STATE: IDLE->PLAYING');
+      }
+
+      function togglePause() {
+        if (state.mode === 'PLAYING') {
+          state.mode = 'PAUSED';
+          console.log('STATE: PLAYING->PAUSED');
+        } else if (state.mode === 'PAUSED') {
+          state.mode = 'PLAYING';
+          console.log('STATE: PAUSED->PLAYING');
+        }
+      }
+
+      function die(reason) {
+        if (state.pendingDeath) return;
+        state.pendingDeath = true;
+        // play sound
+        playSquash();
+        if (reason === 'drown' || reason === 'turtleSubmerged') playSplash();
+
+        state.lives -= 1;
+        if (state.lives <= 0) {
+          state.mode = 'GAME_OVER';
+          console.log('STATE: PLAYING->GAME_OVER');
+          state.pendingDeath = false;
+          // update high score
+          try {
+            const hs = Number(localStorage.getItem('frogger_highscore') || '0') || 0;
+            if (state.score > hs) {
+              localStorage.setItem('frogger_highscore', String(state.score));
+              state.highScore = state.score;
+            }
+          } catch {}
+          return;
+        }
+        // respawn frog after brief delay
+        state.mode = 'PLAYING';
+        // small delay via animation frame ticks
+        const respawnDelayMs = 520;
+        const tStart = performance.now();
+        const startLives = state.lives;
+
+        const respawn = () => {
+          if (state.mode === 'PAUSED') {
+            requestAnimationFrame(respawn);
+            return;
+          }
+          if (performance.now() - tStart >= respawnDelayMs) {
+            state.timer = state.timerMax;
+            frog.alive = true;
+            frog.hopT = 0;
+            frog.cellX = 7;
+            frog.x = frog.cellX * CELL + FROG_IN_CELL_OFFSET;
+            frog.y = TOP_SAFE_ROW_Y;
+            frog.lastSupportVelX = 0;
+            // keep objects moving; just reset frog timer for that life
+            state.pendingDeath = false;
+            return;
+          }
+          requestAnimationFrame(respawn);
+        };
+        requestAnimationFrame(respawn);
+      }
+
+      function isRoadRow(y) {
+        return LANE_Y.road.includes(y);
+      }
+
+      function getRiverLaneSupport(xCenter, frogY) {
+        // Determine if frog is within river row (y=240/160/80 for logs, 200/120 for turtles)
+        // Use frog center overlap AABB with platform rectangles.
+        const frogCenterY = frog.y + frog.h/2;
+        const candidates = [];
+        // Logs
+        for (const ln of logs) {
+          if (Math.abs((ln.y + ln.h/2) - frogCenterY) < 40) { // lane region
+            candidates.push(ln);
+          }
+        }
+        // Turtles
+        for (const tg of turtles) {
+          if (Math.abs((tg.y + tg.h/2) - frogCenterY) < 40) {
+            candidates.push(tg);
+          }
+        }
+        // But better: only evaluate based on actual y lane mapping.
+        // We'll do by checking exact y equality within tolerance and then support logic per type.
+        let supported = false;
+        let supportVelX = 0;
+
+        // Determine river rows
+        const yT = frog.y; // top
+        // Since frog y should align to safe/grid, we can check based on exact rows:
+        const riverLogYs = new Set(LANE_Y.riverLogs);
+        const turtleYs = new Set(LANE_Y.turtle);
+
+        if (riverLogYs.has(Math.round(yT))) {
+          for (const ln of logs) {
+            if (ln.y !== Math.round(yT)) continue;
+            // AABB with frog
+            if (aabbOverlap({x:ln.x, y:ln.y, w:ln.w, h:ln.h}, {x:frog.x, y:frog.y, w:frog.w, h:frog.h})) {
+              supported = true;
+              supportVelX = ln.dir * ln.speed;
+              break;
+            }
+          }
+          return {supported, velX: supportVelX};
+        }
+        if (turtleYs.has(Math.round(yT))) {
+          for (const tg of turtles) {
+            if (tg.y !== Math.round(yT)) continue;
+            // Turtle support only if not submerged
+            const diveState = getTurtleDiveState(tg);
+            if (diveState !== 'visible') continue;
+            if (aabbOverlap({x:tg.x, y:tg.y, w:tg.w, h:tg.h}, {x:frog.x, y:frog.y, w:frog.w, h:frog.h})) {
+              supported = true;
+              supportVelX = tg.dir * tg.speed;
+              break;
+            }
+          }
+          return {supported, velX: supportVelX};
+        }
+        return {supported:false, velX:0};
+      }
+
+      function getTurtleDiveState(tg) {
+        // Deterministic: phase based on performance time
+        const t = (performance.now()/1000);
+        const phase = ((t + tg.dive.t0) % tg.dive.period) / tg.dive.period; // 0..1
+        // visible [0, visibleFrac), submerged (visibleFrac.. visibleFrac+submergedFrac), rising then visible
+        const vf = tg.dive.visibleFrac;
+        const sf = vf + tg.dive.submergedFrac;
+        // rising from sf to sf+riseFrac, treat as unsafe (not supporting) but submerged-ish; spec says temporarily unsafe while submerged.
+        // We'll mark rising as unsafe as well, then visible resumes.
+        if (phase < vf) return 'visible';
+        if (phase < sf) return 'submerged';
+        return 'rising';
+      }
+
+      function aabbOverlap(a,b){
+        return a.x < b.x + b.w &&
+               a.x + a.w > b.x &&
+               a.y < b.y + b.h &&
+               a.y + a.h > b.y;
+      }
+
+      function drawRoundedRect(x,y,w,h,r){
+        const rr = Math.min(r, w/2, h/2);
+        ctx.beginPath();
+        ctx.moveTo(x+rr, y);
+        ctx.arcTo(x+w, y, x+w, y+h, rr);
+        ctx.arcTo(x+w, y+h, x, y+h, rr);
+        ctx.arcTo(x, y+h, x, y, rr);
+        ctx.arcTo(x, y, x+w, y, rr);
+        ctx.closePath();
+        ctx.fill();
+      }
+
+      function drawFrog() {
+        const x = frog.x, y = frog.y;
+        // body
+        ctx.fillStyle = '#22CC22';
+        drawRoundedRect(x, y, frog.w, frog.h, 10);
+        // eyes
+        const eyeY = y + 10;
+        const leftEyeX = x + 10;
+        const rightEyeX = x + frog.w - 10;
+        ctx.fillStyle = '#000000';
+        ctx.fillRect(leftEyeX-2, eyeY, 4, 6);
+        ctx.fillRect(rightEyeX-2, eyeY, 4, 6);
+        // pupils white
+        ctx.fillStyle = '#FFFFFF';
+        ctx.beginPath(); ctx.arc(leftEyeX+1, eyeY+2, 1.6, 0, Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.arc(rightEyeX+1, eyeY+2, 1.6, 0, Math.PI*2); ctx.fill();
+      }
+
+      function drawVehicle(v) {
+        const x=v.x, y=v.y, w=v.w, h=v.h;
+        ctx.fillStyle = v.color;
+        drawRoundedRect(x,y,w,h,6);
+        // window details
+        if (v.win) {
+          ctx.fillStyle = 'rgba(0,0,0,0.25)';
+          const winW = Math.max(10, w/3);
+          const gap = (w - 2*winW)/3;
+          ctx.fillRect(x+gap, y+8, winW, 8);
+          ctx.fillRect(x+2*gap+winW, y+8, winW-6, 8);
+          // stripe
+          ctx.strokeStyle='rgba(255,255,255,0.15)';
+          ctx.lineWidth=2;
+          ctx.beginPath();
+          ctx.moveTo(x+8, y+h-10);
+          ctx.lineTo(x+w-8, y+h-10);
+          ctx.stroke();
+        } else {
+          // truck cab stripe
+          ctx.fillStyle='rgba(255,255,255,0.12)';
+          ctx.fillRect(x+10, y+8, Math.max(18, w/5), 14);
+        }
+        // wheels
+        ctx.fillStyle='rgba(0,0,0,0.8)';
+        const r=6;
+        ctx.beginPath(); ctx.arc(x+12, y+h, r, 0, Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.arc(x+w-12, y+h, r, 0, Math.PI*2); ctx.fill();
+      }
+
+      function drawLog(ln) {
+        ctx.fillStyle = ln.color;
+        drawRoundedRect(ln.x, ln.y, ln.w, ln.h, 14);
+        // bark lines
+        ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+        ctx.lineWidth = 2;
+        for (let i=0;i<4;i++){
+          const xx = ln.x + 16 + i*26;
+          ctx.beginPath();
+          ctx.moveTo(xx, ln.y+6);
+          ctx.lineTo(xx-6, ln.y+ln.h-6);
+          ctx.stroke();
+        }
+      }
+
+      function drawTurtleGroup(tg) {
+        const diveState = getTurtleDiveState(tg);
+        // If submerged/rising, draw darker and maybe reduce alpha
+        let alpha = 1;
+        let offsetY = 0;
+        if (diveState === 'submerged') { alpha = 0.55; offsetY = 6; }
+        if (diveState === 'rising') { alpha = 0.75; offsetY = 3; }
+        ctx.save();
+        ctx.globalAlpha = alpha;
+
+        const baseY = tg.y + offsetY;
+        const x = tg.x, y=baseY, w=tg.w, h=tg.h;
+
+        // Back connections
+        ctx.fillStyle = tg.color;
+        drawRoundedRect(x, y, w, h, 14);
+
+        // heads: two or three turtles? Use width to decide:
+        const turtlesCount = (w <= 90) ? 2 : 3;
+        // draw small heads bumps at top
+        for (let i=0;i<turtlesCount;i++){
+          const hx = x + 18 + i*(w-36)/(turtlesCount-1 || 1);
+          ctx.fillStyle = '#2c6f2c';
+          ctx.beginPath();
+          ctx.moveTo(hx, y);
+          ctx.quadraticCurveTo(hx+7, y+4, hx+12, y+10);
+          ctx.quadraticCurveTo(hx+9, y+12, hx+4, y+12);
+          ctx.quadraticCurveTo(hx-2, y+10, hx, y);
+          ctx.fill();
+          // eyes
+          ctx.fillStyle = '#000';
+          ctx.fillRect(hx+8, y+7, 3, 3);
+          ctx.fillStyle = '#fff';
+          ctx.fillRect(hx+9, y+8, 1.5, 1.5);
+        }
+
+        // shell lines
+        ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+        ctx.lineWidth = 2;
+        for (let i=1;i<=3;i++){
+          const yy = y + i*9;
+          ctx.beginPath();
+          ctx.moveTo(x+12, yy);
+          ctx.lineTo(x+w-12, yy-2);
+          ctx.stroke();
+        }
+
+        // Underwater line (dive visuals)
+        if (diveState !== 'visible') {
+          ctx.strokeStyle = 'rgba(30,200,255,0.25)';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.moveTo(x+8, y+10);
+          ctx.quadraticCurveTo(x+w/2, y+2, x+w-8, y+10);
+          ctx.stroke();
+        }
+
+        ctx.restore();
+      }
+
+      function drawHomes() {
+        // empty bays: #000066, filled: #22CC22
+        for (const b of homeBays) {
+          ctx.fillStyle = b.filled ? '#22CC22' : '#000066';
+          drawRoundedRect(b.x, b.y, b.w, b.h, 6);
+          // opening border
+          ctx.strokeStyle = b.filled ? 'rgba(0,0,0,0.4)' : 'rgba(255,255,255,0.08)';
+          ctx.lineWidth = 2;
+          ctx.strokeRect(b.x+2, b.y+2, b.w-4, b.h-4);
+
+          if (b.filled) {
+            // frog icon centered inside bay
+            const fx = b.x + (b.w - FROG_SIZE)/2;
+            const fy = b.y + (b.h - FROG_SIZE)/2 + 2;
+            ctx.fillStyle = '#22CC22';
+            drawRoundedRect(fx, fy, FROG_SIZE, FROG_SIZE, 10);
+            ctx.fillStyle = '#000';
+            ctx.fillRect(fx+10, fy+10, 4, 6);
+            ctx.fillRect(fx+FROG_SIZE-14, fy+10, 4, 6);
+            ctx.fillStyle = '#fff';
+            ctx.fillRect(fx+11, fy+12, 1.6, 1.6);
+            ctx.fillRect(fx+FROG_SIZE-13, fy+12, 1.6, 1.6);
+          } else {
+            // subtle opening lines
+            ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(b.x+10, b.y+b.h-8);
+            ctx.lineTo(b.x+b.w-10, b.y+b.h-8);
+            ctx.stroke();
+          }
+        }
+      }
+
+      function drawTimerBar() {
+        const x0 = 10;
+        const y = 680;
+        const maxW = 580;
+        const frac = clamp(state.timer / state.timerMax, 0, 1);
+        const barW = Math.floor(maxW * frac);
+
+        // color transitions: green (#22CC22) -> yellow (#CCCC00) -> red (#DD2222)
+        function lerp(a,b,t){ return a + (b-a)*t; }
+        function hexToRgb(hex){
+          const h = hex.replace('#','').trim();
+          const n = parseInt(h.length===3 ? h.split('').map(c=>c+c).join('') : h, 16);
+          return {r:(n>>16)&255, g:(n>>8)&255, b:n&255};
+        }
+        function mixHex(c1, c2, t){
+          const A = hexToRgb(c1), B = hexToRgb(c2);
+          const r = Math.round(lerp(A.r,B.r,t));
+          const g = Math.round(lerp(A.g,B.g,t));
+          const b = Math.round(lerp(A.b,B.b,t));
+          return `rgb(${r},${g},${b})`;
+        }
+
+        let c = '#22CC22';
+        if (frac > 0.5) {
+          c = mixHex('#22CC22', '#CCCC00', (0.5-frac) / (0.5-1)); // when frac from 1->0.5
+        } else {
+          c = mixHex('#CCCC00', '#DD2222', (0.5-frac) / 0.5);
+        }
+
+        ctx.fillStyle = 'rgba(255,255,255,0.12)';
+        ctx.fillRect(x0, y, maxW, 12);
+        ctx.fillStyle = c;
+        ctx.fillRect(x0, y, barW, 12);
+        ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+        ctx.strokeRect(x0, y, maxW, 12);
+      }
+
+      function drawRoadAndRiverBackground() {
+        // background already black
+        // Draw lanes as subtle rectangles
+        // Road area between y=320..520, but only 5 lanes 320..480.
+        function laneRect(y, color) {
+          ctx.fillStyle = color;
+          ctx.fillRect(0, y, W, 40);
+        }
+
+        // Safe start strip (between road and homes) - from y=520 to bottom edge (700) is safe? We'll create:
+        // We'll represent safe starting strip as bottom area y=520..560 (one row) and upper safe lane? Spec says median and safe start strip distinctly.
+        // We'll draw median at y=280..320 maybe, but keep simple: add dim strips.
+
+        // Road lanes (5 lanes): y=320,360,400,440,480 each 40 height (but vehicles are 32)
+        const roadY0 = 320;
+        for (let i=0;i<5;i++){
+          const y = roadY0 + i*40;
+          laneRect(y, 'rgba(50,50,50,0.75)');
+          // lane markings
+          ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+          ctx.lineWidth = 2;
+          ctx.setLineDash([12,10]);
+          ctx.beginPath();
+          ctx.moveTo(0, y+20);
+          ctx.lineTo(W, y+20);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+
+        // River lanes: y=80,120,160,200,240 are 5 rows total. We'll shade river:
+        const riverYs = [80,120,160,200,240];
+        for (const y of riverYs){
+          laneRect(y, 'rgba(0,40,80,0.85)');
+          // waves
+          ctx.strokeStyle = 'rgba(130,220,255,0.12)';
+          ctx.lineWidth = 2;
+          const amp = 4;
+          const t = performance.now()/1000;
+          ctx.beginPath();
+          for (let x=0;x<=W;x+=40){
+            const yy = y+20 + Math.sin((x/120)+t*2)*amp*0.35;
+            ctx.lineTo(x, yy);
+          }
+          ctx.stroke();
+        }
+
+        // Median / safe lanes between river and road:
+        // We have safe band around y=280..320? but road begins at 320. We'll draw a grass safe lane at y=280..320 (one row).
+        laneRect(280, 'rgba(20,90,20,0.8)');
+        // Another safe lane below river above road? Actually frogs can move on grid; we'll define safe rows at y=520 and around 560? But frog y starts at 520.
+        // Let's shade safe row y=520..560 distinctly and also y=560..640? We'll keep top safe around y=560..600 as grass.
+        laneRect(520, 'rgba(20,90,20,0.95)');
+        laneRect(560, 'rgba(20,80,20,0.9)');
+        laneRect(600, 'rgba(20,70,20,0.85)');
+
+        // Home bays backdrop area:
+        laneRect(0, 'rgba(0,0,0,1)');
+        // Draw a line / water fade
+        ctx.strokeStyle='rgba(255,255,255,0.06)';
+        ctx.lineWidth=2;
+        ctx.beginPath();
+        ctx.moveTo(0, 80); ctx.lineTo(W, 80);
+        ctx.moveTo(0, 320); ctx.lineTo(W, 320);
+        ctx.stroke();
+      }
+
+      function drawScoreLivesLevel() {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '16px ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+        ctx.textBaseline = 'top';
+        ctx.fillText(`SCORE ${state.score}`, 10, 10);
+
+        // high score top-right
+        const hs = state.highScore;
+        const txt = `HI ${hs}`;
+        const metrics = ctx.measureText(txt);
+        ctx.fillText(txt, W - metrics.width - 10, 10);
+
+        // Lives bottom-left
+        const livesX = 10, livesY = 640;
+        ctx.font = '16px ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+        ctx.textBaseline = 'top';
+        // Draw frog icons equal to lives
+        for (let i=0;i<state.lives;i++){
+          const x = livesX + i*26;
+          const y = livesY;
+          ctx.fillStyle = '#22CC22';
+          drawRoundedRect(x, y+10, 18, 18, 6);
+          ctx.fillStyle = '#000';
+          ctx.fillRect(x+5, y+15, 3, 5);
+          ctx.fillRect(x+10, y+15, 3, 5);
+          ctx.fillStyle = '#fff';
+          ctx.fillRect(x+6, y+17, 1.2, 1.2);
+          ctx.fillRect(x+11, y+17, 1.2, 1.2);
+        }
+        // Level bottom-right
+        ctx.fillStyle = '#AAAAAA';
+        ctx.textBaseline = 'top';
+        ctx.font = '14px ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+        ctx.fillText(`LEVEL ${state.level}`, W - 140, H - 20);
+      }
+
+      function updateEntities(dt) {
+        // update road cars
+        for (const v of vehicles) {
+          v.x += v.dir * v.speed * dt;
+          // wrap
+          if (v.dir === DIR_RIGHT) {
+            if (v.x > W + 120) v.x = -120 - v.w;
+          } else {
+            if (v.x + v.w < -120) v.x = W + 120;
+          }
+        }
+        for (const ln of logs) {
+          ln.x += ln.dir * ln.speed * dt;
+          if (ln.dir === DIR_RIGHT) {
+            if (ln.x > W + 250) ln.x = -250 - ln.w;
+          } else {
+            if (ln.x + ln.w < -250) ln.x = W + 250;
+          }
+        }
+        for (const tg of turtles) {
+          tg.x += tg.dir * tg.speed * dt;
+          if (tg.dir === DIR_RIGHT) {
+            if (tg.x > W + 260) tg.x = -260 - tg.w;
+          } else {
+            if (tg.x + tg.w < -260) tg.x = W + 260;
+          }
+        }
+      }
+
+      function setFrogCell(cellX, cellY) {
+        // cellY mapping: we use pixel y positions in spec:
+        // safe bottom row y=520. moving up by 40 means next rows at 480 (road), 440,400,360,320, then river at 280? (median), 240,200,160,120,80 then home y=40.
+        // We'll map using exact cell rows:
+        // cellY=0 at y=520? Let's compute from known hop increments:
+        // y = 520 - cellY*40
+        const newX = clamp(cellX, 0, 14);
+        frog.cellX = newX;
+        frog.x = frog.cellX * CELL + FROG_IN_CELL_OFFSET;
+        frog.y = 520 - cellY*40;
+      }
+
+      function frogRowIndexFromY(y) {
+        return Math.round((520 - y)/40);
+      }
+
+      function canSupportAtCurrentPosition() {
+        const yKey = Math.round(frog.y);
+        if (isRoadRow(yKey)) return {type:'road', supported:false};
+        const riverLogYs = new Set(LANE_Y.riverLogs);
+        const turtleYs = new Set(LANE_Y.turtle);
+        if (riverLogYs.has(yKey)) return {type:'riverLogs', supported:getRiverLaneSupport(frog.x+frog.w/2, frog.y).supported};
+        if (turtleYs.has(yKey)) return {type:'turtles', supported:getRiverLaneSupport(frog.x+frog.w/2, frog.y).supported};
+        return {type:'safe', supported:false};
+      }
+
+      function checkCollisions() {
+        if (!frog.alive) return;
+
+        // If road, check vehicle collision
+        const yKey = Math.round(frog.y);
+        if (isRoadRow(yKey)) {
+          for (const v of vehicles) {
+            if (v.y !== yKey) continue;
+            // AABB collision between frog and vehicle
+            if (aabbOverlap({x:frog.x,y:frog.y,w:frog.w,h:frog.h},{x:v.x,y:v.y,w:v.w,h:v.h})) {
+              console.log('death: vehicle');
+              playSquash();
+              die('vehicle');
+              return;
+            }
+          }
+          return;
+        }
+
+        // If river (logs/turtles) check support
+        const riverLogYs = new Set(LANE_Y.riverLogs);
+        const turtleYs = new Set(LANE_Y.turtle);
+        if (riverLogYs.has(yKey) || turtleYs.has(yKey)) {
+          const {supported} = getRiverLaneSupport(frog.x + frog.w/2, frog.y);
+          if (!supported) {
+            console.log('death: drowning/unsupported');
+            die(turtleYs.has(yKey) ? 'turtleSubmerged' : 'drown');
+            return;
+          }
+          // carried off-screen check
+          // Use frog center: if beyond edges while on platform => die
+          const cx = frog.x + frog.w/2;
+          if (cx < -10 || cx > W + 10) {
+            console.log('death: carried off-screen');
+            die('offscreen');
+            return;
+          }
+          return;
+        }
+
+        // Home bay region: y==40
+        if (Math.round(frog.y) === homeY) {
+          // Determine which bay by frog center
+          const cx = frog.x + frog.w/2;
+          const cy = frog.y + frog.h/2;
+          // Must be within bay rect vertically
+          let hitBay = null;
+          for (const b of homeBays) {
+            if (cx >= b.x && cx <= b.x + b.w && cy >= b.y && cy <= b.y + b.h) {
+              hitBay = b;
+              break;
+            }
+          }
+          if (!hitBay) {
+            // Landed in gap between bays -> death
+            console.log('death: gap');
+            die('gap');
+            return;
+          }
+          if (hitBay.filled) {
+            console.log('death: filled bay');
+            die('filled');
+            return;
+          }
+          // Fill it and score
+          hitBay.filled = true;
+          state.filledHomesCount += 1;
+          playHomeFill();
+
+          // Score: +50 reaching a home bay, plus time bonus on home arrival:
+          const bonus = Math.floor(state.timer) * 2;
+          state.score += 50 + bonus;
+          // Start forward hop furthest row tracking already gives +10 per new furthest row; handled in movement.
+          console.log('home filled', state.filledHomesCount);
+
+          if (state.filledHomesCount >= 5) {
+            // complete level
+            state.score += 1000;
+            // increase level speeds by 15% after all five bays are filled
+            state.level += 1;
+            resetHomes();
+            state.timer = state.timerMax;
+            frog.alive = true;
+            frog.hopT = 0;
+            frog.cellX = 7;
+            frog.x = frog.cellX * CELL + FROG_IN_CELL_OFFSET;
+            frog.y = TOP_SAFE_ROW_Y;
+            frog.lastSupportVelX = 0;
+            // rebuild entities for new level
+            resetLevel(true);
+            state.pendingDeath = false;
+          } else {
+            // respawn frog, reset timer for each life? spec says reset on successful frog arrival or death/respawn
+            state.timer = state.timerMax;
+            frog.alive = true;
+            frog.hopT = 0;
+            frog.cellX = 7;
+            frog.x = frog.cellX * CELL + FROG_IN_CELL_OFFSET;
+            frog.y = TOP_SAFE_ROW_Y;
+          }
+          return;
+        }
+      }
+
+      function tryHop(dx, dy) {
+        if (state.mode !== 'PLAYING') return;
+        if (frog.hopT > 0) return;
+        // If timer expired -> death? spec doesn't explicitly, but timer bar shrinks over time; we end life at 0.
+        if (state.timer <= 0) {
+          die('timeout');
+          return;
+        }
+
+        const currentRow = frogRowIndexFromY(frog.y);
+        const newX = frog.cellX + dx;
+        const newRow = currentRow - dy; // dy positive should move up (ArrowUp)
+        // dy mapping: input up -> newRow = currentRow -1
+        // Input down -> newRow = currentRow +1
+        const yPix = 520 - newRow*40;
+        const xPix = clamp(newX, 0, 14) * CELL + FROG_IN_CELL_OFFSET;
+
+        // Bounds: allow home at y=40 => compute row: (520-40)/40=12
+        // So valid cellY range 0..12. (0 at y=520, 12 at y=40)
+        const clampedRow = clamp(newRow, 0, 12);
+
+        // if x out-of-bounds, ignore
+        if (newX < 0 || newX > 14) return;
+
+        const targetX = xPix;
+        const targetY = 520 - clampedRow*40;
+
+        // lock hop 80ms
+        frog.hopFrom.x = frog.x;
+        frog.hopFrom.y = frog.y;
+        frog.hopTo.x = targetX;
+        frog.hopTo.y = targetY;
+        frog.hopT = frog.hopLockMs;
+        frog.cellX = newX;
+        // frog row update at end of hop only for furthest row logic? We'll set row now for movement stepping.
+        frog.targetRow = clampedRow;
+        // score: forward hop to a new furthest row: +10
+        // Furthest row measured as max row index reached? Starting row index is 0. Higher row index means forward.
+        const furthest = Math.max(state.furthestRow, clampedRow);
+        if (furthest > state.furthestRow) {
+          // +10 per new furthest row (only one hop)
+          const delta = furthest - state.furthestRow;
+          state.score += 10 * delta;
+          state.furthestRow = furthest;
+        }
+        playHop();
+      }
+
+      function updateFrogHop(dt) {
+        if (frog.hopT <= 0) return;
+        frog.hopT -= dt*1000;
+        const t = 1 - (frog.hopT / frog.hopLockMs);
+        const ease = t < 0.5 ? 2*t*t : 1 - Math.pow(-2*t+2,2)/2;
+        const x = frog.hopFrom.x + (frog.hopTo.x - frog.hopFrom.x)*ease;
+        const y = frog.hopFrom.y + (frog.hopTo.y - frog.hopFrom.y)*ease;
+        // hop arc: lift proportional to t*(1-t)
+        const arc = Math.sin(Math.PI * t) * 10;
+        frog.x = x;
+        frog.y = y - arc;
+        if (frog.hopT <= 0) {
+          // snap to exact cell
+          frog.x = frog.hopTo.x;
+          frog.y = frog.hopTo.y;
+          frog.lastSupportVelX = 0;
+          // after landing, check collisions and score rules
+          // Note: support/carry should begin immediately in update after hop.
+          checkCollisions();
+        }
+      }
+
+      function applyRiverCarry(dt) {
+        const yKey = Math.round(frog.y);
+        if (state.mode !== 'PLAYING') return;
+        if (!['safe','riverLogs','turtles'].includes(canSupportAtCurrentPosition().type)) return;
+
+        const supportInfo = getRiverLaneSupport(frog.x + frog.w/2, frog.y);
+        if (supportInfo.supported) {
+          // inherit platform velocity continuously while supported
+          const vx = supportInfo.velX;
+          frog.x += vx * dt;
+        }
+      }
+
+      function drawStartScreen() {
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0,0,W,H);
+        drawRoadAndRiverBackground();
+        drawHomes();
+        drawScoreLivesLevel();
+        // title
+        ctx.fillStyle = '#22CC22';
+        ctx.font = '52px ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        ctx.fillText('FROGGER', W/2, 280-20);
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '22px ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+        ctx.fillText('Press Enter to Start', W/2, 380-10);
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'alphabetic';
+      }
+
+      function drawGameOver() {
+        // draw scene underneath
+        drawRoadAndRiverBackground();
+        for (const ln of logs) drawLog(ln);
+        for (const tg of turtles) drawTurtleGroup(tg);
+        for (const v of vehicles) drawVehicle(v);
+        drawHomes();
+
+        drawFrog();
+        drawScoreLivesLevel();
+        drawTimerBar();
+
+        ctx.fillStyle = 'rgba(0,0,0,0.55)';
+        ctx.fillRect(0,0,W,H);
+
+        ctx.fillStyle = '#FFFFFF';
+        ctx.textAlign = 'center';
+        ctx.font = '64px ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+        ctx.fillText('GAME OVER', W/2, 300);
+        ctx.font = '22px ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+        ctx.fillText(`Score: ${state.score}`, W/2, 372);
+        ctx.fillText('Press Enter to restart', W/2, 410);
+        ctx.textAlign = 'left';
+      }
+
+      function drawPauseOverlay() {
+        ctx.save();
+        ctx.fillStyle = 'rgba(0,0,0,0.45)';
+        ctx.fillRect(0,0,W,H);
+        ctx.fillStyle = '#FFFFFF';
+        ctx.textAlign = 'center';
+        ctx.font = '40px ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+        ctx.fillText('PAUSED', W/2, 320);
+        ctx.font = '18px ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+        ctx.fillText('Press P to unpause', W/2, 370);
+        ctx.restore();
+      }
+
+      function tick(time) {
+        if (!state.lastTime) state.lastTime = time;
+        let dt = (time - state.lastTime) / 1000;
+        state.lastTime = time;
+
+        // cap dt
+        dt = Math.min(dt, 0.05);
+        state.dt = dt;
+
+        // Update
+        if (state.mode === 'PLAYING') {
+          // timer
+          state.timer -= dt;
+          if (state.timer <= 0) {
+            state.timer = 0;
+            die('timeout');
+          }
+
+          updateEntities(dt);
+          updateFrogHop(dt);
+
+          // River carry while not hopping
+          if (frog.hopT <= 0 && !state.pendingDeath) {
+            // carry only in river lanes with support
+            applyRiverCarry(dt);
+            // If carried beyond edge, die
+            const cx = frog.x + frog.w/2;
+            const yKey = Math.round(frog.y);
+            const turtleYs = new Set(LANE_Y.turtle);
+            const riverLogYs = new Set(LANE_Y.riverLogs);
+            if (turtleYs.has(yKey) || riverLogYs.has(yKey)) {
+              if (cx < -10 || cx > W + 10) {
+                console.log('death: carried off-screen (continuous)');
+                die('offscreen');
+              } else {
+                // drowning check should happen when support lost (e.g., carrying off to gap). We'll re-check each frame.
+                const supportInfo = getRiverLaneSupport(cx, frog.y);
+                if (!supportInfo.supported) {
+                  console.log('death: unsupported mid-ride');
+                  die(turtleYs.has(yKey) ? 'turtleSubmerged' : 'drown');
+                }
+              }
+            }
+          }
+
+          // check after movement if landed on home etc (already in checkCollisions at end hop),
+          // but also could have changed after carry if near home (not necessary). Keep safe.
+          if (frog.hopT <= 0) {
+            checkCollisions();
+          }
+        } else if (state.mode === 'PAUSED') {
+          // no updates
+        } else {
+          // IDLE / GAME_OVER
+        }
+
+        // Render
+        ctx.fillStyle = '#000000';
+        ctx.fillRect(0,0,W,H);
+
+        if (state.mode === 'IDLE') {
+          // start screen
+          drawStartScreen();
+          requestAnimationFrame(tick);
+          return;
+        }
+
+        if (state.mode === 'GAME_OVER') {
+          drawGameOver();
+          requestAnimationFrame(tick);
+          return;
+        }
+
+        drawRoadAndRiverBackground();
+
+        // River objects
+        for (const ln of logs) drawLog(ln);
+        for (const tg of turtles) drawTurtleGroup(tg);
+
+        // Road objects
+        for (const v of vehicles) drawVehicle(v);
+
+        // Home bays
+        drawHomes();
+
+        // Frog
+        drawFrog();
+
+        drawScoreLivesLevel();
+        drawTimerBar();
+
+        if (state.mode === 'PAUSED') {
+          drawPauseOverlay();
+        }
+
+        requestAnimationFrame(tick);
+      }
+
+      // Controls
+      const keyState = {};
+      window.addEventListener('keydown', (e) => {
+        const k = e.key;
+        // prevent scroll for arrows/space
+        if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown',' '].includes(k)) e.preventDefault();
+        if (k === 'Enter') {
+          if (state.mode === 'IDLE' || state.mode === 'GAME_OVER') {
+            if (state.mode === 'GAME_OVER') console.log('RESTART');
+            startNewGame();
+          } else if (state.mode === 'PAUSED') {
+            // Enter can act as unpause/restart? Spec says Enter start/restart; we'll ignore in pause.
+          } else {
+            // Playing: ignore
+          }
+          return;
+        }
+        if (k === 'p' || k === 'P') {
+          if (state.mode === 'PLAYING' || state.mode === 'PAUSED') togglePause();
+          return;
+        }
+
+        // Movement
+        if (state.mode !== 'PLAYING') return;
+        if (k === 'ArrowLeft' || k === 'a' || k === 'A') { tryHop(-1,0); }
+        else if (k === 'ArrowRight' || k === 'd' || k === 'D') { tryHop(1,0); }
+        else if (k === 'ArrowUp' || k === 'w' || k === 'W') { tryHop(0,1); }
+        else if (k === 'ArrowDown' || k === 's' || k === 'S') { tryHop(0,-1); }
+      }, {passive:false});
+
+      // Init high score
+      try {
+        state.highScore = Number(localStorage.getItem('frogger_highscore') || '0') || 0;
+      } catch { state.highScore = 0; }
+
+      // Initialize scene for IDLE
+      resetHomes();
+      // Build initial objects for preview (but don't animate since mode IDLE)
+      state.level = 1;
+      seed = 1337;
+      resetLevel(true);
+      state.mode = 'IDLE';
+      state.lastTime = 0;
+      console.log('STATE: IDLE initial');
+
+      // Start loop
+      requestAnimationFrame(tick);
+    })();
+  </script>
+</body>
+</html>

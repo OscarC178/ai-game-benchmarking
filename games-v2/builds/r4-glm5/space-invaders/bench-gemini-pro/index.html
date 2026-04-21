@@ -1,0 +1,795 @@
+<!--
+  GAME:      Space Invaders
+  RUN:       r4-glm5
+  BUILDER:   google/gemini-3-pro-preview
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Space Invaders</title>
+<style>
+    body {
+        margin: 0;
+        padding: 0;
+        background-color: #111;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        height: 100vh;
+        overflow: hidden;
+        color: white;
+        font-family: monospace;
+    }
+    canvas {
+        background-color: #000;
+        box-shadow: 0 0 20px rgba(255,255,255,0.1);
+        image-rendering: crisp-edges;
+    }
+</style>
+</head>
+<body>
+
+<canvas id="gameCanvas" width="800" height="600"></canvas>
+
+<script>
+// --- Constants & Game Configuration ---
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+const W = canvas.width;
+const H = canvas.height;
+
+const STATE_TITLE = 0;
+const STATE_PLAYING = 1;
+const STATE_PAUSED = 2;
+const STATE_DEAD = 3;
+const STATE_GAMEOVER = 4;
+const STATE_WAVE_COMPLETE = 5;
+
+// Player
+const PLAYER_W = 50;
+const PLAYER_H = 30;
+const PLAYER_Y = 550;
+const PLAYER_SPEED = 5;
+
+// Projectiles
+const LASER_W = 3;
+const LASER_H = 15;
+const LASER_SPEED = 8;
+const BOMB_W = 4;
+const BOMB_H = 8;
+const BOMB_SPEED = 3.5;
+
+// Aliens
+const ALIEN_ROWS = 5;
+const ALIEN_COLS = 11;
+const ALIEN_TYPES = [
+    { type: 'A', w: 30, h: 20, pts: 30, color: '#00FF00' }, // Row 0
+    { type: 'A', w: 30, h: 20, pts: 30, color: '#00FF00' }, // Row 1
+    { type: 'B', w: 40, h: 25, pts: 20, color: '#FFFF00' }, // Row 2
+    { type: 'B', w: 40, h: 25, pts: 20, color: '#FFFF00' }, // Row 3
+    { type: 'C', w: 50, h: 30, pts: 10, color: '#FF0000' }  // Row 4
+];
+const ALIEN_STEP_X = 15;
+const ALIEN_STEP_Y = 20;
+
+// Shields
+const SHIELD_COUNT = 4;
+const SHIELD_W = 70;
+const SHIELD_H = 50;
+const SHIELD_Y = 450;
+
+// Mystery Ship
+const UFO_W = 60;
+const UFO_H = 25;
+const UFO_Y = 40;
+const UFO_SPEED = 3;
+const UFO_POINTS = [50, 100, 150, 300];
+
+// --- Game State Variables ---
+let state = STATE_TITLE;
+let lastTime = 0;
+let stateTimer = 0;
+
+let score = 0;
+let highScore = parseInt(localStorage.getItem('si_highscore')) || 0;
+let lives = 3;
+let wave = 1;
+
+// Entities
+let player = null;
+let pLaser = null;
+let aliens = [];
+let bombs = [];
+let shields = [];
+let ufo = null;
+let explosions = [];
+let floatingTexts = [];
+
+// Alien movement
+let alienDir = 1; // 1 = right, -1 = left
+let alienStepTimer = 0;
+let alienAnimFrame = 0;
+let baseStartY = 80;
+
+// Input
+const keys = { ArrowLeft: false, ArrowRight: false, a: false, d: false, Space: false, p: false, r: false, Esc: false };
+let spacePressed = false;
+let pPressed = false;
+let rPressed = false;
+let escPressed = false;
+
+// --- Setup Functions ---
+
+function getShieldMatrix() {
+    let matrix = [];
+    for (let y = 0; y < SHIELD_H; y++) {
+        matrix[y] = [];
+        for (let x = 0; x < SHIELD_W; x++) {
+            // Cutout at bottom center
+            let isCutout = (y > 35 && x > 25 && x < 45);
+            // Top rounded corners
+            let isTL = (x < 10 && y < 10 - x);
+            let isTR = (x > SHIELD_W - 10 && y < 10 - (SHIELD_W - x));
+            
+            matrix[y][x] = !(isCutout || isTL || isTR);
+        }
+    }
+    return matrix;
+}
+
+function initShields() {
+    shields = [];
+    let spacing = W / SHIELD_COUNT;
+    for (let i = 0; i < SHIELD_COUNT; i++) {
+        let cx = (spacing * i) + (spacing / 2);
+        shields.push({
+            x: cx - SHIELD_W/2,
+            y: SHIELD_Y,
+            pixels: getShieldMatrix()
+        });
+    }
+}
+
+function initAliens() {
+    aliens = [];
+    alienDir = 1;
+    alienStepTimer = 0;
+    
+    let startY = baseStartY + (wave - 1) * 15;
+    if (startY > 250) startY = 250; // Cap starting height
+    
+    for (let r = 0; r < ALIEN_ROWS; r++) {
+        let typeInfo = ALIEN_TYPES[r];
+        for (let c = 0; c < ALIEN_COLS; c++) {
+            let spaceX = W / 14; 
+            aliens.push({
+                r: r, c: c,
+                x: 80 + c * spaceX,
+                y: startY + r * 40 + (30 - typeInfo.h), // align bottoms roughly
+                type: typeInfo.type,
+                w: typeInfo.w,
+                h: typeInfo.h,
+                pts: typeInfo.pts,
+                color: typeInfo.color,
+                alive: true
+            });
+        }
+    }
+}
+
+function resetPlayer() {
+    player = {
+        x: W/2 - PLAYER_W/2,
+        y: PLAYER_Y,
+        w: PLAYER_W,
+        h: PLAYER_H
+    };
+    pLaser = null;
+}
+
+function startGame() {
+    score = 0;
+    lives = 3;
+    wave = 1;
+    initShields();
+    startWave();
+}
+
+function startWave() {
+    initAliens();
+    resetPlayer();
+    bombs = [];
+    pLaser = null;
+    ufo = null;
+    explosions = [];
+    floatingTexts = [];
+    state = STATE_PLAYING;
+}
+
+// --- Input Handling ---
+
+window.addEventListener('keydown', e => {
+    let key = e.key;
+    if (key === 'ArrowLeft') keys.ArrowLeft = true;
+    if (key === 'ArrowRight') keys.ArrowRight = true;
+    if (key === 'a' || key === 'A') keys.a = true;
+    if (key === 'd' || key === 'D') keys.d = true;
+    
+    if (key === ' ' && !spacePressed) {
+        keys.Space = true;
+        spacePressed = true;
+        if (state === STATE_TITLE) startGame();
+    }
+    if ((key === 'p' || key === 'P') && !pPressed) {
+        keys.p = true;
+        pPressed = true;
+        if (state === STATE_PLAYING) state = STATE_PAUSED;
+        else if (state === STATE_PAUSED) state = STATE_PLAYING;
+    }
+    if ((key === 'r' || key === 'R') && !rPressed) {
+        keys.r = true;
+        rPressed = true;
+        if (state === STATE_GAMEOVER || state === STATE_PAUSED) startGame();
+    }
+    if (key === 'Escape' && !escPressed) {
+        keys.Esc = true;
+        escPressed = true;
+        if (state === STATE_GAMEOVER || state === STATE_PAUSED) state = STATE_TITLE;
+    }
+    
+    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(key)) {
+        e.preventDefault();
+    }
+});
+
+window.addEventListener('keyup', e => {
+    let key = e.key;
+    if (key === 'ArrowLeft') keys.ArrowLeft = false;
+    if (key === 'ArrowRight') keys.ArrowRight = false;
+    if (key === 'a' || key === 'A') keys.a = false;
+    if (key === 'd' || key === 'D') keys.d = false;
+    if (key === ' ') spacePressed = false;
+    if (key === 'p' || key === 'P') pPressed = false;
+    if (key === 'r' || key === 'R') rPressed = false;
+    if (key === 'Escape') escPressed = false;
+});
+
+// --- Collisions & Math ---
+
+function AABB(x1, y1, w1, h1, x2, y2, w2, h2) {
+    return x1 < x2 + w2 && x1 + w1 > x2 && y1 < y2 + h2 && y1 + h1 > y2;
+}
+
+function damageShield(shield, hitX, hitY) {
+    // Local coords
+    let sx = Math.floor(hitX - shield.x);
+    let sy = Math.floor(hitY - shield.y);
+    let radius = 4;
+    let hit = false;
+    
+    for (let dy = -radius; dy <= radius; dy++) {
+        for (let dx = -radius; dx <= radius; dx++) {
+            if (dx*dx + dy*dy <= radius*radius) {
+                let px = sx + dx;
+                let py = sy + dy;
+                // If within bounds and pixel exists
+                if (py >= 0 && py < SHIELD_H && px >= 0 && px < SHIELD_W) {
+                    if (shield.pixels[py][px]) {
+                        shield.pixels[py][px] = false;
+                        hit = true;
+                    }
+                }
+            }
+        }
+    }
+    return hit; // returns true if actual shield pixels were destroyed
+}
+
+function addExplosion(x, y, color) {
+    for (let i=0; i<8; i++) {
+        let angle = Math.random() * Math.PI * 2;
+        let speed = Math.random() * 2 + 1;
+        explosions.push({
+            x: x, y: y,
+            vx: Math.cos(angle)*speed, vy: Math.sin(angle)*speed,
+            life: 0.2, // seconds
+            color: color
+        });
+    }
+}
+
+// --- Logic ---
+
+function checkScore(pts) {
+    score += pts;
+    if (score > highScore) {
+        highScore = score;
+        localStorage.setItem('si_highscore', highScore);
+    }
+}
+
+function killPlayer() {
+    addExplosion(player.x + PLAYER_W/2, player.y + PLAYER_H/2, '#0FF');
+    lives--;
+    if (lives <= 0) {
+        state = STATE_GAMEOVER;
+    } else {
+        state = STATE_DEAD;
+        stateTimer = 1.5;
+    }
+}
+
+function update(dt) {
+    if (state === STATE_TITLE || state === STATE_PAUSED || state === STATE_GAMEOVER) return;
+
+    // Handle timer states
+    if (state === STATE_DEAD || state === STATE_WAVE_COMPLETE) {
+        stateTimer -= dt;
+        
+        // Update explosions even during dead state
+        for (let i = explosions.length - 1; i >= 0; i--) {
+            explosions[i].x += explosions[i].vx;
+            explosions[i].y += explosions[i].vy;
+            explosions[i].life -= dt;
+            if (explosions[i].life <= 0) explosions.splice(i, 1);
+        }
+        // Update floating texts
+        for (let i = floatingTexts.length - 1; i >= 0; i--) {
+            floatingTexts[i].y -= 20 * dt;
+            floatingTexts[i].life -= dt;
+            if (floatingTexts[i].life <= 0) floatingTexts.splice(i, 1);
+        }
+
+        if (stateTimer <= 0) {
+            if (state === STATE_DEAD) {
+                resetPlayer();
+                state = STATE_PLAYING;
+            } else if (state === STATE_WAVE_COMPLETE) {
+                wave++;
+                startWave();
+            }
+        }
+        return; // Pause main gameplay logic
+    }
+
+    if (state !== STATE_PLAYING) return;
+
+    // --- Player Movement ---
+    if (keys.ArrowLeft || keys.a) player.x -= PLAYER_SPEED;
+    if (keys.ArrowRight || keys.d) player.x += PLAYER_SPEED;
+    
+    if (player.x < 0) player.x = 0;
+    if (player.x + player.w > W) player.x = W - player.w;
+
+    // --- Player Firing ---
+    if (keys.Space && spacePressed && !pLaser) {
+        pLaser = {
+            x: player.x + player.w/2 - LASER_W/2,
+            y: player.y - LASER_H,
+            w: LASER_W,
+            h: LASER_H
+        };
+        keys.Space = false; // Require release
+    }
+
+    // --- Update Player Laser ---
+    if (pLaser) {
+        pLaser.y -= LASER_SPEED;
+        
+        if (pLaser.y + pLaser.h < 0) {
+            pLaser = null;
+        } else {
+            // VS Shields
+            for (let s of shields) {
+                if (pLaser && AABB(pLaser.x, pLaser.y, pLaser.w, pLaser.h, s.x, s.y, SHIELD_W, SHIELD_H)) {
+                    // Check pixels
+                    if (damageShield(s, pLaser.x + pLaser.w/2, pLaser.y)) {
+                        pLaser = null;
+                        break;
+                    }
+                }
+            }
+            
+            // VS UFO
+            if (pLaser && ufo && AABB(pLaser.x, pLaser.y, pLaser.w, pLaser.h, ufo.x, ufo.y, UFO_W, UFO_H)) {
+                pLaser = null;
+                let pts = UFO_POINTS[Math.floor(Math.random() * UFO_POINTS.length)];
+                checkScore(pts);
+                floatingTexts.push({ txt: `+${pts}`, x: ufo.x, y: ufo.y, life: 1.0 });
+                addExplosion(ufo.x + UFO_W/2, ufo.y + UFO_H/2, '#F00');
+                ufo = null;
+            }
+
+            // VS Aliens
+            if (pLaser) {
+                for (let a of aliens) {
+                    if (a.alive && AABB(pLaser.x, pLaser.y, pLaser.w, pLaser.h, a.x, a.y, a.w, a.h)) {
+                        a.alive = false;
+                        pLaser = null;
+                        checkScore(a.pts);
+                        addExplosion(a.x + a.w/2, a.y + a.h/2, a.color);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Alien Movement ---
+    let aliveAliens = aliens.filter(a => a.alive);
+    if (aliveAliens.length === 0) {
+        state = STATE_WAVE_COMPLETE;
+        stateTimer = 2.0;
+        return;
+    }
+
+    alienStepTimer += dt * 1000;
+    
+    // Calculate interval based on remaining
+    let interval = 800;
+    if (aliveAliens.length <= 44) interval = 600;
+    if (aliveAliens.length <= 34) interval = 400;
+    if (aliveAliens.length <= 24) interval = 300;
+    if (aliveAliens.length <= 14) interval = 200;
+    if (aliveAliens.length <= 4) interval = 100;
+    if (aliveAliens.length === 1) interval = 60; // Extra fast
+
+    if (alienStepTimer >= interval) {
+        alienStepTimer = 0;
+        alienAnimFrame = 1 - alienAnimFrame;
+        
+        let leftMost = W, rightMost = 0;
+        aliveAliens.forEach(a => {
+            if (a.x < leftMost) leftMost = a.x;
+            if (a.x + a.w > rightMost) rightMost = a.x + a.w;
+        });
+
+        let shouldReverse = false;
+        if (alienDir === 1 && rightMost + ALIEN_STEP_X > W - 10) shouldReverse = true;
+        else if (alienDir === -1 && leftMost - ALIEN_STEP_X < 10) shouldReverse = true;
+
+        aliveAliens.forEach(a => {
+            if (shouldReverse) {
+                a.y += ALIEN_STEP_Y;
+            } else {
+                a.x += ALIEN_STEP_X * alienDir;
+            }
+        });
+
+        if (shouldReverse) alienDir *= -1;
+
+        // Check Invasion
+        let invaded = false;
+        aliveAliens.forEach(a => {
+            if (a.y + a.h >= player.y) invaded = true;
+            
+            // Eat shields if moving over them
+            for (let s of shields) {
+                if (AABB(a.x, a.y, a.w, a.h, s.x, s.y, SHIELD_W, SHIELD_H)) {
+                    // Just wipe the top part they touch roughly
+                    let startY = Math.max(0, Math.floor(a.y + a.h - s.y));
+                    if (startY < SHIELD_H) {
+                        for(let sy=0; sy<startY; sy++){
+                            for(let sx=0; sx<SHIELD_W; sx++){
+                                let wX = s.x + sx;
+                                if (wX >= a.x && wX <= a.x + a.w) {
+                                    s.pixels[sy][sx] = false;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        if (invaded) {
+            state = STATE_GAMEOVER;
+            return;
+        }
+    }
+
+    // --- Alien Shooting ---
+    // Find bottom aliens
+    let bottomAliens = [];
+    for (let c = 0; c < ALIEN_COLS; c++) {
+        let lowest = null;
+        for (let r = ALIEN_ROWS - 1; r >= 0; r--) {
+            let idx = r * ALIEN_COLS + c;
+            if (aliens[idx].alive) {
+                lowest = aliens[idx];
+                break;
+            }
+        }
+        if (lowest) bottomAliens.push(lowest);
+    }
+
+    bottomAliens.forEach(a => {
+        // Random chance to fire
+        if (Math.random() < 0.005 && bombs.length < 4) {
+            bombs.push({
+                x: a.x + a.w/2 - BOMB_W/2,
+                y: a.y + a.h,
+                w: BOMB_W,
+                h: BOMB_H
+            });
+        }
+    });
+
+    // --- Update Bombs ---
+    for (let i = bombs.length - 1; i >= 0; i--) {
+        let b = bombs[i];
+        b.y += BOMB_SPEED;
+
+        let removed = false;
+
+        // VS Player
+        if (AABB(b.x, b.y, b.w, b.h, player.x, player.y, player.w, player.h)) {
+            bombs.splice(i, 1);
+            killPlayer();
+            continue;
+        }
+
+        // VS Shields
+        if (!removed) {
+            for (let s of shields) {
+                if (AABB(b.x, b.y, b.w, b.h, s.x, s.y, SHIELD_W, SHIELD_H)) {
+                    if (damageShield(s, b.x + b.w/2, b.y + b.h)) {
+                        bombs.splice(i, 1);
+                        removed = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Leave screen
+        if (!removed && b.y > H) {
+            bombs.splice(i, 1);
+        }
+    }
+    
+    // --- UFO ---
+    if (!ufo) {
+        if (Math.random() < 0.001) { // Spawn chance
+            let dir = Math.random() < 0.5 ? 1 : -1;
+            ufo = {
+                x: dir === 1 ? -UFO_W : W,
+                y: UFO_Y,
+                w: UFO_W,
+                h: UFO_H,
+                dir: dir
+            };
+        }
+    } else {
+        ufo.x += UFO_SPEED * ufo.dir;
+        if ((ufo.dir === 1 && ufo.x > W) || (ufo.dir === -1 && ufo.x + ufo.w < 0)) {
+            ufo = null;
+        }
+    }
+
+    // --- Effects Update ---
+    for (let i = explosions.length - 1; i >= 0; i--) {
+        explosions[i].x += explosions[i].vx;
+        explosions[i].y += explosions[i].vy;
+        explosions[i].life -= dt;
+        if (explosions[i].life <= 0) explosions.splice(i, 1);
+    }
+    for (let i = floatingTexts.length - 1; i >= 0; i--) {
+        floatingTexts[i].y -= 20 * dt;
+        floatingTexts[i].life -= dt;
+        if (floatingTexts[i].life <= 0) floatingTexts.splice(i, 1);
+    }
+}
+
+// --- Rendering ---
+
+function drawRect(x, y, w, h, color) {
+    ctx.fillStyle = color;
+    ctx.fillRect(Math.floor(x), Math.floor(y), w, h);
+}
+
+function drawText(txt, x, y, size, align='left', color='#FFF') {
+    ctx.fillStyle = color;
+    ctx.font = `bold ${size}px monospace`;
+    ctx.textAlign = align;
+    ctx.textBaseline = 'top';
+    ctx.fillText(txt, Math.floor(x), Math.floor(y));
+}
+
+function drawAlien(a) {
+    ctx.fillStyle = a.color;
+    
+    // Simple pixel-art approximation using rects
+    let u = a.w / 11; // Base unit
+    let v = a.h / 8;
+    
+    let cx = a.x; let cy = a.y;
+    
+    if (a.type === 'A') { // Squid
+        // Body
+        ctx.fillRect(cx + 3*u, cy + 2*v, 5*u, 3*v);
+        // Eyes (black) by skipping fill or drawing black over
+        ctx.fillStyle = '#000'; ctx.fillRect(cx + 3.5*u, cy + 2.5*v, u, u); ctx.fillRect(cx + 6.5*u, cy + 2.5*v, u, u);
+        ctx.fillStyle = a.color;
+        // Top hat
+        ctx.fillRect(cx + 4*u, cy, 3*u, 2*v);
+        
+        // Arms/Legs based on frame
+        if (alienAnimFrame === 0) {
+            ctx.fillRect(cx + 2*u, cy + 5*v, u, 2*v); // L leg down
+            ctx.fillRect(cx + 8*u, cy + 5*v, u, 2*v); // R leg down
+            ctx.fillRect(cx + 1*u, cy + 3*v, u, 2*v); // L arm up
+            ctx.fillRect(cx + 9*u, cy + 3*v, u, 2*v); // R arm up
+        } else {
+            ctx.fillRect(cx + 3*u, cy + 5*v, u, 2*v); // L leg inf
+            ctx.fillRect(cx + 7*u, cy + 5*v, u, 2*v); // R leg inf
+            ctx.fillRect(cx, cy + 5*v, u, 2*v); // L arm down
+            ctx.fillRect(cx + 10*u, cy + 5*v, u, 2*v); // R arm down
+        }
+    } else if (a.type === 'B') { // Crab
+        ctx.fillRect(cx + 2*u, cy + 2*v, 7*u, 3*v);
+        ctx.fillStyle = '#000'; ctx.fillRect(cx + 3*u, cy + 3*v, u, u); ctx.fillRect(cx + 7*u, cy + 3*v, u, u);
+        ctx.fillStyle = a.color;
+        ctx.fillRect(cx + 3*u, cy + u, 5*u, v);
+        ctx.fillRect(cx + 4*u, cy, 3*u, v);
+        
+        if (alienAnimFrame === 0) {
+            ctx.fillRect(cx + u, cy + 1*v, u, 3*v); // L side
+            ctx.fillRect(cx + 9*u, cy + 1*v, u, 3*v); // R side
+            ctx.fillRect(cx, cy + 4*v, u, 2*v); // L hand
+            ctx.fillRect(cx + 10*u, cy + 4*v, u, 2*v); // R hand
+            ctx.fillRect(cx + 3*u, cy + 5*v, u, 2*v); // L leg
+            ctx.fillRect(cx + 7*u, cy + 5*v, u, 2*v); // R leg
+        } else {
+            ctx.fillRect(cx + u, cy + 2*v, u, 3*v); // L side down
+            ctx.fillRect(cx + 9*u, cy + 2*v, u, 3*v); // R side down
+            ctx.fillRect(cx + 2*u, cy + 5*v, u, 2*v); // L leg out
+            ctx.fillRect(cx + 8*u, cy + 5*v, u, 2*v); // R leg out
+            ctx.fillRect(cx + 4*u, cy + 5*v, u, 2*v); // L inner leg
+            ctx.fillRect(cx + 6*u, cy + 5*v, u, 2*v); // R inner leg
+        }
+    } else { // 'C' Octopus
+        ctx.fillRect(cx + 3*u, cy + 2*v, 5*u, 3*v);
+        ctx.fillStyle = '#000'; ctx.fillRect(cx + 4*u, cy + 3*v, u, u); ctx.fillRect(cx + 6*u, cy + 3*v, u, u);
+        ctx.fillStyle = a.color;
+        ctx.fillRect(cx + 4*u, cy + v, 3*u, v);
+        ctx.fillRect(cx + 2*u, cy + 5*v, 7*u, v);
+        
+        if (alienAnimFrame === 0) {
+            ctx.fillRect(cx + u, cy + 6*v, u, 2*v);
+            ctx.fillRect(cx + 3*u, cy + 6*v, u, 2*v);
+            ctx.fillRect(cx + 7*u, cy + 6*v, u, 2*v);
+            ctx.fillRect(cx + 9*u, cy + 6*v, u, 2*v);
+        } else {
+            ctx.fillRect(cx + 2*u, cy + 6*v, u, 2*v);
+            ctx.fillRect(cx + 4*u, cy + 6*v, u, 2*v);
+            ctx.fillRect(cx + 6*u, cy + 6*v, u, 2*v);
+            ctx.fillRect(cx + 8*u, cy + 6*v, u, 2*v);
+        }
+    }
+}
+
+function drawPlayerCannon(x, y) {
+    ctx.fillStyle = '#00FFFF';
+    // Base
+    ctx.fillRect(Math.floor(x), Math.floor(y + 10), PLAYER_W, PLAYER_H - 10);
+    // Mid
+    ctx.fillRect(Math.floor(x + 5), Math.floor(y + 5), PLAYER_W - 10, 5);
+    // Barrel
+    ctx.fillRect(Math.floor(x + PLAYER_W/2 - 2), Math.floor(y), 4, 5);
+}
+
+function render() {
+    drawRect(0, 0, W, H, '#000');
+
+    // --- UI ---
+    drawText(`SCORE: ${score}`, 20, 20, 20);
+    drawText(`HI-SCORE: ${highScore}`, W/2, 20, 20, 'center');
+    drawText(`LIVES:`, W - 150, 20, 20);
+    for (let i = 0; i < lives-1; i++) {
+        drawPlayerCannon(W - 60 + i * 25, 20);
+    }
+    
+    if (state === STATE_TITLE) {
+        drawText("SPACE INVADERS", W/2, H/3, 60, 'center');
+        
+        // Demo
+        let dx = W/2 - 60; let dy = H/2 - 40;
+        drawRect(dx, dy, 30, 20, '#00FF00'); drawText("= 30", dx + 40, dy, 20);
+        drawRect(dx, dy+40, 40, 25, '#FFFF00'); drawText("= 20", dx + 50, dy+40, 20);
+        drawRect(dx, dy+80, 50, 30, '#FF0000'); drawText("= 10", dx + 60, dy+80, 20);
+        
+        let blink = Math.floor(performance.now() / 500) % 2 === 0;
+        if (blink) drawText("Press SPACE to start", W/2, H - 150, 24, 'center');
+        drawText("← → or A D to move, SPACE to fire", W/2, H - 100, 16, 'center', '#AAA');
+        return;
+    }
+
+    // --- Shields ---
+    ctx.fillStyle = '#00FF00';
+    for (let s of shields) {
+        for (let y = 0; y < SHIELD_H; y++) {
+            for (let x = 0; x < SHIELD_W; x++) {
+                if (s.pixels[y][x]) {
+                    ctx.fillRect(Math.floor(s.x + x), Math.floor(s.y + y), 1, 1);
+                }
+            }
+        }
+    }
+
+    // --- Player ---
+    if (state !== STATE_DEAD && state !== STATE_GAMEOVER && player) {
+        drawPlayerCannon(player.x, player.y);
+    }
+
+    // --- Projectiles ---
+    if (pLaser) drawRect(pLaser.x, pLaser.y, pLaser.w, pLaser.h, '#FFFF00');
+    bombs.forEach(b => drawRect(b.x, b.y, b.w, b.h, '#FFF'));
+
+    // --- Aliens ---
+    aliens.forEach(a => {
+        if (a.alive) drawAlien(a);
+    });
+
+    // --- UFO ---
+    if (ufo) {
+        ctx.fillStyle = '#F00';
+        ctx.beginPath();
+        ctx.ellipse(Math.floor(ufo.x + ufo.w/2), Math.floor(ufo.y + ufo.h/2), ufo.w/2, ufo.h/2, 0, 0, Math.PI*2);
+        ctx.fill();
+        ctx.fillStyle = '#FFF'; // dome
+        ctx.beginPath();
+        ctx.arc(Math.floor(ufo.x + ufo.w/2), Math.floor(ufo.y + ufo.h/2 - 5), 10, Math.PI, 0);
+        ctx.fill();
+    }
+
+    // --- Effects ---
+    explosions.forEach(ex => {
+        drawRect(ex.x, ex.y, 3, 3, ex.color);
+    });
+    
+    floatingTexts.forEach(ft => {
+        ctx.fillStyle = `rgba(255, 255, 255, ${Math.max(0, ft.life)})`;
+        ctx.font = 'bold 16px monospace';
+        ctx.fillText(ft.txt, ft.x, ft.y);
+    });
+
+    // --- Overlays ---
+    if (state === STATE_PAUSED) {
+        drawRect(0, 0, W, H, 'rgba(0,0,0,0.6)');
+        drawText("PAUSED", W/2, H/2, 50, 'center');
+    } else if (state === STATE_GAMEOVER) {
+        drawRect(0, 0, W, H, 'rgba(0,0,0,0.7)');
+        drawText("GAME OVER", W/2, H/2 - 40, 60, 'center', '#F00');
+        let blink = Math.floor(performance.now() / 500) % 2 === 0;
+        if (blink) drawText("Press R to play again", W/2, H/2 + 30, 20, 'center');
+        drawText("Press ESC for title screen", W/2, H/2 + 70, 16, 'center', '#AAA');
+    } else if (state === STATE_WAVE_COMPLETE) {
+        drawText(`WAVE ${wave} COMPLETE!`, W/2, H/2, 40, 'center', '#0FF');
+    }
+}
+
+// --- Main Loop ---
+
+let _lastTime = 0;
+function loop(timestamp) {
+    if (!_lastTime) _lastTime = timestamp;
+    let dt = (timestamp - _lastTime) / 1000;
+    _lastTime = timestamp;
+
+    if (dt > 0.1) dt = 0.1; // Clamp
+
+    update(dt);
+    render();
+
+    requestAnimationFrame(loop);
+}
+
+requestAnimationFrame(loop);
+
+</script>
+</body>
+</html>

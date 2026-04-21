@@ -1,0 +1,621 @@
+<!--
+  GAME:      Space Invaders
+  RUN:       r5-control
+  BUILDER:   openai/gpt-5.4
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Space Invaders</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background: #02060b;
+      overflow: hidden;
+      font-family: Arial, Helvetica, sans-serif;
+    }
+    body {
+      display: grid;
+      place-items: center;
+    }
+    canvas {
+      display: block;
+      background: #000;
+      box-shadow: 0 0 28px rgba(255,255,255,0.08);
+      image-rendering: pixelated;
+    }
+  </style>
+</head>
+<body>
+<canvas id="game" width="800" height="600"></canvas>
+<script>
+(() => {
+  'use strict';
+
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width;
+  const H = canvas.height;
+  const DT_CAP = 1 / 30;
+
+  const STATES = {
+    TITLE: 'title',
+    START: 'start',
+    PLAYING: 'playing',
+    PAUSED: 'paused',
+    PLAYER_HIT: 'player_hit',
+    WAVE_CLEAR: 'wave_clear',
+    GAME_OVER: 'game_over',
+    WIN: 'win'
+  };
+
+  const ALIEN_TYPES = [
+    { name: 'squid', color: '#4DDBFF', score: 30 },
+    { name: 'crab', color: '#7CFF6B', score: 20 },
+    { name: 'octo', color: '#FF7CF5', score: 10 }
+  ];
+
+  const keys = Object.create(null);
+  const prevKeys = Object.create(null);
+
+  let state = STATES.TITLE;
+  let lastTime = 0;
+  let score = 0;
+  let highScore = loadHighScore();
+  let lives = 3;
+  let wave = 1;
+  let stateTimer = 0;
+  let message = '';
+
+  const player = {
+    x: W / 2 - 22,
+    y: H - 60,
+    w: 44,
+    h: 20,
+    speed: 340,
+    cooldown: 0,
+    hitFlash: 0
+  };
+
+  let aliens = [];
+  let alienDir = 1;
+  let alienStepTimer = 0;
+  let alienStepInterval = 0.7;
+  let alienDropAmount = 18;
+  let bullets = [];
+  let enemyBullets = [];
+  let particles = [];
+  let shields = [];
+  let mystery = null;
+  let mysteryTimer = 10;
+
+  function loadHighScore() {
+    try { return parseInt(localStorage.getItem('space_invaders_best_r5_control') || '0', 10) || 0; } catch { return 0; }
+  }
+
+  function saveHighScore() {
+    try { localStorage.setItem('space_invaders_best_r5_control', String(highScore)); } catch {}
+  }
+
+  function updateHighScore() {
+    if (score > highScore) {
+      highScore = score;
+      saveHighScore();
+    }
+  }
+
+  function justPressed(code) {
+    return !!keys[code] && !prevKeys[code];
+  }
+
+  function clamp(v, min, max) {
+    return Math.max(min, Math.min(max, v));
+  }
+
+  function buildAliens() {
+    aliens = [];
+    const cols = 10;
+    const rows = 5;
+    const startX = 130;
+    const startY = 90;
+    const gapX = 52;
+    const gapY = 40;
+
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const type = ALIEN_TYPES[Math.min(ALIEN_TYPES.length - 1, Math.floor(r / 2))];
+        aliens.push({
+          x: startX + c * gapX,
+          y: startY + r * gapY,
+          w: 28,
+          h: 20,
+          type,
+          frame: Math.random() < 0.5 ? 0 : 1,
+          alive: true
+        });
+      }
+    }
+
+    alienDir = 1;
+    alienStepTimer = 0;
+    alienStepInterval = Math.max(0.18, 0.7 - (wave - 1) * 0.06);
+  }
+
+  function buildShields() {
+    shields = [];
+    const bases = [120, 290, 460, 630];
+    bases.forEach(baseX => {
+      const blocks = [];
+      for (let y = 0; y < 5; y++) {
+        for (let x = 0; x < 10; x++) {
+          if ((y === 4 && (x < 2 || x > 7)) || (y === 3 && (x === 4 || x === 5))) continue;
+          blocks.push({ x: baseX + x * 6, y: 420 + y * 6, hp: 3 });
+        }
+      }
+      shields.push(blocks);
+    });
+  }
+
+  function resetPlayer() {
+    player.x = W / 2 - player.w / 2;
+    player.cooldown = 0;
+    player.hitFlash = 0;
+  }
+
+  function startGame() {
+    score = 0;
+    lives = 3;
+    wave = 1;
+    message = '';
+    bullets = [];
+    enemyBullets = [];
+    particles = [];
+    mystery = null;
+    mysteryTimer = 10;
+    buildAliens();
+    buildShields();
+    resetPlayer();
+    state = STATES.START;
+    stateTimer = 1.6;
+  }
+
+  function beginWave(nextWave = false) {
+    if (nextWave) wave += 1;
+    if (wave > 6) {
+      state = STATES.WIN;
+      message = 'The fleet is gone.';
+      return;
+    }
+    bullets = [];
+    enemyBullets = [];
+    particles = [];
+    mystery = null;
+    mysteryTimer = 8;
+    buildAliens();
+    buildShields();
+    resetPlayer();
+    state = STATES.START;
+    stateTimer = 1.5;
+  }
+
+  function spawnParticleBurst(x, y, color, count = 10) {
+    for (let i = 0; i < count; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const s = 40 + Math.random() * 120;
+      particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 0.55, maxLife: 0.55, color });
+    }
+  }
+
+  function firePlayerBullet() {
+    if (state !== STATES.PLAYING || player.cooldown > 0 || bullets.length >= 1) return;
+    bullets.push({ x: player.x + player.w / 2 - 2, y: player.y - 12, w: 4, h: 16, vy: -520, from: 'player' });
+    player.cooldown = 0.28;
+  }
+
+  function fireEnemyBullet() {
+    if (enemyBullets.length >= 4) return;
+    const shooters = [];
+    for (let col = 0; col < 10; col++) {
+      for (let row = 4; row >= 0; row--) {
+        const alien = aliens[row * 10 + col];
+        if (alien && alien.alive) {
+          shooters.push(alien);
+          break;
+        }
+      }
+    }
+    if (!shooters.length) return;
+    const shooter = shooters[Math.floor(Math.random() * shooters.length)];
+    enemyBullets.push({ x: shooter.x + shooter.w / 2 - 2, y: shooter.y + shooter.h + 6, w: 4, h: 16, vy: 260 + wave * 18, from: 'enemy' });
+  }
+
+  function alienBounds() {
+    const alive = aliens.filter(a => a.alive);
+    if (!alive.length) return null;
+    const xs = alive.map(a => [a.x, a.x + a.w]).flat();
+    return { left: Math.min(...xs), right: Math.max(...xs), bottom: Math.max(...alive.map(a => a.y + a.h)) };
+  }
+
+  function updateAliens(dt) {
+    alienStepTimer += dt;
+    const aliveCount = aliens.filter(a => a.alive).length;
+    const interval = Math.max(0.08, alienStepInterval * (aliveCount / 50));
+
+    if (alienStepTimer >= interval) {
+      alienStepTimer = 0;
+      const bounds = alienBounds();
+      if (!bounds) {
+        state = STATES.WAVE_CLEAR;
+        stateTimer = 1.5;
+        return;
+      }
+
+      const hitEdge = (alienDir > 0 && bounds.right + 18 >= W) || (alienDir < 0 && bounds.left - 18 <= 0);
+      if (hitEdge) {
+        alienDir *= -1;
+        aliens.forEach(a => { if (a.alive) a.y += alienDropAmount; a.frame = 1 - a.frame; });
+      } else {
+        aliens.forEach(a => { if (a.alive) { a.x += alienDir * 12; a.frame = 1 - a.frame; } });
+      }
+
+      if (Math.random() < 0.35) fireEnemyBullet();
+    }
+
+    const bounds = alienBounds();
+    if (bounds && bounds.bottom >= player.y - 8) {
+      state = STATES.GAME_OVER;
+      message = 'The invaders landed.';
+    }
+  }
+
+  function updateMystery(dt) {
+    mysteryTimer -= dt;
+    if (!mystery && mysteryTimer <= 0) {
+      mystery = { x: -50, y: 52, w: 42, h: 18, vx: 90 + wave * 10 };
+      mysteryTimer = 18;
+    }
+    if (mystery) {
+      mystery.x += mystery.vx * dt;
+      if (mystery.x > W + 50) mystery = null;
+    }
+  }
+
+  function rectsOverlap(a, b) {
+    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  }
+
+  function damageShield(projectile) {
+    for (const shield of shields) {
+      for (let i = 0; i < shield.length; i++) {
+        const block = shield[i];
+        if (rectsOverlap(projectile, { x: block.x, y: block.y, w: 6, h: 6 })) {
+          block.hp -= 1;
+          projectile.dead = true;
+          if (block.hp <= 0) shield.splice(i, 1);
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function hitPlayer() {
+    if (state !== STATES.PLAYING) return;
+    lives -= 1;
+    player.hitFlash = 0.8;
+    spawnParticleBurst(player.x + player.w / 2, player.y + 6, '#ffffff', 18);
+    if (lives <= 0) {
+      state = STATES.GAME_OVER;
+      message = 'Your last base was destroyed.';
+    } else {
+      state = STATES.PLAYER_HIT;
+      stateTimer = 1.1;
+    }
+  }
+
+  function updateBullets(dt) {
+    bullets.forEach(b => { b.y += b.vy * dt; });
+    enemyBullets.forEach(b => { b.y += b.vy * dt; });
+
+    bullets.forEach(b => damageShield(b));
+    enemyBullets.forEach(b => damageShield(b));
+
+    for (const bullet of bullets) {
+      if (bullet.dead) continue;
+      for (const alien of aliens) {
+        if (!alien.alive) continue;
+        if (rectsOverlap(bullet, alien)) {
+          alien.alive = false;
+          bullet.dead = true;
+          score += alien.type.score;
+          updateHighScore();
+          spawnParticleBurst(alien.x + alien.w / 2, alien.y + alien.h / 2, alien.type.color, 10);
+          break;
+        }
+      }
+      if (!bullet.dead && mystery && rectsOverlap(bullet, mystery)) {
+        bullet.dead = true;
+        const bonus = 100 + Math.floor(Math.random() * 4) * 50;
+        score += bonus;
+        updateHighScore();
+        spawnParticleBurst(mystery.x + mystery.w / 2, mystery.y + mystery.h / 2, '#ff6666', 16);
+        mystery = null;
+      }
+    }
+
+    for (const bullet of enemyBullets) {
+      if (bullet.dead) continue;
+      if (rectsOverlap(bullet, player)) {
+        bullet.dead = true;
+        hitPlayer();
+      }
+    }
+
+    bullets = bullets.filter(b => !b.dead && b.y + b.h > 0);
+    enemyBullets = enemyBullets.filter(b => !b.dead && b.y < H + 20);
+  }
+
+  function updateParticles(dt) {
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.life -= dt;
+      if (p.life <= 0) particles.splice(i, 1);
+    }
+  }
+
+  function updatePlayer(dt) {
+    player.cooldown = Math.max(0, player.cooldown - dt);
+    player.hitFlash = Math.max(0, player.hitFlash - dt);
+
+    let move = 0;
+    if (keys.ArrowLeft || keys.KeyA) move -= 1;
+    if (keys.ArrowRight || keys.KeyD) move += 1;
+    player.x += move * player.speed * dt;
+    player.x = clamp(player.x, 16, W - player.w - 16);
+  }
+
+  function update(dt) {
+    updateParticles(dt);
+
+    if (state === STATES.TITLE || state === STATES.PAUSED || state === STATES.GAME_OVER || state === STATES.WIN) return;
+
+    if (state === STATES.START) {
+      stateTimer -= dt;
+      if (stateTimer <= 0) state = STATES.PLAYING;
+      return;
+    }
+
+    if (state === STATES.PLAYER_HIT) {
+      stateTimer -= dt;
+      if (stateTimer <= 0) {
+        bullets = [];
+        enemyBullets = [];
+        resetPlayer();
+        state = STATES.PLAYING;
+      }
+      return;
+    }
+
+    if (state === STATES.WAVE_CLEAR) {
+      stateTimer -= dt;
+      if (stateTimer <= 0) beginWave(true);
+      return;
+    }
+
+    updatePlayer(dt);
+    updateAliens(dt);
+    updateBullets(dt);
+    updateMystery(dt);
+  }
+
+  function drawStarfield() {
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    for (let i = 0; i < 60; i++) {
+      const x = (i * 137) % W;
+      const y = (i * 211) % H;
+      ctx.fillRect(x, y, 2, 2);
+    }
+  }
+
+  function drawAlien(a) {
+    if (!a.alive) return;
+    ctx.save();
+    ctx.translate(a.x, a.y);
+    ctx.fillStyle = a.type.color;
+    if (a.type.name === 'squid') {
+      ctx.fillRect(10, 0, 8, 6);
+      ctx.fillRect(6, 6, 16, 6);
+      ctx.fillRect(2, 12, 24, 4);
+      ctx.fillRect(6 + (a.frame ? 0 : 2), 16, 4, 4);
+      ctx.fillRect(18 - (a.frame ? 0 : 2), 16, 4, 4);
+    } else if (a.type.name === 'crab') {
+      ctx.fillRect(4, 4, 20, 6);
+      ctx.fillRect(0, 10, 28, 6);
+      ctx.fillRect(4 + (a.frame ? 0 : 2), 16, 4, 4);
+      ctx.fillRect(20 - (a.frame ? 0 : 2), 16, 4, 4);
+    } else {
+      ctx.fillRect(8, 0, 12, 6);
+      ctx.fillRect(4, 6, 20, 8);
+      ctx.fillRect(0, 14, 28, 4);
+      ctx.fillRect(6 + (a.frame ? 0 : 2), 18, 4, 2);
+      ctx.fillRect(18 - (a.frame ? 0 : 2), 18, 4, 2);
+    }
+    ctx.restore();
+  }
+
+  function drawPlayer() {
+    ctx.save();
+    ctx.translate(player.x, player.y);
+    ctx.fillStyle = player.hitFlash > 0 && Math.floor(player.hitFlash * 12) % 2 === 0 ? '#ff6666' : '#ffffff';
+    ctx.fillRect(18, 0, 8, 8);
+    ctx.fillRect(14, 8, 16, 4);
+    ctx.fillRect(8, 12, 28, 4);
+    ctx.fillRect(4, 16, 36, 4);
+    ctx.restore();
+  }
+
+  function drawBullets() {
+    ctx.fillStyle = '#ffffff';
+    bullets.forEach(b => ctx.fillRect(b.x, b.y, b.w, b.h));
+    ctx.fillStyle = '#ff6666';
+    enemyBullets.forEach(b => ctx.fillRect(b.x, b.y, b.w, b.h));
+  }
+
+  function drawShields() {
+    shields.forEach(shield => {
+      shield.forEach(block => {
+        const shade = ['#1e5', '#3f7', '#9fb'][block.hp - 1] || '#2e6';
+        ctx.fillStyle = shade;
+        ctx.fillRect(block.x, block.y, 6, 6);
+      });
+    });
+  }
+
+  function drawMystery() {
+    if (!mystery) return;
+    ctx.fillStyle = '#ff4444';
+    ctx.fillRect(mystery.x + 6, mystery.y, 30, 6);
+    ctx.fillRect(mystery.x, mystery.y + 6, 42, 8);
+    ctx.fillRect(mystery.x + 8, mystery.y + 14, 8, 4);
+    ctx.fillRect(mystery.x + 26, mystery.y + 14, 8, 4);
+  }
+
+  function drawParticles() {
+    particles.forEach(p => {
+      ctx.fillStyle = p.color;
+      ctx.globalAlpha = p.life / p.maxLife;
+      ctx.fillRect(p.x, p.y, 3, 3);
+      ctx.globalAlpha = 1;
+    });
+  }
+
+  function drawHUD() {
+    ctx.fillStyle = '#fff';
+    ctx.font = '20px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`SCORE ${score}`, 18, 28);
+    ctx.textAlign = 'center';
+    ctx.fillText(`HI ${highScore}`, W / 2, 28);
+    ctx.textAlign = 'right';
+    ctx.fillText(`WAVE ${wave}`, W - 18, 28);
+
+    for (let i = 0; i < lives; i++) {
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(20 + i * 28, H - 20, 18, 6);
+      ctx.fillRect(26 + i * 28, H - 26, 6, 6);
+    }
+  }
+
+  function drawOverlay(title, lines, dim = true) {
+    if (dim) {
+      ctx.fillStyle = 'rgba(0,0,0,0.58)';
+      ctx.fillRect(0, 0, W, H);
+    }
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'bold 46px Arial';
+    ctx.fillText(title, W / 2, H / 2 - 90);
+    ctx.font = '24px Arial';
+    lines.forEach((line, i) => ctx.fillText(line, W / 2, H / 2 + i * 34));
+  }
+
+  function render() {
+    drawStarfield();
+    drawShields();
+    aliens.forEach(drawAlien);
+    drawMystery();
+    drawBullets();
+    drawPlayer();
+    drawParticles();
+
+    ctx.strokeStyle = '#66ff66';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(10, H - 34);
+    ctx.lineTo(W - 10, H - 34);
+    ctx.stroke();
+
+    drawHUD();
+
+    if (state === STATES.TITLE) {
+      drawOverlay('SPACE INVADERS', [
+        'Press SPACE to start',
+        'Arrow keys / A D to move',
+        'Space fires • survive 6 waves'
+      ], true);
+    } else if (state === STATES.START) {
+      drawOverlay(`WAVE ${wave}`, ['Prepare defenses...'], false);
+    } else if (state === STATES.PAUSED) {
+      drawOverlay('PAUSED', ['Press P or Escape to resume', 'Press R to restart'], true);
+    } else if (state === STATES.GAME_OVER) {
+      drawOverlay('GAME OVER', [message || 'The fleet won.', 'Press R to play again', 'Press Escape for title'], true);
+    } else if (state === STATES.WIN) {
+      drawOverlay('VICTORY!', [message || 'Earth is safe tonight.', 'Press R to play again'], true);
+    }
+  }
+
+  function handleInput() {
+    if (justPressed('Space')) {
+      if (state === STATES.TITLE) startGame();
+      else if (state === STATES.PLAYING) firePlayerBullet();
+    }
+
+    if (justPressed('KeyP') || justPressed('Escape')) {
+      if (state === STATES.PLAYING || state === STATES.START) state = STATES.PAUSED;
+      else if (state === STATES.PAUSED) state = STATES.PLAYING;
+      else if (state === STATES.GAME_OVER || state === STATES.WIN) state = STATES.TITLE;
+    }
+
+    if (justPressed('KeyR')) {
+      if (state !== STATES.TITLE) startGame();
+    }
+  }
+
+  function syncPrev() {
+    const watched = ['ArrowLeft','ArrowRight','KeyA','KeyD','Space','KeyP','Escape','KeyR'];
+    for (const key of watched) prevKeys[key] = !!keys[key];
+  }
+
+  function frame(ts) {
+    if (!lastTime) lastTime = ts;
+    const dt = Math.min(DT_CAP, (ts - lastTime) / 1000);
+    lastTime = ts;
+
+    handleInput();
+    update(dt);
+    render();
+    syncPrev();
+    requestAnimationFrame(frame);
+  }
+
+  window.addEventListener('keydown', (e) => {
+    const handled = ['ArrowLeft','ArrowRight','KeyA','KeyD','Space','KeyP','Escape','KeyR'];
+    if (handled.includes(e.code)) e.preventDefault();
+    keys[e.code] = true;
+  }, { passive: false });
+
+  window.addEventListener('keyup', (e) => {
+    keys[e.code] = false;
+  });
+
+  window.addEventListener('blur', () => {
+    for (const key in keys) keys[key] = false;
+  });
+
+  buildAliens();
+  buildShields();
+  render();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

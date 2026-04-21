@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Tetris</title>
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; background: #111111; overflow: hidden; }
+  canvas { display: block; margin: 0 auto; background: #111111; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="game" width="800" height="600"></canvas>
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  const CELL = 28;
+  const COLS = 10, ROWS = 20;
+  const WELL_X = 240, WELL_Y = 20, WELL_W = COLS * CELL, WELL_H = ROWS * CELL;
+  const PREVIEW_X = 560, PREVIEW_Y = 60, PREVIEW_W = 112, PREVIEW_H = 112;
+
+  const COLORS = {
+    I: '#00FFFF', O: '#FFFF00', T: '#AA00FF', S: '#00FF00',
+    Z: '#FF0000', J: '#0000FF', L: '#FF8800'
+  };
+  const PIECES = {
+    I: [[0,1],[1,1],[2,1],[3,1]],
+    O: [[1,0],[2,0],[1,1],[2,1]],
+    T: [[1,0],[0,1],[1,1],[2,1]],
+    S: [[1,0],[2,0],[0,1],[1,1]],
+    Z: [[0,0],[1,0],[1,1],[2,1]],
+    J: [[0,0],[0,1],[1,1],[2,1]],
+    L: [[2,0],[0,1],[1,1],[2,1]]
+  };
+  const ORDER = ['I','O','T','S','Z','J','L'];
+
+  let state = 'IDLE';
+  let board, current, nextQueue, bag, score, highScore, level, lines, gravityMs, fallAcc, lockDelay, groundedTime, groundedResets, pausedOverlay, flashTimer, gameOverReason;
+  let last = performance.now();
+
+  try { highScore = Number(localStorage.getItem('tetris_highscore') || 0) || 0; } catch(e) { highScore = 0; }
+
+  function initGame() {
+    board = Array.from({length: ROWS}, () => Array(COLS).fill(null));
+    score = 0; level = 1; lines = 0; gravityMs = 1000; fallAcc = 0; lockDelay = 500;
+    groundedTime = 0; groundedResets = 0; pausedOverlay = false; flashTimer = 0; gameOverReason = '';
+    bag = []; nextQueue = [];
+    refillQueue();
+    spawnPiece();
+    state = 'PLAYING';
+    console.log('state: PLAYING');
+    updateHighScore();
+  }
+
+  function refillBag() {
+    const arr = ORDER.slice();
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = (Math.random() * (i + 1)) | 0;
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+  function refillQueue() {
+    while (nextQueue.length < 3) {
+      if (bag.length === 0) bag = refillBag();
+      nextQueue.push(bag.shift());
+    }
+  }
+  function clonePiece(type) {
+    return { type, x: 3, y: 0, r: 0 };
+  }
+  function spawnPiece() {
+    refillQueue();
+    current = clonePiece(nextQueue.shift());
+    refillQueue();
+    current.x = 3; current.y = -1; current.r = 0;
+    groundedTime = 0; groundedResets = 0; fallAcc = 0;
+    if (!canPlace(current, 0, 0, current.r)) {
+      state = 'GAME_OVER';
+      gameOverReason = 'Spawn blocked';
+      console.log('state: GAME_OVER');
+      try { localStorage.setItem('tetris_highscore', String(Math.max(highScore, score))); } catch(e) {}
+    }
+  }
+
+  function cellsOf(piece, rx = piece.r, ox = piece.x, oy = piece.y) {
+    const shape = PIECES[piece.type];
+    const out = [];
+    for (const [bx, by] of shape) {
+      let x = bx, y = by;
+      for (let i = 0; i < (rx % 4); i++) {
+        const tx = x;
+        x = 3 - y;
+        y = tx;
+      }
+      out.push({x: ox + x, y: oy + y});
+    }
+    return out;
+  }
+
+  function canPlace(piece, dx, dy, rot) {
+    const test = { ...piece, x: piece.x + dx, y: piece.y + dy, r: rot };
+    for (const c of cellsOf(test)) {
+      if (c.x < 0 || c.x >= COLS || c.y >= ROWS) return false;
+      if (c.y >= 0 && board[c.y][c.x]) return false;
+    }
+    return true;
+  }
+
+  const KICKS = {
+    '0>1': [[0,0],[-1,0],[1,0],[0,-1],[-1,-1],[1,-1],[-2,0],[2,0]],
+    '1>2': [[0,0],[1,0],[-1,0],[0,-1],[1,-1],[-1,-1],[2,0],[-2,0]],
+    '2>3': [[0,0],[1,0],[-1,0],[0,-1],[1,-1],[-1,-1],[2,0],[-2,0]],
+    '3>0': [[0,0],[-1,0],[1,0],[0,-1],[-1,-1],[1,-1],[-2,0],[2,0]]
+  };
+
+  function tryRotate(dir=1) {
+    if (state !== 'PLAYING') return false;
+    const from = current.r, to = (current.r + dir + 4) % 4;
+    const key = `${from}>${to}`;
+    const tests = KICKS[key] || [[0,0]];
+    for (const [kx, ky] of tests) {
+      if (canPlace({ ...current, r: to }, kx, ky, to)) {
+        current.x += kx; current.y += ky; current.r = to;
+        onGroundedAction();
+        beep(220, 0.03, 'square', 0.02);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function move(dx) {
+    if (state !== 'PLAYING') return false;
+    if (canPlace(current, dx, 0, current.r)) {
+      current.x += dx;
+      onGroundedAction();
+      beep(220, 0.02, 'square', 0.02);
+      return true;
+    }
+    return false;
+  }
+
+  function hardDrop() {
+    if (state !== 'PLAYING') return;
+    let dist = 0;
+    while (canPlace(current, 0, 1, current.r)) { current.y++; dist++; }
+    score += dist * 2;
+    beep(120, 0.05, 'sine', 0.03);
+    lockPiece();
+    updateHighScore();
+  }
+
+  function softDrop() {
+    if (state !== 'PLAYING') return;
+    if (canPlace(current, 0, 1, current.r)) {
+      current.y++; score += 1;
+      onGroundedAction();
+    }
+  }
+
+  function onGroundedAction() {
+    if (!isGrounded()) {
+      groundedTime = 0; groundedResets = 0;
+    } else if (groundedResets < 3) {
+      groundedTime = 0; groundedResets++;
+    }
+  }
+
+  function isGrounded() {
+    return !canPlace(current, 0, 1, current.r);
+  }
+
+  function lockPiece() {
+    for (const c of cellsOf(current)) {
+      if (c.y >= 0) board[c.y][c.x] = current.type;
+    }
+    const cleared = clearLines();
+    if (cleared > 0) {
+      const pts = [0,100,300,500,800][cleared] * level;
+      score += pts;
+      lines += cleared;
+      level = 1 + Math.floor(lines / 10);
+      gravityMs = Math.max(1000 - (level - 1) * 75, 100);
+      flashTimer = 180;
+      lineTone();
+    }
+    updateHighScore();
+    spawnPiece();
+  }
+
+  function clearLines() {
+    let cleared = 0;
+    for (let y = ROWS - 1; y >= 0; y--) {
+      if (board[y].every(v => v)) {
+        board.splice(y, 1);
+        board.unshift(Array(COLS).fill(null));
+        cleared++; y++;
+      }
+    }
+    return cleared;
+  }
+
+  function updateHighScore() {
+    if (score > highScore) {
+      highScore = score;
+      try { localStorage.setItem('tetris_highscore', String(highScore)); } catch(e) {}
+    }
+  }
+
+  function getGhostY() {
+    let y = current.y;
+    while (canPlace(current, 0, (y - current.y) + 1, current.r)) y++;
+    return y;
+  }
+
+  function drawCell(x, y, color, alpha=1, stroke=false) {
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = color;
+    ctx.fillRect(WELL_X + x * CELL, WELL_Y + y * CELL, CELL, CELL);
+    if (stroke) {
+      ctx.globalAlpha = alpha;
+      ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+      ctx.strokeRect(WELL_X + x * CELL + 0.5, WELL_Y + y * CELL + 0.5, CELL - 1, CELL - 1);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawPiece(piece, alpha=1, xOff=0, yOff=0) {
+    ctx.fillStyle = COLORS[piece.type];
+    for (const c of cellsOf(piece)) {
+      if (c.y < 0) continue;
+      drawCell(c.x, c.y, COLORS[piece.type], alpha, true);
+    }
+  }
+
+  function drawMiniPiece(type, px, py, scale=1) {
+    const temp = { type, x: px, y: py, r: 0 };
+    ctx.fillStyle = COLORS[type];
+    for (const c of cellsOf(temp)) {
+      ctx.fillStyle = COLORS[type];
+      ctx.fillRect(PREVIEW_X + c.x * CELL * scale, PREVIEW_Y + c.y * CELL * scale, CELL * scale, CELL * scale);
+      ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+      ctx.strokeRect(PREVIEW_X + c.x * CELL * scale + 0.5, PREVIEW_Y + c.y * CELL * scale + 0.5, CELL * scale - 1, CELL * scale - 1);
+    }
+  }
+
+  function drawWell() {
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(WELL_X, WELL_Y, WELL_W, WELL_H);
+    ctx.strokeStyle = '#555555';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(WELL_X + 0.5, WELL_Y + 0.5, WELL_W - 1, WELL_H - 1);
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = '#333333';
+    for (let x = 1; x < COLS; x++) {
+      ctx.beginPath(); ctx.moveTo(WELL_X + x * CELL + 0.5, WELL_Y); ctx.lineTo(WELL_X + x * CELL + 0.5, WELL_Y + WELL_H); ctx.stroke();
+    }
+    for (let y = 1; y < ROWS; y++) {
+      ctx.beginPath(); ctx.moveTo(WELL_X, WELL_Y + y * CELL + 0.5); ctx.lineTo(WELL_X + WELL_W, WELL_Y + y * CELL + 0.5); ctx.stroke();
+    }
+  }
+
+  function drawUI() {
+    ctx.fillStyle = '#AAAAAA';
+    ctx.font = '14px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText('SCORE', 560, 20);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = '20px monospace';
+    ctx.fillText(String(score), 560, 44);
+
+    ctx.fillStyle = '#AAAAAA';
+    ctx.font = '14px monospace';
+    ctx.fillText('HIGH SCORE', 560, 92);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = '20px monospace';
+    ctx.fillText(String(highScore), 560, 116);
+
+    ctx.fillStyle = '#AAAAAA';
+    ctx.font = '14px monospace';
+    ctx.fillText('LEVEL', 560, 164);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = '20px monospace';
+    ctx.fillText(String(level), 560, 188);
+
+    ctx.fillStyle = '#AAAAAA';
+    ctx.font = '14px monospace';
+    ctx.fillText('LINES', 560, 236);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = '20px monospace';
+    ctx.fillText(String(lines), 560, 260);
+
+    ctx.fillStyle = '#AAAAAA';
+    ctx.font = '14px monospace';
+    ctx.fillText('NEXT', PREVIEW_X, PREVIEW_Y - 14);
+    ctx.strokeStyle = '#555555';
+    ctx.strokeRect(PREVIEW_X + 0.5, PREVIEW_Y + 0.5, PREVIEW_W - 1, PREVIEW_H - 1);
+
+    if (nextQueue.length) {
+      const t = nextQueue[0];
+      const boxes = PIECES[t];
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const [x,y] of boxes) { minX=Math.min(minX,x); minY=Math.min(minY,y); maxX=Math.max(maxX,x); maxY=Math.max(maxY,y); }
+      const bw = (maxX - minX + 1) * CELL, bh = (maxY - minY + 1) * CELL;
+      const ox = PREVIEW_X + (PREVIEW_W - bw)/2 - minX*CELL;
+      const oy = PREVIEW_Y + (PREVIEW_H - bh)/2 - minY*CELL;
+      for (const [x,y] of boxes) {
+        ctx.fillStyle = COLORS[t];
+        ctx.fillRect(ox + x * CELL, oy + y * CELL, CELL, CELL);
+        ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+        ctx.strokeRect(ox + x * CELL + 0.5, oy + y * CELL + 0.5, CELL - 1, CELL - 1);
+      }
+    }
+  }
+
+  function drawStartScreen() {
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = 'bold 44px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('TETRIS', WELL_X + WELL_W/2, 170);
+    const centerX = WELL_X + WELL_W/2, centerY = 290;
+    const keys = ['I','O','T','S','Z','J','L'];
+    const positions = [
+      [0,0],[1,0],[-1,0],[0,1],[1,1],[-1,1],[0,2]
+    ];
+    for (let i=0;i<7;i++) {
+      const t = keys[i], [ox,oy] = positions[i];
+      const temp = { type:t, x: ox, y: oy, r: 0 };
+      const c0 = cellsOf(temp);
+      const dx = centerX + ox*72 - 42;
+      const dy = centerY + oy*72 - 42;
+      for (const cell of c0) {
+        ctx.fillStyle = COLORS[t];
+        ctx.fillRect(dx + (cell.x - ox) * 14, dy + (cell.y - oy) * 14, 14, 14);
+      }
+    }
+    ctx.fillStyle = '#AAAAAA';
+    ctx.font = '20px monospace';
+    ctx.fillText('Press Enter to Start', WELL_X + WELL_W/2, 505);
+  }
+
+  function drawPauseOverlay() {
+    overlayText('PAUSED', 'Press P to resume');
+  }
+
+  function drawGameOver() {
+    overlayText('GAME OVER', `Score ${score}`, 'Press Enter to restart');
+  }
+
+  function overlayText(title, sub1, sub2) {
+    ctx.fillStyle = 'rgba(0,0,0,0.68)';
+    ctx.fillRect(0,0,W,H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = 'bold 42px monospace';
+    ctx.fillText(title, W/2, H/2 - 20);
+    ctx.font = '20px monospace';
+    ctx.fillText(sub1, W/2, H/2 + 20);
+    if (sub2) ctx.fillText(sub2, W/2, H/2 + 54);
+  }
+
+  function update(dt) {
+    if (state !== 'PLAYING') return;
+    if (flashTimer > 0) flashTimer -= dt;
+    fallAcc += dt;
+    const interval = (keydownDown ? gravityMs * 0.08 : gravityMs);
+    if (fallAcc >= interval) {
+      fallAcc = 0;
+      if (canPlace(current, 0, 1, current.r)) {
+        current.y++;
+      } else {
+        groundedTime += interval;
+        if (groundedTime >= lockDelay) lockPiece();
+      }
+    }
+    if (isGrounded()) {
+      groundedTime += dt;
+      if (groundedTime >= lockDelay) lockPiece();
+    } else groundedTime = 0;
+  }
+
+  let keydownDown = false;
+  function handleKey(e, down) {
+    if (down && e.repeat && (e.code === 'ArrowLeft' || e.code === 'ArrowRight' || e.code === 'ArrowDown' || e.code === 'KeyA' || e.code === 'KeyD' || e.code === 'KeyS')) return;
+    if (e.code === 'Enter' && down) {
+      if (state === 'IDLE' || state === 'GAME_OVER') initGame();
+      else if (state === 'PLAYING' || state === 'PAUSED') { if (state === 'GAME_OVER') initGame(); }
+      return;
+    }
+    if (e.code === 'KeyP' && down && state === 'PLAYING') { state = 'PAUSED'; console.log('state: PAUSED'); return; }
+    if (e.code === 'KeyP' && down && state === 'PAUSED') { state = 'PLAYING'; console.log('state: PLAYING'); return; }
+    if (state !== 'PLAYING') return;
+    if (down) {
+      if (e.code === 'ArrowLeft' || e.code === 'KeyA') move(-1);
+      else if (e.code === 'ArrowRight' || e.code === 'KeyD') move(1);
+      else if (e.code === 'ArrowUp' || e.code === 'KeyW') tryRotate(1);
+      else if (e.code === 'ArrowDown' || e.code === 'KeyS') { keydownDown = true; softDrop(); }
+      else if (e.code === 'Space') hardDrop();
+    } else {
+      if (e.code === 'ArrowDown' || e.code === 'KeyS') keydownDown = false;
+    }
+  }
+
+  window.addEventListener('keydown', e => { if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Space'].includes(e.code)) e.preventDefault(); handleKey(e, true); });
+  window.addEventListener('keyup', e => handleKey(e, false));
+
+  let audioCtx = null;
+  function beep(freq, dur, type='square', gain=0.04) {
+    try {
+      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+      const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+      o.type = type; o.frequency.value = freq; g.gain.value = gain;
+      o.connect(g); g.connect(audioCtx.destination);
+      o.start(); o.stop(audioCtx.currentTime + dur);
+    } catch(e) {}
+  }
+  function lineTone() {
+    try {
+      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+      const now = audioCtx.currentTime;
+      [440, 660, 880].forEach((f,i) => {
+        const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+        o.type = 'sine'; o.frequency.value = f; g.gain.value = 0.03;
+        o.connect(g); g.connect(audioCtx.destination);
+        o.start(now + i*0.06); o.stop(now + i*0.06 + 0.08);
+      });
+    } catch(e) {}
+  }
+
+  function render() {
+    ctx.clearRect(0,0,W,H);
+    ctx.fillStyle = '#111111';
+    ctx.fillRect(0,0,W,H);
+    drawWell();
+    if (state !== 'IDLE') {
+      for (let y = 0; y < ROWS; y++) for (let x = 0; x < COLS; x++) if (board[y][x]) drawCell(x,y,COLORS[board[y][x]],1,true);
+      if (current) {
+        const gy = getGhostY();
+        const ghost = { ...current, y: gy };
+        drawPiece(ghost, 0.30);
+        drawPiece(current, 1);
+      }
+      drawUI();
+    }
+    if (state === 'IDLE') drawStartScreen();
+    if (state === 'PAUSED') drawPauseOverlay();
+    if (state === 'GAME_OVER') drawGameOver();
+  }
+
+  function loop(t) {
+    const dt = Math.min(33.33, t - last);
+    last = t;
+    update(dt);
+    render();
+    requestAnimationFrame(loop);
+  }
+
+  state = 'IDLE';
+  console.log('state: IDLE');
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

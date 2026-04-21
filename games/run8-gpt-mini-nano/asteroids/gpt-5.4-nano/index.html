@@ -1,0 +1,1037 @@
+<!-- asteroids | spec:run8-gpt-mini-nano | built-by:gpt-5.4-nano -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Asteroids</title>
+  <style>
+    html, body { margin:0; padding:0; background:#000; height:100%; overflow:hidden; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    #wrap { width:800px; margin:0 auto; }
+    canvas { display:block; background:#000; width:800px; height:600px; image-rendering: pixelated; }
+    .hidden { display:none; }
+    #hint { position:absolute; left:0; top:0; color:#fff; font-size:12px; opacity:.0; pointer-events:none; }
+    /* Accessibility focus for keyboard capture */
+    body { user-select:none; -webkit-user-select:none; }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="game" width="800" height="600" tabindex="0" aria-label="Asteroids game"></canvas>
+  </div>
+  <div id="hint"> </div>
+
+<script>
+(() => {
+  "use strict";
+
+  // ---- Canvas / setup ----
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d", { alpha: false });
+  const W = canvas.width, H = canvas.height;
+
+  // ---- Input ----
+  const keys = new Set();
+  function setKey(e, down) {
+    const k = e.key;
+    if (!k) return;
+    if (down) keys.add(k);
+    else keys.delete(k);
+  }
+  window.addEventListener("keydown", (e) => {
+    if (["ArrowLeft","ArrowRight","ArrowUp","ArrowDown"," "].includes(e.key)) e.preventDefault();
+    if (e.key === " "){ setKey(e, true); }
+    else setKey(e, true);
+    if (["ArrowLeft","ArrowRight","ArrowUp","ArrowDown"," "].includes(e.key)) e.preventDefault();
+  }, { passive:false });
+  window.addEventListener("keyup", (e) => {
+    if (e.key === " ") setKey(e, false);
+    else setKey(e, false);
+  });
+
+  // ---- Audio (optional but implemented safely) ----
+  let audioCtx = null;
+  let master = null;
+  function ensureAudio() {
+    if (audioCtx) return;
+    try {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      master = audioCtx.createGain();
+      master.gain.value = 0.25;
+      master.connect(audioCtx.destination);
+    } catch { /* ignore */ }
+  }
+  function playTone(freq, dur, type="triangle", gain=0.08, detune=0) {
+    if (!audioCtx) return;
+    const t0 = audioCtx.currentTime;
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = type;
+    o.frequency.value = freq;
+    o.detune.value = detune;
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(gain, t0 + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g);
+    g.connect(master);
+    o.start(t0);
+    o.stop(t0 + dur + 0.02);
+  }
+  function playBlip() {
+    ensureAudio();
+    try {
+      playTone(900, 0.06, "triangle", 0.05);
+    } catch {}
+  }
+  function playExplosion(size=1) {
+    if (!audioCtx) return;
+    const t0 = audioCtx.currentTime;
+    const seconds = 0.08 + (size*0.03);
+    const noiseBuffer = audioCtx.createBuffer(1, Math.max(1, Math.floor(audioCtx.sampleRate * seconds)), audioCtx.sampleRate);
+    const data = noiseBuffer.getChannelData(0);
+    for (let i=0;i<data.length;i++) data[i] = (Math.random()*2-1) * Math.pow(1 - i/data.length, 2);
+    const src = audioCtx.createBufferSource();
+    src.buffer = noiseBuffer;
+
+    const filter = audioCtx.createBiquadFilter();
+    filter.type = "bandpass";
+    filter.frequency.value = 400 + size*250;
+    filter.Q.value = 0.6 + size*0.2;
+
+    const g = audioCtx.createGain();
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(0.22 * (0.8 + size*0.2), t0 + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + seconds);
+
+    src.connect(filter);
+    filter.connect(g);
+    g.connect(master);
+    src.start(t0);
+    src.stop(t0 + seconds + 0.02);
+  }
+  let shipSweepTimer = 0;
+  function playShipDeath() {
+    if (!audioCtx) return;
+    const t0 = audioCtx.currentTime;
+    const dur = 0.35;
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = "sawtooth";
+    o.frequency.setValueAtTime(220, t0);
+    o.frequency.exponentialRampToValueAtTime(60, t0 + dur);
+    o.detune.value = -10;
+
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(0.18, t0 + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+
+    // add tiny noise layer
+    const noiseBuffer = audioCtx.createBuffer(1, Math.max(1, Math.floor(audioCtx.sampleRate * dur)), audioCtx.sampleRate);
+    const data = noiseBuffer.getChannelData(0);
+    for (let i=0;i<data.length;i++) data[i] = (Math.random()*2-1) * Math.pow(1 - i/data.length, 2);
+    const src = audioCtx.createBufferSource();
+    src.buffer = noiseBuffer;
+
+    const nf = audioCtx.createBiquadFilter();
+    nf.type="lowpass"; nf.frequency.value=900;
+
+    const ng = audioCtx.createGain();
+    ng.gain.setValueAtTime(0.0001, t0);
+    ng.gain.exponentialRampToValueAtTime(0.08, t0 + 0.01);
+    ng.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+
+    o.connect(g); g.connect(master);
+    src.connect(nf); nf.connect(ng); ng.connect(master);
+
+    o.start(t0); o.stop(t0+dur+0.02);
+    src.start(t0); src.stop(t0+dur+0.02);
+  }
+
+  let ufoHum = { active:false, o1:null, o2:null, g:null };
+  function startUfoHum() {
+    if (!audioCtx || ufoHum.active) return;
+    try {
+      ufoHum.active = true;
+      ufoHum.o1 = audioCtx.createOscillator();
+      ufoHum.o2 = audioCtx.createOscillator();
+      ufoHum.g = audioCtx.createGain();
+      ufoHum.o1.type = "sine";
+      ufoHum.o2.type = "sine";
+      ufoHum.o1.frequency.value = 70;
+      ufoHum.o2.frequency.value = 92;
+      ufoHum.g.gain.value = 0.0001;
+      ufoHum.o1.connect(ufoHum.g);
+      ufoHum.o2.connect(ufoHum.g);
+      ufoHum.g.connect(master);
+      const t0 = audioCtx.currentTime;
+      ufoHum.g.gain.setValueAtTime(0.0001, t0);
+      ufoHum.g.gain.exponentialRampToValueAtTime(0.12, t0 + 0.25);
+      ufoHum.o1.start(t0);
+      ufoHum.o2.start(t0);
+    } catch {}
+  }
+  function stopUfoHum() {
+    if (!audioCtx || !ufoHum.active) return;
+    try {
+      const t0 = audioCtx.currentTime;
+      ufoHum.g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.18);
+      setTimeout(() => {
+        try { ufoHum.o1.stop(); } catch {}
+        try { ufoHum.o2.stop(); } catch {}
+        ufoHum.active = false;
+      }, 220);
+    } catch { ufoHum.active=false; }
+  }
+
+  // ---- Math helpers ----
+  const TAU = Math.PI * 2;
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  function rand(min, max){ return min + Math.random()*(max-min); }
+  function wrapPos(obj) {
+    // seamless wrap for center positions
+    if (obj.x < 0) obj.x += W;
+    else if (obj.x >= W) obj.x -= W;
+    if (obj.y < 0) obj.y += H;
+    else if (obj.y >= H) obj.y -= H;
+  }
+  function distSqWrap(a, b) {
+    // not used; spec says circular checks; simplest is plain distance, but wrapping should be fair.
+    // We'll do minimal torus distance.
+    let dx = b.x - a.x;
+    if (dx > W/2) dx -= W;
+    else if (dx < -W/2) dx += W;
+    let dy = b.y - a.y;
+    if (dy > H/2) dy -= H;
+    else if (dy < -H/2) dy += H;
+    return dx*dx + dy*dy;
+  }
+
+  // ---- Vector helpers ----
+  function vecFromAngle(angle) { return { x: Math.cos(angle), y: Math.sin(angle) }; }
+
+  // ---- Asteroid polygon generation ----
+  function makeAsteroidShape(seed, pointsCount, baseRadius, roughness=0.33) {
+    // Deterministic per asteroid "seed": generate points along 0..2pi with radius perturbations.
+    // We store in local asteroid space centered at origin.
+    let rngState = seed >>> 0;
+    function rnd() { // xorshift32
+      rngState ^= rngState << 13; rngState ^= rngState >>> 17; rngState ^= rngState << 5;
+      return ((rngState >>> 0) / 4294967296);
+    }
+    const pts = [];
+    const startRot = rnd() * TAU;
+    for (let i=0;i<pointsCount;i++) {
+      const t = i / pointsCount;
+      const ang = startRot + t*TAU;
+      const rr = baseRadius * (1 + (rnd()*2-1) * roughness);
+      pts.push({ x: Math.cos(ang)*rr, y: Math.sin(ang)*rr });
+    }
+    return pts;
+  }
+
+  // ---- Game state machine ----
+  const State = { IDLE: "IDLE", PLAYING: "PLAYING", PAUSED: "PAUSED", GAME_OVER: "GAME_OVER" };
+  let state = State.IDLE;
+
+  // ---- Entities ----
+  const ship = {
+    x: 400, y: 300,
+    angle: 0, // radians, 0 pointing up? We'll align with spec: triangle points at (0,-18) initially.
+    vx: 0, vy: 0,
+    invulnT: 0,
+    deadT: 0,
+    blinkPhase: 0,
+    radius: 12 // for circular checks (ship center)
+  };
+
+  const bullets = []; // {x,y,vx,vy,life, r}
+  const asteroids = []; // {x,y,vx,vy, size, r, pts, rot, rotV, id}
+  let wave = 1;
+
+  const player = { lives: 3 };
+
+  // UFO
+  let ufo = null; // {x,y,vx,vy,r, life? not needed, active, nextShotT}
+  const ufoBullets = [];
+
+  // Score
+  let score = 0;
+  let highScore = 0;
+
+  // ---- Timers / pacing ----
+  let lastT = 0;
+  let pauseOverlayAlpha = 0;
+
+  let ufoSpawnT = 0; // countdown to next spawn (20-30s)
+  let ufoShotCooldown = 0; // handled per ufo
+
+  // For wave completion checks
+  function clearWaveAndAdvanceIfNeeded() {
+    if (asteroids.length === 0 && state === State.PLAYING) {
+      wave += 1;
+      spawnWave(wave);
+    }
+  }
+
+  // ---- Spawning ----
+  let asteroidSeedCounter = 1;
+
+  function spawnWave(w) {
+    // wave 1: 4 large; later adds 1 more large
+    const count = 3 + w; // since w=1 ->4, w=2 ->5 etc
+    asteroids.length = 0;
+
+    const safeSpawnMinDist = 150;
+    for (let i=0;i<count;i++) {
+      let ax, ay;
+      let tries = 0;
+      do {
+        ax = rand(0, W);
+        ay = rand(0, H);
+        tries++;
+      } while (tries < 200 && ((ax-ship.x)*(ax-ship.x) + (ay-ship.y)*(ay-ship.y) < safeSpawnMinDist*safeSpawnMinDist));
+      const size = 3; // large=3, medium=2, small=1
+      spawnAsteroidAt(ax, ay, size, null, /*fromSplit*/false);
+    }
+  }
+
+  function spawnAsteroidAt(x, y, size, fromAsteroid, fromSplit) {
+    // size mapping: large radius 40, medium 20, small 10
+    const radii = { 3: 40, 2: 20, 1: 10 };
+    const r = radii[size];
+    let pointsCount;
+    let baseRadius = r;
+    if (size === 3) pointsCount = Math.floor(rand(10, 14+1)); // 10–14
+    else if (size === 2) pointsCount = Math.floor(rand(8, 12+1));
+    else pointsCount = Math.floor(rand(6, 10+1));
+    const seed = (asteroidSeedCounter++ * 2654435761) >>> 0;
+
+    const pts = makeAsteroidShape(seed, pointsCount, baseRadius, 0.35);
+
+    // drift speed range
+    let speedMin, speedMax;
+    if (size === 3) { speedMin = 50; speedMax = 80; }
+    else if (size === 2) { speedMin = 80; speedMax = 120; }
+    else { speedMin = 120; speedMax = 180; }
+
+    let ang = rand(0, TAU);
+    // If fromSplit, diversify with diverging angles
+    let vx=0, vy=0;
+    if (fromAsteroid && fromSplit) {
+      const baseAng = Math.atan2(fromAsteroid.vy, fromAsteroid.vx);
+      const add = rand(-1.1, 1.1) * (fromAsteroid.size === 3 ? 0.9 : 0.75);
+      ang = baseAng + add + (fromAsteroid.id % 2 ? 0.35 : -0.35);
+    }
+    const sp = rand(speedMin, speedMax);
+    vx = Math.cos(ang)*sp;
+    vy = Math.sin(ang)*sp;
+
+    const rot = rand(0, TAU);
+    const rotV = rand(-0.75, 0.75) * (size === 3 ? 0.55 : size === 2 ? 0.85 : 1.05);
+
+    asteroids.push({
+      x, y,
+      vx, vy,
+      size,
+      r,
+      pts,
+      rot, rotV,
+      id: (Math.random()*1e9)>>>0,
+      seed
+    });
+  }
+
+  function shipNosePosition() {
+    const nose = vecFromAngle(ship.angle);
+    // triangle defined with points at (0,-18), (-12,12), (12,12) before rotation.
+    // With our coordinate, triangle is centered at ship.x/y. The nose vector should point in ship facing direction.
+    // If angle=0 corresponds to pointing up, then nose is (0,-18) -> vector (0,-1).
+    // We'll implement ship angle such that 0 means up, positive is clockwise? Canvas y+ downward.
+    // We'll set facing direction unit vector = (cos(angle), sin(angle)) with angle=0 => (1,0) right. Not match.
+    // Instead we define that ship angle is radians where 0 means up: direction = (sin(angle), -cos(angle)).
+    const dirX = Math.sin(ship.angle);
+    const dirY = -Math.cos(ship.angle);
+    const noseDist = 18;
+    return { x: ship.x + dirX*noseDist, y: ship.y + dirY*noseDist };
+  }
+
+  function respawnShip() {
+    // respawn after 2 seconds only if center region is safe
+    // center region: radius 90 around center; must not overlap any asteroid radius + 10
+    const centerX = W/2, centerY = H/2;
+    const regionR = 90;
+    const minClear = 10;
+
+    function isSafe(px, py) {
+      // avoid if within region or intersects asteroids? spec says "center region is safe"
+      const dxC = px - centerX, dyC = py - centerY;
+      if (dxC*dxC + dyC*dyC > regionR*regionR) return false; // spawn in that center region
+      for (const a of asteroids) {
+        const rr = a.r + ship.radius + minClear;
+        if (distSqWrap({x:px,y:py}, {x:a.x,y:a.y}) < rr*rr) return false;
+      }
+      for (const ub of ufoBullets) {
+        // optional
+        const rr = ub.r + ship.radius + minClear;
+        if (distSqWrap({x:px,y:py}, {x:ub.x,y:ub.y}) < rr*rr) return false;
+      }
+      return true;
+    }
+
+    let tries = 0;
+    while (tries < 400) {
+      // spawn within center region
+      const r = Math.sqrt(Math.random()) * regionR;
+      const ang = Math.random()*TAU;
+      const px = centerX + Math.cos(ang)*r;
+      const py = centerY + Math.sin(ang)*r;
+
+      if (isSafe(px, py)) {
+        ship.x = px; ship.y = py;
+        ship.vx = 0; ship.vy = 0;
+        ship.angle = -Math.PI/2; // face up initially: our angle where 0 is up -> actually use -pi/2?
+        // Let's keep consistent with draw: dir = (sin(angle), -cos(angle)); for up, dir=(0,-1): choose angle=0.
+        ship.angle = 0;
+        ship.invulnT = 2.0;
+        ship.blinkPhase = 0;
+        return true;
+      }
+      tries++;
+    }
+    return false;
+  }
+
+  function startGame() {
+    score = 0;
+    wave = 1;
+    player.lives = 3;
+    bullets.length = 0;
+    asteroids.length = 0;
+    ufo = null;
+    ufoBullets.length = 0;
+
+    ship.x = 400; ship.y = 300;
+    ship.angle = 0;
+    ship.vx = 0; ship.vy = 0;
+    ship.invulnT = 2.0;
+    ship.blinkPhase = 0;
+
+    spawnWave(1);
+
+    ufoSpawnT = rand(20, 30);
+    ufoShotCooldown = 0;
+    state = State.PLAYING;
+    console.log("State -> PLAYING");
+    lastT = performance.now();
+  }
+
+  function restart() {
+    stopUfoHum();
+    state = State.IDLE;
+    startGame();
+  }
+
+  // ---- Controls mapping ----
+  function controls(dt) {
+    // Rotate left/right at 270°/s
+    const rotRate = 270 * Math.PI / 180;
+    const thrustAcc = 200; // px/s^2
+    const maxSpeed = 350;
+
+    let rot = 0;
+    if (keys.has("ArrowLeft") || keys.has("a") || keys.has("A")) rot -= rotRate;
+    if (keys.has("ArrowRight") || keys.has("d") || keys.has("D")) rot += rotRate;
+
+    if (rot !== 0) ship.angle += rot * dt;
+
+    const thrusting = keys.has("ArrowUp") || keys.has("w") || keys.has("W");
+    if (thrusting && state === State.PLAYING) {
+      // direction for ship facing (angle=0 => up)
+      const dirX = Math.sin(ship.angle);
+      const dirY = -Math.cos(ship.angle);
+      ship.vx += dirX * thrustAcc * dt;
+      ship.vy += dirY * thrustAcc * dt;
+
+      // clamp speed
+      const sp = Math.hypot(ship.vx, ship.vy);
+      if (sp > maxSpeed) {
+        const s = maxSpeed / sp;
+        ship.vx *= s; ship.vy *= s;
+      }
+    } else {
+      // mild friction decay to keep vector feel (inertia but not infinite)
+      const decay = Math.pow(0.998, dt*60); // ~1 at small dt
+      ship.vx *= decay; ship.vy *= decay;
+    }
+    return thrusting;
+  }
+
+  let fireCooldown = 0;
+  function updateShooting(dt, thrusting) {
+    // Space fires; max 4 active bullets; bullets wrap; expires 0.8s
+    if (state !== State.PLAYING) return;
+    fireCooldown = Math.max(0, fireCooldown - dt);
+    const wantsFire = keys.has(" ") || keys.has("Spacebar") || keys.has("Space");
+    if (wantsFire && fireCooldown === 0 && bullets.length < 4) {
+      const nose = shipNosePosition();
+      // bullet velocity in ship facing direction
+      const dirX = Math.sin(ship.angle);
+      const dirY = -Math.cos(ship.angle);
+      const speed = 500;
+      bullets.push({
+        x: nose.x, y: nose.y,
+        vx: dirX * speed,
+        vy: dirY * speed,
+        life: 0.8,
+        r: 2
+      });
+      fireCooldown = 0.18;
+      if (!audioCtx) { /* wait for user gesture later */ }
+      playBlip();
+    }
+  }
+
+  function spawnBulletUfo() {
+    if (!ufo) return;
+    const dx = ship.x - ufo.x;
+    const dy = ship.y - ufo.y;
+    // minimal torus aim for direction (not strictly required but nicer)
+    // We'll ignore wrap in aiming and just use raw dx/dy
+    const len = Math.hypot(dx, dy) || 1;
+    const dirX = dx / len, dirY = dy / len;
+    const speed = 350;
+    ufoBullets.push({
+      x: ufo.x,
+      y: ufo.y,
+      vx: dirX * speed,
+      vy: dirY * speed,
+      life: 5,
+      r: 2
+    });
+  }
+
+  // ---- Drawing ----
+  function drawText(text, x, y, style) {
+    ctx.save();
+    ctx.fillStyle = style?.color ?? "#fff";
+    ctx.font = style?.font ?? "18px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace";
+    ctx.textAlign = style?.align ?? "left";
+    ctx.textBaseline = style?.baseline ?? "alphabetic";
+    ctx.fillText(text, x, y);
+    ctx.restore();
+  }
+
+  function drawShip(thrusting) {
+    const inv = ship.invulnT > 0;
+    const blink = inv ? (ship.blinkPhase < 0.25) : false;
+
+    if (inv && blink) return;
+
+    ctx.save();
+    ctx.translate(ship.x, ship.y);
+    ctx.rotate(ship.angle);
+
+    ctx.strokeStyle = "#FFFFFF";
+    ctx.lineWidth = 2;
+
+    // Triangle points at (0,-18), (-12,12), (12,12)
+    ctx.beginPath();
+    ctx.moveTo(0, -18);
+    ctx.lineTo(-12, 12);
+    ctx.lineTo(12, 12);
+    ctx.closePath();
+    ctx.stroke();
+
+    // Thrust flame behind ship when thrusting
+    if (thrusting && state === State.PLAYING) {
+      const flicker = 0.6 + Math.random()*0.8;
+      // rear direction opposite nose; in ship local coords: flame at (0, 14) pointing downwards (since nose at (0,-18))
+      ctx.fillStyle = "#FF9900";
+      ctx.beginPath();
+      ctx.moveTo(0, 14);
+      ctx.lineTo(-4, 18 + flicker*2);
+      ctx.lineTo(4, 18 + flicker*2);
+      ctx.closePath();
+      ctx.fill();
+      // small flicker notch
+      ctx.globalAlpha = 0.7;
+      ctx.beginPath();
+      ctx.moveTo(0, 12);
+      ctx.lineTo(-2, 16 + flicker*2);
+      ctx.lineTo(2, 16 + flicker*2);
+      ctx.closePath();
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    ctx.restore();
+  }
+
+  function drawAsteroid(a) {
+    ctx.save();
+    ctx.translate(a.x, a.y);
+    ctx.rotate(a.rot);
+    ctx.strokeStyle = "#AAAAAA";
+    ctx.lineWidth = 2;
+
+    ctx.beginPath();
+    for (let i=0;i<a.pts.length;i++) {
+      const p = a.pts[i];
+      if (i === 0) ctx.moveTo(p.x, p.y);
+      else ctx.lineTo(p.x, p.y);
+    }
+    ctx.closePath();
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawBullet(b) {
+    ctx.save();
+    ctx.fillStyle = "#FFFFFF";
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, b.r, 0, TAU);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawUfo() {
+    if (!ufo) return;
+    ctx.save();
+    ctx.translate(ufo.x, ufo.y);
+    // body horizontal; spec size 32x12 with dome 20x8
+    ctx.strokeStyle = "#FF4444";
+    ctx.lineWidth = 2;
+
+    // body (saucer outline)
+    const bw = 32, bh = 12;
+    const domeW = 20, domeH = 8;
+
+    ctx.beginPath();
+    ctx.ellipse(0, 0, bw/2, bh/2, 0, 0, TAU);
+    // But ellipse would look odd; use outline with simple arc + base
+    // We'll create a flat-ish saucer:
+    ctx.closePath();
+
+    // Better: draw lower body arc + top rim and dome
+    // Lower body:
+    ctx.beginPath();
+    ctx.moveTo(-bw/2, 0);
+    ctx.quadraticCurveTo(0, -bh/2 - 1, bw/2, 0);
+    ctx.quadraticCurveTo( bw/2, bh/2, -bw/2, bh/2);
+    ctx.closePath();
+    ctx.stroke();
+
+    // dome:
+    ctx.beginPath();
+    ctx.ellipse(0, -2, domeW/2, domeH/2, 0, Math.PI, 0, false);
+    // dome as top half
+    ctx.stroke();
+
+    // top dome rim:
+    ctx.beginPath();
+    ctx.arc(0, -2, domeW/2, Math.PI, 0);
+    ctx.stroke();
+
+    ctx.restore();
+  }
+
+  function drawUfoBullet(b) {
+    ctx.save();
+    ctx.fillStyle = "#FF4444";
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, b.r, 0, TAU);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawHUD() {
+    // Score top-left
+    drawText(`SCORE ${score}`, 16, 30, { color:"#FFFFFF", font:"18px monospace", align:"left", baseline:"alphabetic" });
+
+    // High score top-right
+    const hs = Math.max(highScore, score);
+    drawText(`HI ${highScore}`, W-16, 30, { color:"#FFFFFF", font:"18px monospace", align:"right", baseline:"alphabetic" });
+
+    // Lives under score area: small ship icons
+    const startX = 16;
+    const y = 60;
+    for (let i=0;i<player.lives;i++) {
+      const sx = startX + i*28;
+      ctx.save();
+      ctx.translate(sx, y+10);
+      ctx.strokeStyle = "#FFFFFF";
+      ctx.lineWidth = 2;
+      // smaller triangle
+      ctx.beginPath();
+      ctx.moveTo(0, -10);
+      ctx.lineTo(-7, 7);
+      ctx.lineTo(7, 7);
+      ctx.closePath();
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // Wave indicator optional near top-center
+    drawText(`WAVE ${wave}`, W/2, 30, { color:"#AAAAAA", font:"16px monospace", align:"center", baseline:"alphabetic" });
+  }
+
+  function drawStartScreen() {
+    ctx.save();
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0,0,W,H);
+
+    drawText("ASTEROIDS", W/2, 220, { color:"#FFFFFF", font:"52px monospace", align:"center", baseline:"alphabetic" });
+    drawText("Press Enter to Start", W/2, 360, { color:"#FFFFFF", font:"20px monospace", align:"center", baseline:"alphabetic" });
+    ctx.restore();
+  }
+
+  function drawGameOver() {
+    ctx.save();
+    // Dim background
+    ctx.fillStyle = "rgba(0,0,0,0.45)";
+    ctx.fillRect(0,0,W,H);
+
+    drawText("GAME OVER", W/2, 270, { color:"#FFFFFF", font:"60px monospace", align:"center", baseline:"alphabetic" });
+    drawText(`Final Score: ${score}`, W/2, 340, { color:"#FFFFFF", font:"22px monospace", align:"center", baseline:"alphabetic" });
+    drawText(`Press Enter to restart`, W/2, 390, { color:"#FFFFFF", font:"18px monospace", align:"center", baseline:"alphabetic" });
+    ctx.restore();
+  }
+
+  function drawPauseOverlay() {
+    ctx.save();
+    ctx.fillStyle = "#000000CC";
+    ctx.fillRect(0,0,W,H);
+    drawText("PAUSED", W/2, 300, { color:"#FFFFFF", font:"64px monospace", align:"center", baseline:"alphabetic" });
+    ctx.restore();
+  }
+
+  function drawWrappingHintGlow(obj) {
+    // no-op; keep minimalist
+  }
+
+  // ---- Collision handling ----
+  function destroyAsteroid(a, byBullet=true) {
+    // Split logic based on size (large->2 medium, medium->2 small, small destroyed)
+    if (a.size === 3) score += 20;
+    else if (a.size === 2) score += 50;
+    else score += 100;
+
+    playExplosion(a.size === 3 ? 3 : a.size === 2 ? 2 : 1);
+
+    if (a.size > 1) {
+      const newSize = a.size - 1;
+      // spawn 2
+      for (let i=0;i<2;i++) {
+        // diverging angles
+        spawnAsteroidAt(a.x, a.y, newSize, a, true);
+        const child = asteroids[asteroids.length-1];
+        // push them slightly apart and add diverging velocities
+        const baseAng = Math.atan2(a.vy, a.vx);
+        const offset = (i === 0 ? -1 : 1) * rand(0.45, 0.85);
+        const spBoost = rand(30, 60) + (newSize===2?20:0);
+        const dirX = Math.cos(baseAng + offset);
+        const dirY = Math.sin(baseAng + offset);
+        child.vx += dirX * spBoost;
+        child.vy += dirY * spBoost;
+
+        child.rot = rand(0, TAU);
+        child.rotV = rand(-1, 1) * (newSize===2?0.9:1.1);
+        // slight positional jitter to avoid perfect overlap
+        child.x += dirX * (a.r*0.2);
+        child.y += dirY * (a.r*0.2);
+        wrapPos(child);
+      }
+    }
+  }
+
+  function handleShipHit() {
+    if (ship.invulnT > 0 || state !== State.PLAYING) return;
+    player.lives -= 1;
+    console.log("Ship hit! Lives:", player.lives);
+    playShipDeath();
+
+    if (player.lives <= 0) {
+      state = State.GAME_OVER;
+      console.log("State -> GAME_OVER");
+      stopUfoHum();
+      highScore = Math.max(highScore, score);
+      try { localStorage.setItem("asteroids_highscore", String(highScore)); } catch {}
+      return;
+    }
+
+    // Remove UFO hum? keep.
+    ship.deadT = 2.0;
+    // set invuln for blinking after respawn? spec says invuln for respawned ship, and respawn after 2 seconds.
+    ship.invulnT = 0;
+    ship.blinkPhase = 0;
+  }
+
+  function checkCollisions() {
+    // Bullet ↔ Asteroid
+    for (let bi=bullets.length-1; bi>=0; bi--) {
+      const b = bullets[bi];
+      let hit = false;
+      for (let ai=asteroids.length-1; ai>=0; ai--) {
+        const a = asteroids[ai];
+        const rr = a.r + b.r;
+        if (distSqWrap(b, a) <= rr*rr) {
+          // destroy bullet and asteroid (split)
+          bullets.splice(bi, 1);
+          // remove asteroid and add splits
+          asteroids.splice(ai, 1);
+          destroyAsteroid(a, true);
+          hit = true;
+          break;
+        }
+      }
+      if (hit) continue;
+    }
+
+    // Bullet ↔ UFO
+    if (ufo) {
+      for (let bi=bullets.length-1; bi>=0; bi--) {
+        const b = bullets[bi];
+        const rr = 20 + b.r; // approximate UFO radius
+        if (distSqWrap(b, ufo) <= rr*rr) {
+          bullets.splice(bi, 1);
+          // destroy UFO
+          ufo = null;
+          stopUfoHum();
+          score += 200;
+          playExplosion(2);
+          break;
+        }
+      }
+    }
+
+    // Ship ↔ Asteroid
+    if (ship.invulnT <= 0) {
+      for (const a of asteroids) {
+        const rr = a.r + ship.radius;
+        if (distSqWrap({x:ship.x,y:ship.y}, a) <= rr*rr) {
+          handleShipHit();
+          return;
+        }
+      }
+
+      // Ship ↔ UFO bullet
+      for (const ub of ufoBullets) {
+        const rr = ub.r + ship.radius;
+        if (distSqWrap({x:ship.x,y:ship.y}, ub) <= rr*rr) {
+          handleShipHit();
+          return;
+        }
+      }
+
+      // Ship ↔ UFO
+      if (ufo) {
+        const rr = 22 + ship.radius;
+        if (distSqWrap({x:ship.x,y:ship.y}, ufo) <= rr*rr) {
+          handleShipHit();
+          return;
+        }
+      }
+    }
+  }
+
+  // ---- Update loop ----
+  function update(dt) {
+    if (state !== State.PLAYING) return;
+
+    // timers
+    if (ship.deadT > 0) {
+      ship.deadT -= dt;
+      if (ship.deadT <= 0) {
+        // respawn after 2 seconds, safe center region
+        const ok = respawnShip();
+        if (!ok) {
+          // if not safe, keep trying a little bit before giving up
+          ship.deadT = 0.2;
+        }
+      }
+      // while dead: don't move
+    } else {
+      const thrusting = controls(dt);
+      // position update (inertia)
+      ship.x += ship.vx * dt;
+      ship.y += ship.vy * dt;
+      wrapPos(ship);
+
+      ship.invulnT = Math.max(0, ship.invulnT - dt);
+      if (ship.invulnT > 0) {
+        ship.blinkPhase += dt;
+        // blink roughly 10 Hz
+        ship.blinkPhase = ship.blinkPhase % 0.5;
+      }
+
+      updateShooting(dt, thrusting);
+    }
+
+    // bullets update
+    for (let i=bullets.length-1;i>=0;i--) {
+      const b = bullets[i];
+      b.life -= dt;
+      if (b.life <= 0) { bullets.splice(i,1); continue; }
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+      wrapPos(b);
+    }
+
+    // asteroids update
+    for (let i=0;i<asteroids.length;i++) {
+      const a = asteroids[i];
+      a.x += a.vx * dt;
+      a.y += a.vy * dt;
+      wrapPos(a);
+      a.rot += a.rotV * dt;
+    }
+
+    // UFO update
+    ufoSpawnT -= dt;
+    if (ufoSpawnT <= 0 && !ufo && state === State.PLAYING) {
+      // spawn entering from left or right around y=120-220
+      const fromLeft = Math.random() < 0.5;
+      ufo = {
+        x: fromLeft ? -50 : W + 50,
+        y: rand(120, 220),
+        vx: fromLeft ? 120 : -120,
+        vy: 0,
+        nextShotT: rand(1.0, 2.2),
+      };
+      startUfoHum();
+      // new spawn timer re-queued after current ufo is destroyed or will not; spec says occasionally respawn on 20-30s timer
+      ufoSpawnT = rand(20, 30);
+      console.log("UFO spawned");
+    }
+    if (ufo) {
+      ufo.x += ufo.vx * dt;
+      wrapPos(ufo);
+
+      // Occasionally spawn/shot at interval
+      ufo.nextShotT -= dt;
+      if (ufo.nextShotT <= 0) {
+        spawnBulletUfo();
+        ufo.nextShotT = rand(1.0, 2.0);
+      }
+    }
+
+    // UFO bullets
+    for (let i=ufoBullets.length-1;i>=0;i--) {
+      const b = ufoBullets[i];
+      b.life -= dt;
+      if (b.life <= 0) { ufoBullets.splice(i,1); continue; }
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+      wrapPos(b);
+    }
+
+    // collisions
+    checkCollisions();
+
+    // if wave cleared and no asteroids, advance wave
+    clearWaveAndAdvanceIfNeeded();
+
+    // update high score
+    highScore = Math.max(highScore, score);
+    try { localStorage.setItem("asteroids_highscore", String(highScore)); } catch {}
+  }
+
+  function render() {
+    // Background
+    ctx.fillStyle = "#000000";
+    ctx.fillRect(0,0,W,H);
+
+    if (state === State.IDLE) {
+      drawStartScreen();
+      return;
+    }
+
+    // Draw HUD always in gameplay/paused/gameover maybe
+    drawHUD();
+
+    // Draw entities
+    for (const a of asteroids) drawAsteroid(a);
+    for (const b of bullets) drawBullet(b);
+    drawShip(keys.has("ArrowUp") || keys.has("w") || keys.has("W"));
+    if (ufo) drawUfo();
+    for (const b of ufoBullets) drawUfoBullet(b);
+
+    if (state === State.PAUSED) {
+      drawPauseOverlay();
+    } else if (state === State.GAME_OVER) {
+      drawGameOver();
+    }
+  }
+
+  // ---- State + controls for meta keys ----
+  window.addEventListener("mousedown", () => {
+    ensureAudio();
+    canvas.focus();
+  });
+
+  window.addEventListener("click", () => { ensureAudio(); canvas.focus(); });
+
+  function handleMetaControls() {
+    if (keys.has("Enter")) {
+      if (state === State.IDLE) {
+        ensureAudio();
+        restart();
+      } else if (state === State.GAME_OVER) {
+        ensureAudio();
+        restart();
+      }
+      // prevent repeated start attempts while key held: consume by clearing set after action
+      keys.delete("Enter");
+    }
+    if (keys.has("p") || keys.has("P")) {
+      if (state === State.PLAYING) {
+        state = State.PAUSED;
+        console.log("State -> PAUSED");
+      } else if (state === State.PAUSED) {
+        state = State.PLAYING;
+        console.log("State -> PLAYING");
+        lastT = performance.now();
+      }
+      keys.delete("p"); keys.delete("P");
+    }
+  }
+
+  // ---- Game Loop (T02) ----
+  function frame(t) {
+    const now = t;
+    let dt = (now - lastT) / 1000;
+    dt = clamp(dt, 0, 0.033); // avoid huge jumps; stable
+    lastT = now;
+
+    handleMetaControls();
+
+    if (state === State.PLAYING) update(dt);
+
+    render();
+    requestAnimationFrame(frame);
+  }
+
+  // ---- Load high score ----
+  try {
+    highScore = parseInt(localStorage.getItem("asteroids_highscore") || "0", 10) || 0;
+  } catch { highScore = 0; }
+
+  // ---- Initial draw ----
+  drawStartScreen();
+  canvas.focus();
+  console.log("State -> IDLE");
+
+  // ---- Start animation ----
+  lastT = performance.now();
+  requestAnimationFrame(frame);
+
+  // ---- Additional acceptance: ensure ship blink during invuln ----
+  // Already in drawShip + invuln updates.
+
+  // ---- Ensure spec: AABB unless spec says otherwise ----
+  // We used circular checks for bullets/asteroids/ship center as requested; torus distance for wrapping fairness.
+
+})();
+</script>
+</body>
+</html>

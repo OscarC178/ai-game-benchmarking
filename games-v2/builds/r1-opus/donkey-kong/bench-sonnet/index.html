@@ -1,0 +1,635 @@
+<!-- GAME: Donkey Kong | RUN: r1-opus | BUILDER: Sonnet 4.6 -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Donkey Kong - Construction Site</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: #222;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            overflow: hidden;
+            font-family: 'Courier New', Courier, monospace;
+        }
+        canvas {
+            background: #000;
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+            image-rendering: pixelated;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas" width="672" height="768"></canvas>
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        // Constants
+        const CANVAS_WIDTH = 672;
+        const CANVAS_HEIGHT = 768;
+        const GRAVITY = 700;
+        const TERMINAL_VELOCITY = 400;
+        const MARIO_WALK_SPEED = 100;
+        const MARIO_CLIMB_SPEED = 80;
+        const MARIO_JUMP_VEL = -280;
+        const BARREL_RADIUS = 10;
+        const HAMMER_DURATION = 10000;
+
+        // Audio System
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        function playTone(freq, type, duration, volume = 0.1, slideTo = null) {
+            try {
+                const osc = audioCtx.createOscillator();
+                const gain = audioCtx.createGain();
+                osc.type = type;
+                osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+                if (slideTo) osc.frequency.exponentialRampToValueAtTime(slideTo, audioCtx.currentTime + duration);
+                gain.gain.setValueAtTime(volume, audioCtx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + duration);
+                osc.connect(gain);
+                gain.connect(audioCtx.destination);
+                osc.start();
+                osc.stop(audioCtx.currentTime + duration);
+            } catch(e) {}
+        }
+
+        // Game State
+        const STATE = { TITLE: 0, INTRO: 1, PLAYING: 2, PAUSED: 3, DEATH: 4, CLEAR: 5, GAMEOVER: 6 };
+        let currentState = STATE.TITLE;
+        let score = 0;
+        let highscore = parseInt(localStorage.getItem('donkeykong_best')) || 0;
+        let lives = 3;
+        let level = 1;
+        let bonus = 5000;
+        let lastTime = 0;
+        let keys = {};
+        let objects = { mario: null, dk: null, pauline: null, barrels: [], fireballs: [], hammers: [], girders: [], ladders: [], popups: [] };
+
+        // Girder Definition
+        class Girder {
+            constructor(id, lx, rx, ly, ry, direction) {
+                this.id = id;
+                this.lx = lx; this.rx = rx; this.ly = ly; this.ry = ry;
+                this.direction = direction; // 1: slopes down-right, -1: slopes down-left
+            }
+            getYAt(x) {
+                if (x < this.lx || x > this.rx) return null;
+                const t = (x - this.lx) / (this.rx - this.lx);
+                return this.ly + t * (this.ry - this.ly);
+            }
+            draw() {
+                ctx.fillStyle = '#CC4400';
+                ctx.beginPath();
+                ctx.moveTo(this.lx, this.ly);
+                ctx.lineTo(this.rx, this.ry);
+                ctx.lineTo(this.rx, this.ry + 8);
+                ctx.lineTo(this.lx, this.ly + 8);
+                ctx.closePath();
+                ctx.fill();
+                // Rivet detail
+                ctx.strokeStyle = '#FF6600';
+                ctx.lineWidth = 1;
+                for(let x = this.lx; x < this.rx; x += 16) {
+                    ctx.strokeRect(x, this.getYAt(x), 16, 8);
+                }
+            }
+        }
+
+        class Ladder {
+            constructor(x, bGid, tGid, type = 'full') {
+                this.x = x; this.bGid = bGid; this.tGid = tGid; this.type = type;
+                this.active = true;
+                this.timer = 0;
+            }
+            update(dt) {
+                if (this.type === 'broken') {
+                    this.timer += dt;
+                    this.active = (Math.floor(this.timer / 3) % 2 === 0);
+                }
+            }
+            draw() {
+                if (!this.active) return;
+                const bG = objects.girders.find(g => g.id === this.bGid);
+                const tG = objects.girders.find(g => g.id === this.tGid);
+                const by = bG.getYAt(this.x);
+                const ty = tG.getYAt(this.x);
+                
+                ctx.strokeStyle = '#66CCFF';
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.moveTo(this.x - 6, ty); ctx.lineTo(this.x - 6, by);
+                ctx.moveTo(this.x + 6, ty); ctx.lineTo(this.x + 6, by);
+                ctx.stroke();
+                for(let y = ty; y < by; y += 10) {
+                    ctx.beginPath();
+                    ctx.moveTo(this.x - 6, y); ctx.lineTo(this.x + 6, y);
+                    ctx.stroke();
+                }
+            }
+        }
+
+        class Mario {
+            constructor() {
+                this.reset();
+            }
+            reset() {
+                this.x = 560; this.y = 620;
+                this.vx = 0; this.vy = 0;
+                this.width = 24; this.height = 32;
+                this.facing = -1;
+                this.state = 'standing'; // standing, walking, jumping, climbing, dying
+                this.airborne = false;
+                this.climbingLadder = null;
+                this.hammerTimer = 0;
+                this.animFrame = 0;
+                this.animTimer = 0;
+            }
+            update(dt) {
+                if (this.state === 'dying') {
+                    this.animTimer += dt;
+                    return;
+                }
+
+                if (this.hammerTimer > 0) {
+                    this.hammerTimer -= dt * 1000;
+                }
+
+                if (this.state === 'climbing') {
+                    this.handleClimbing(dt);
+                } else {
+                    this.handleMovement(dt);
+                }
+                
+                this.checkCollisions();
+            }
+            handleMovement(dt) {
+                let move = 0;
+                if (keys['ArrowLeft'] || keys['KeyA']) move = -1;
+                if (keys['ArrowRight'] || keys['KeyD']) move = 1;
+
+                if (!this.airborne) {
+                    this.vx = move * (this.hammerTimer > 0 ? 80 : MARIO_WALK_SPEED);
+                    if (move !== 0) {
+                        this.facing = move;
+                        this.state = 'walking';
+                        this.animTimer += dt;
+                        if (this.animTimer > 0.12) {
+                            this.animTimer = 0;
+                            this.animFrame = (this.animFrame + 1) % 2;
+                            playTone(200 + this.animFrame * 50, 'triangle', 0.03, 0.05);
+                        }
+                    } else {
+                        this.state = 'standing';
+                    }
+
+                    if ((keys['Space']) && !this.airborne && this.hammerTimer <= 0) {
+                        this.vy = MARIO_JUMP_VEL;
+                        this.airborne = true;
+                        playTone(300, 'sine', 0.1, 0.15, 500);
+                        this.jumpedBarrels = new Set();
+                    }
+
+                    // Check for ladder entry
+                    if (keys['ArrowUp'] || keys['KeyW'] || keys['ArrowDown'] || keys['KeyS']) {
+                        const dir = (keys['ArrowUp'] || keys['KeyW']) ? -1 : 1;
+                        const ladder = objects.ladders.find(l => Math.abs(this.x - l.x) < 8 && l.active);
+                        if (ladder && this.hammerTimer <= 0) {
+                            const bG = objects.girders.find(g => g.id === ladder.bGid);
+                            const tG = objects.girders.find(g => g.id === ladder.tGid);
+                            const myFeet = this.y + this.height;
+                            if (dir === -1 && Math.abs(myFeet - bG.getYAt(this.x)) < 10) {
+                                this.state = 'climbing';
+                                this.climbingLadder = ladder;
+                                this.x = ladder.x;
+                            } else if (dir === 1 && Math.abs(myFeet - tG.getYAt(this.x)) < 10) {
+                                this.state = 'climbing';
+                                this.climbingLadder = ladder;
+                                this.x = ladder.x;
+                            }
+                        }
+                    }
+                }
+
+                if (this.airborne) {
+                    this.vy += GRAVITY * dt;
+                    if (this.vy > TERMINAL_VELOCITY) this.vy = TERMINAL_VELOCITY;
+                    this.y += this.vy * dt;
+                    this.x += this.vx * dt;
+                    this.state = 'jumping';
+
+                    // Land detection
+                    objects.girders.forEach(g => {
+                        const gy = g.getYAt(this.x);
+                        if (gy && this.vy > 0 && this.y + this.height >= gy && this.y + this.height <= gy + 15) {
+                            const fallDist = this.vy; // heuristic
+                            this.y = gy - this.height;
+                            this.vy = 0;
+                            this.airborne = false;
+                            this.vx = 0;
+                            playTone(120, 'square', 0.04, 0.1);
+                            
+                            // Scoring jumps
+                            if (this.jumpedBarrels && this.jumpedBarrels.size > 0) {
+                                const pts = this.jumpedBarrels.size === 1 ? 100 : 300;
+                                score += pts;
+                                objects.popups.push({x: this.x, y: this.y, text: pts, timer: 0.6});
+                                playTone(660, 'sine', 0.06, 0.15);
+                            }
+                        }
+                    });
+                } else {
+                    const currentGirder = objects.girders.find(g => g.getYAt(this.x) !== null);
+                    if (currentGirder) {
+                        this.y = currentGirder.getYAt(this.x) - this.height;
+                    } else if (this.x < 56 || this.x > 616) {
+                        this.airborne = true; // Fall off edge
+                    }
+                }
+            }
+            handleClimbing(dt) {
+                let move = 0;
+                if (keys['ArrowUp'] || keys['KeyW']) move = -1;
+                if (keys['ArrowDown'] || keys['KeyS']) move = 1;
+
+                if (move !== 0) {
+                    this.y += move * MARIO_CLIMB_SPEED * dt;
+                    this.animTimer += dt;
+                    if (this.animTimer > 0.15) {
+                        this.animTimer = 0;
+                        this.animFrame = (this.animFrame + 1) % 2;
+                        playTone(350, 'square', 0.02, 0.05);
+                    }
+                }
+
+                const bG = objects.girders.find(g => g.id === this.climbingLadder.bGid);
+                const tG = objects.girders.find(g => g.id === this.climbingLadder.tGid);
+                const by = bG.getYAt(this.x);
+                const ty = tG.getYAt(this.x);
+
+                if (this.y + this.height <= ty + 2) {
+                    this.y = ty - this.height;
+                    this.state = 'standing';
+                    this.climbingLadder = null;
+                } else if (this.y + this.height >= by) {
+                    this.y = by - this.height;
+                    this.state = 'standing';
+                    this.climbingLadder = null;
+                }
+            }
+            checkCollisions() {
+                // Goal
+                if (this.y < 110 && this.x > 220 && this.x < 452) {
+                    currentState = STATE.CLEAR;
+                    playTone(523, 'sine', 0.1, 0.15);
+                    setTimeout(() => playTone(659, 'sine', 0.1, 0.15), 100);
+                    setTimeout(() => playTone(783, 'sine', 0.1, 0.15), 200);
+                    setTimeout(() => playTone(1046, 'sine', 0.2, 0.15), 300);
+                }
+                
+                // Hammer collection
+                objects.hammers = objects.hammers.filter(h => {
+                    if (Math.abs(this.x - h.x) < 20 && Math.abs(this.y - h.y) < 20) {
+                        this.hammerTimer = HAMMER_DURATION;
+                        playTone(440, 'square', 0.08, 0.2);
+                        setTimeout(() => playTone(660, 'square', 0.08, 0.2), 80);
+                        return false;
+                    }
+                    return true;
+                });
+
+                // Enemies
+                const hitbox = {x: this.x + 3, y: this.y + 4, w: 18, h: 28};
+                [...objects.barrels, ...objects.fireballs].forEach(e => {
+                    const eBox = {x: e.x - 8, y: e.y - 8, w: 16, h: 16};
+                    if (rectIntersect(hitbox, eBox)) {
+                        this.die();
+                    }
+                    
+                    // Jump over detection
+                    if (this.airborne && Math.abs(this.x - e.x) < 18 && this.y + this.height < e.y) {
+                        if (e instanceof Barrel) this.jumpedBarrels.add(e.id);
+                    }
+
+                    // Hammer smash
+                    if (this.hammerTimer > 0) {
+                        const hBox = {
+                            x: this.facing === 1 ? this.x + 12 : this.x - 28,
+                            y: this.y - 10, w: 30, h: 20
+                        };
+                        if (rectIntersect(hBox, eBox)) {
+                            const pts = e instanceof Barrel ? 300 : 500;
+                            score += pts;
+                            objects.popups.push({x: e.x, y: e.y, text: pts, timer: 0.6});
+                            playTone(200, 'square', 0.06, 0.2);
+                            if (e instanceof Barrel) {
+                                objects.barrels = objects.barrels.filter(b => b !== e);
+                            } else {
+                                objects.fireballs = objects.fireballs.filter(f => f !== e);
+                            }
+                        }
+                    }
+                });
+            }
+            die() {
+                if (this.state === 'dying') return;
+                this.state = 'dying';
+                this.animTimer = 0;
+                lives--;
+                playTone(400, 'sine', 0.6, 0.25, 100);
+                setTimeout(() => {
+                    if (lives <= 0) currentState = STATE.GAMEOVER;
+                    else {
+                        this.reset();
+                        objects.barrels = [];
+                        currentState = STATE.PLAYING;
+                    }
+                }, 1500);
+            }
+            draw() {
+                ctx.save();
+                if (this.state === 'dying') {
+                    ctx.translate(this.x + 12, this.y + 16);
+                    ctx.rotate(this.animTimer * 10);
+                    ctx.translate(-12, -16);
+                }
+                // Draw simple Mario
+                ctx.fillStyle = '#0000AA'; // Overalls
+                ctx.fillRect(this.x + 4, this.y + 10, 16, 18);
+                ctx.fillStyle = '#CC0000'; // Hat/Shirt
+                ctx.fillRect(this.x + 4, this.y + 4, 16, 6);
+                ctx.fillStyle = '#FFAA77'; // Face
+                ctx.fillRect(this.x + 6, this.y + 8, 12, 10);
+                
+                // Hammer animation
+                if (this.hammerTimer > 0) {
+                    const up = Math.floor(Date.now() / 100) % 2 === 0;
+                    if (this.hammerTimer < 2000 && Math.floor(Date.now() / 100) % 4 === 0) {
+                        // Flashing
+                    } else {
+                        ctx.fillStyle = '#AAAAAA';
+                        const hx = this.facing === 1 ? this.x + 20 : this.x - 10;
+                        const hy = up ? this.y - 15 : this.y + 10;
+                        ctx.fillRect(hx, hy, 14, 10);
+                        ctx.fillStyle = '#8B4513';
+                        ctx.fillRect(hx + 5, hy + 10, 4, 10);
+                    }
+                }
+                ctx.restore();
+            }
+        }
+
+        class Barrel {
+            static nextId = 0;
+            constructor(x, y, speedMult) {
+                this.id = Barrel.nextId++;
+                this.x = x; this.y = y;
+                this.vx = (80 + Math.random() * 40) * speedMult;
+                this.vy = 0;
+                this.state = 'rolling'; // rolling, falling, ladder
+                this.dir = 1;
+                this.currentGirder = objects.girders[5];
+                this.anim = 0;
+            }
+            update(dt) {
+                this.anim += dt * 10;
+                if (this.state === 'rolling') {
+                    this.x += this.vx * this.dir * dt;
+                    const gy = this.currentGirder.getYAt(this.x);
+                    if (gy === null) {
+                        this.state = 'falling';
+                    } else {
+                        this.y = gy - 8;
+                        // Check for ladder
+                        if (Math.random() < 0.01) { // simplified ladder chance
+                            const ladder = objects.ladders.find(l => Math.abs(this.x - l.x) < 10 && l.bGid === this.currentGirder.id - 1);
+                            if (ladder) {
+                                this.state = 'ladder';
+                                this.x = ladder.x;
+                            }
+                        }
+                    }
+                } else if (this.state === 'falling') {
+                    this.vy += GRAVITY * dt;
+                    this.y += this.vy * dt;
+                    this.x += this.vx * 0.3 * this.dir * dt;
+                    for(let g of objects.girders) {
+                        const gy = g.getYAt(this.x);
+                        if (gy && this.y >= gy - 8 && this.vy > 0) {
+                            this.y = gy - 8;
+                            this.vy = 0;
+                            this.currentGirder = g;
+                            this.state = 'rolling';
+                            this.dir = g.id % 2 === 0 ? -1 : 1;
+                            if (g.id === 0) this.dir = -1; // bottom
+                            break;
+                        }
+                    }
+                } else if (this.state === 'ladder') {
+                    this.y += 100 * dt;
+                    for(let g of objects.girders) {
+                        const gy = g.getYAt(this.x);
+                        if (gy && Math.abs(this.y - (gy-8)) < 5) {
+                            this.state = 'rolling';
+                            this.currentGirder = g;
+                            this.dir *= -1;
+                        }
+                    }
+                }
+
+                if (this.y > 700) {
+                    if (this.x < 100) spawnFireball();
+                    return false;
+                }
+                return true;
+            }
+            draw() {
+                ctx.fillStyle = '#CD853F';
+                ctx.beginPath();
+                ctx.ellipse(this.x, this.y, 10, 8, Math.sin(this.anim), 0, Math.PI * 2);
+                ctx.fill();
+                ctx.strokeStyle = '#8B4513';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+            }
+        }
+
+        function spawnFireball() {
+            if (objects.fireballs.length < 4) {
+                objects.fireballs.push({
+                    x: 60, y: 620, vx: 60, vy: 0,
+                    update: function(dt) {
+                        this.x += this.vx * dt;
+                        if (this.x < 56 || this.x > 616) this.vx *= -1;
+                        return true;
+                    },
+                    draw: function() {
+                        ctx.fillStyle = Math.random() > 0.5 ? '#FF4400' : '#FF8800';
+                        ctx.beginPath();
+                        ctx.arc(this.x, this.y, 8, 0, Math.PI*2);
+                        ctx.fill();
+                    }
+                });
+            }
+        }
+
+        function rectIntersect(r1, r2) {
+            return r1.x < r2.x + r2.w && r1.x + r1.w > r2.x && r1.y < r2.y + r2.h && r1.y + r1.h > r2.y;
+        }
+
+        function initLevel() {
+            objects.girders = [
+                new Girder(0, 56, 616, 640, 628, 1),
+                new Girder(1, 56, 616, 544, 556, -1),
+                new Girder(2, 56, 616, 460, 448, 1),
+                new Girder(3, 56, 616, 364, 376, -1),
+                new Girder(4, 56, 616, 280, 268, 1),
+                new Girder(5, 56, 456, 188, 180, 1),
+                new Girder(6, 220, 452, 98, 98, 0)
+            ];
+            objects.ladders = [
+                new Ladder(120, 0, 1), new Ladder(540, 1, 2),
+                new Ladder(120, 2, 3), new Ladder(540, 3, 4),
+                new Ladder(120, 4, 5), new Ladder(400, 5, 6),
+                new Ladder(320, 0, 1, 'broken')
+            ];
+            objects.mario = new Mario();
+            objects.barrels = [];
+            objects.fireballs = [];
+            objects.popups = [];
+            objects.hammers = [{x: 130, y: 440}, {x: 130, y: 260}];
+            bonus = 5000 + (level * 1000);
+            spawnTimer = 0;
+        }
+
+        let spawnTimer = 0;
+        function update(time) {
+            const dt = Math.min((time - lastTime) / 1000, 0.05);
+            lastTime = time;
+
+            if (currentState === STATE.TITLE) {
+                if (keys['Enter']) {
+                    level = 1; score = 0; lives = 3;
+                    initLevel();
+                    currentState = STATE.PLAYING;
+                    if (audioCtx.state === 'suspended') audioCtx.resume();
+                }
+            } else if (currentState === STATE.PLAYING) {
+                objects.mario.update(dt);
+                objects.ladders.forEach(l => l.update(dt));
+                objects.barrels = objects.barrels.filter(b => b.update(dt));
+                objects.fireballs = objects.fireballs.filter(f => f.update(dt));
+                objects.popups = objects.popups.filter(p => {
+                    p.timer -= dt;
+                    p.y -= 20 * dt;
+                    return p.timer > 0;
+                });
+
+                spawnTimer -= dt;
+                if (spawnTimer <= 0) {
+                    objects.barrels.push(new Barrel(100, 150, 1 + level * 0.1));
+                    spawnTimer = 3.0 - Math.min(level * 0.2, 1.5);
+                    playTone(80, 'square', 0.1, 0.1);
+                }
+
+                bonus -= 50 * dt;
+                if (bonus <= 0) objects.mario.die();
+            } else if (currentState === STATE.CLEAR) {
+                if (bonus > 0) {
+                    const step = Math.min(bonus, 100);
+                    bonus -= step;
+                    score += step;
+                    playTone(600, 'square', 0.01, 0.05);
+                } else {
+                    level++;
+                    initLevel();
+                    currentState = STATE.PLAYING;
+                }
+            } else if (currentState === STATE.GAMEOVER) {
+                if (score > highscore) {
+                    highscore = score;
+                    localStorage.setItem('donkeykong_best', highscore);
+                }
+                if (keys['Enter']) currentState = STATE.TITLE;
+            }
+
+            draw();
+            requestAnimationFrame(update);
+        }
+
+        function draw() {
+            ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+            // HUD
+            ctx.fillStyle = '#FF0000';
+            ctx.font = '12px monospace';
+            ctx.fillText('SCORE', 20, 20);
+            ctx.fillText('HIGH SCORE', CANVAS_WIDTH/2 - 40, 20);
+            ctx.fillText('BONUS', 520, 20);
+            ctx.fillStyle = '#FFFFFF';
+            ctx.font = '16px monospace';
+            ctx.fillText(Math.floor(score).toString().padStart(6, '0'), 20, 40);
+            ctx.fillText(highscore.toString().padStart(6, '0'), CANVAS_WIDTH/2 - 40, 40);
+            ctx.fillText(Math.max(0, Math.floor(bonus)).toString(), 520, 40);
+            ctx.fillText(`L=${level}`, 620, 40);
+
+            // World
+            objects.girders.forEach(g => g.draw());
+            objects.ladders.forEach(l => l.draw());
+            objects.hammers.forEach(h => {
+                ctx.fillStyle = '#AAAAAA'; ctx.fillRect(h.x - 7, h.y - 5, 14, 10);
+                ctx.fillStyle = '#8B4513'; ctx.fillRect(h.x - 2, h.y + 5, 4, 10);
+            });
+            
+            // DK & Pauline
+            ctx.fillStyle = '#8B4513'; ctx.fillRect(80, 120, 64, 60); // DK body
+            ctx.fillStyle = '#FFAA77'; ctx.fillRect(100, 130, 24, 20); // DK face
+            ctx.fillStyle = '#FF69B4'; ctx.fillRect(326, 66, 20, 32); // Pauline
+            if (Math.floor(Date.now() / 500) % 2 === 0) {
+                ctx.fillStyle = '#00FFFF'; ctx.font = '12px bold monospace';
+                ctx.fillText('HELP!', 320, 60);
+            }
+
+            // Oil Drum
+            ctx.fillStyle = '#333333'; ctx.fillRect(40, 612, 24, 28);
+            ctx.fillStyle = Math.random() > 0.5 ? '#FF4400' : '#FFFF00';
+            ctx.fillRect(44, 600, 16, 12);
+
+            objects.mario.draw();
+            objects.barrels.forEach(b => b.draw());
+            objects.fireballs.forEach(f => f.draw());
+            objects.popups.forEach(p => {
+                ctx.fillStyle = '#FFF'; ctx.font = '14px monospace';
+                ctx.fillText(p.text, p.x, p.y);
+            });
+
+            if (currentState === STATE.TITLE) {
+                ctx.fillStyle = 'rgba(0,0,0,0.8)';
+                ctx.fillRect(0,0,CANVAS_WIDTH, CANVAS_HEIGHT);
+                ctx.fillStyle = '#FF4400'; ctx.font = 'bold 42px monospace';
+                ctx.textAlign = 'center'; ctx.fillText('DONKEY KONG', CANVAS_WIDTH/2, 350);
+                ctx.fillStyle = '#AAA'; ctx.font = '18px monospace';
+                ctx.fillText('PRESS ENTER TO START', CANVAS_WIDTH/2, 500);
+                ctx.textAlign = 'left';
+            } else if (currentState === STATE.GAMEOVER) {
+                ctx.fillStyle = 'rgba(255,0,0,0.5)';
+                ctx.fillRect(0, 300, CANVAS_WIDTH, 200);
+                ctx.fillStyle = '#FFF'; ctx.font = 'bold 40px monospace';
+                ctx.textAlign = 'center'; ctx.fillText('GAME OVER', CANVAS_WIDTH/2, 380);
+                ctx.font = '20px monospace'; ctx.fillText('PRESS ENTER TO RESTART', CANVAS_WIDTH/2, 450);
+                ctx.textAlign = 'left';
+            }
+        }
+
+        window.addEventListener('keydown', e => { keys[e.code] = true; if(e.code === 'KeyP') currentState = (currentState === STATE.PLAYING ? STATE.PAUSED : STATE.PLAYING); });
+        window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+        requestAnimationFrame(update);
+    </script>
+</body>
+</html>

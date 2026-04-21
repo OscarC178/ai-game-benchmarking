@@ -1,0 +1,1009 @@
+<!-- space-invaders | spec:run7-opus-mini-nano | built-by:gpt-5.4-nano -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Space Invaders</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #000;
+      height: 100%;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      overflow: hidden;
+    }
+    .wrap {
+      width: 800px;
+      height: 600px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    canvas {
+      image-rendering: pixelated;
+      background: #000000;
+      width: 800px;
+      height: 600px;
+      display: block;
+      outline: none;
+    }
+    .hint {
+      position: absolute;
+      left: -9999px;
+      top: -9999px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <canvas id="game" width="800" height="600" tabindex="0" aria-label="Space Invaders"></canvas>
+  </div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d', { alpha: false });
+  const W = canvas.width, H = canvas.height;
+
+  // ---------- Audio (optional) ----------
+  let audioCtx = null;
+  let audioEnabled = true;
+  function ensureAudio() {
+    if (!audioEnabled) return null;
+    if (!audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      audioCtx = new AC();
+    }
+    return audioCtx;
+  }
+
+  function now() { return (audioCtx ? audioCtx.currentTime : 0); }
+
+  function tone(freq, durationMs, type='square', gain=0.04, startOffsetMs=0, sweep) {
+    const ac = ensureAudio();
+    if (!ac) return;
+    const t0 = ac.currentTime + (startOffsetMs/1000);
+    const osc = ac.createOscillator();
+    const g = ac.createGain();
+    osc.type = type;
+    if (sweep && typeof sweep === 'function') {
+      sweep(osc, g, t0, durationMs/1000);
+    } else {
+      osc.frequency.setValueAtTime(freq, t0);
+    }
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(Math.max(0.0002, gain), t0 + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + durationMs/1000);
+    osc.connect(g);
+    g.connect(ac.destination);
+    osc.start(t0);
+    osc.stop(t0 + durationMs/1000 + 0.02);
+  }
+
+  function playShoot() { tone(880, 50, 'square', 0.05); }
+  function playExplosion() { tone(160, 80, 'square', 0.05); tone(260, 80, 'square', 0.035, 0); }
+  function playHit() {
+    const ac = ensureAudio();
+    if (!ac) return;
+    // descending 440 -> 55Hz over 400ms
+    const t0 = ac.currentTime + 0.0;
+    const osc = ac.createOscillator();
+    const g = ac.createGain();
+    osc.type = 'square';
+    osc.frequency.setValueAtTime(440, t0);
+    osc.frequency.exponentialRampToValueAtTime(55, t0 + 0.4);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(0.06, t0 + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.4);
+    osc.connect(g); g.connect(ac.destination);
+    osc.start(t0); osc.stop(t0 + 0.42);
+  }
+
+  // March heartbeat alternating 2-tone lower pitch as fewer aliens remain
+  let marchBeepState = 0;
+  let marchBeepAccum = 0;
+  function playMarch(dt, aliensAlive) {
+    const ac = ensureAudio();
+    if (!ac) return;
+    marchBeepAccum += dt;
+    const countFactor = Math.max(0, Math.min(1, (aliensAlive - 0) / 55)); // 0..1
+    // When fewer aliens remain, lower pitch => use factor inversely
+    const base = 160 + (countFactor * 140); // lower when fewer => around 160
+    const freqA = base;
+    const freqB = base * 1.33;
+
+    // Heartbeat rate slightly depends on remaining; faster when more? use 0.18..0.3s
+    const interval = 0.22 + (1 - countFactor) * 0.05;
+    if (marchBeepAccum >= interval) {
+      marchBeepAccum = 0;
+      marchBeepState ^= 1;
+      const f = marchBeepState ? freqA : freqB;
+      tone(f, 65, 'square', 0.02);
+    }
+  }
+
+  // ---------- Utilities ----------
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const randRange = (a, b) => a + Math.random() * (b - a);
+  const randInt = (a, b) => Math.floor(randRange(a, b + 1));
+  const rectsOverlap = (ax, ay, aw, ah, bx, by, bw, bh) =>
+    ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+
+  // AABB for point/bullet vs cell
+  function bulletHitsAABB(b, x, y, w, h) {
+    return rectsOverlap(b.x, b.y, b.w, b.h, x, y, w, h);
+  }
+
+  // ---------- Game State ----------
+  const GameState = { IDLE: 'IDLE', PLAYING: 'PLAYING', PAUSED: 'PAUSED', GAME_OVER: 'GAME_OVER' };
+  let state = GameState.IDLE;
+
+  // ---------- Entities ----------
+  const PLAYER = {
+    w: 40, h: 32,
+    x: 380, y: 550,
+    speed: 300,
+    lives: 3
+  };
+
+  const playerBullet = {
+    active: false,
+    w: 3, h: 12,
+    x: 0, y: 0,
+    speed: 500
+  };
+
+  const MAX_ALIEN_BULLETS = 3;
+  const alienBullets = [];
+
+  function newAlienBullet(x, y) {
+    return { active: true, w: 3, h: 12, x, y, speed: 250 };
+  }
+
+  // Alien formation data
+  const ALIEN = {
+    cols: 11,
+    rows: 5,
+    spacingX: 50,
+    spacingY: 40,
+    originX: 120,
+    originY: 80,
+    alive: [],
+    cellTopOffsetY: 0
+  };
+
+  const alienTypeByRow = (r) => {
+    // r: 0..4 top->bottom
+    if (r === 0) return { kind:'small', color:'#FF0000', w:24, h:16, points:30 };
+    if (r === 1 || r === 2) return { kind:'medium', color:'#FFCC00', w:28, h:20, points:20 };
+    return { kind:'large', color:'#00CCFF', w:32, h:20, points:10 };
+  };
+
+  let formation = {
+    dir: 1, // 1 right, -1 left
+    speedBase: 30,
+    speedBonusPerWave: 10, // spec says base bonus per wave
+    speed: 30,
+    dropPending: false,
+    dropAmount: 20,
+    edgeRight: 760,
+    edgeLeft: 40,
+    lastDropAtDirectionEdge: true
+  };
+
+  function makeAliens() {
+    formation.alive = [];
+    for (let r = 0; r < ALIEN.rows; r++) {
+      formation.alive[r] = [];
+      const t = alienTypeByRow(r);
+      for (let c = 0; c < ALIEN.cols; c++) {
+        const x = ALIEN.originX + c * ALIEN.spacingX;
+        const y = ALIEN.originY + r * ALIEN.spacingY;
+        formation.alive[r][c] = {
+          alive: true,
+          x, y,
+          w: t.w, h: t.h,
+          color: t.color,
+          points: t.points,
+          // For collisions, we'll treat x,y as top-left AABB; drawing uses these
+        };
+      }
+    }
+  }
+
+  function getAliensAliveCount() {
+    let n = 0;
+    for (let r=0; r<ALIEN.rows; r++) for (let c=0; c<ALIEN.cols; c++) if (formation.alive[r][c].alive) n++;
+    return n;
+  }
+
+  function getAlienBottomInColumn(c) {
+    // bottom-most alive alien per column (largest r with alive)
+    for (let r = ALIEN.rows - 1; r >= 0; r--) {
+      const a = formation.alive[r][c];
+      if (a && a.alive) return a;
+    }
+    return null;
+  }
+
+  function getRightmostAliveX() {
+    let maxX = -Infinity;
+    for (let r=0; r<ALIEN.rows; r++) for (let c=0; c<ALIEN.cols; c++) {
+      const a = formation.alive[r][c];
+      if (a && a.alive) maxX = Math.max(maxX, a.x + a.w); // consider right edge
+    }
+    return maxX;
+  }
+  function getLeftmostAliveX() {
+    let minX = Infinity;
+    for (let r=0; r<ALIEN.rows; r++) for (let c=0; c<ALIEN.cols; c++) {
+      const a = formation.alive[r][c];
+      if (a && a.alive) minX = Math.min(minX, a.x); // left edge
+    }
+    return minX;
+  }
+
+  let wave = 1;
+
+  // Shields (4) each 20x16 grid of 4x4 cells => total shield box 80x64, arch shape
+  // positioned at x = 140,300,460,620 ; y = 480
+  const SHIELD = {
+    cols: 20, rows: 16, cell: 4,
+    shieldsX: [140, 300, 460, 620],
+    y: 480,
+    shields: [] // each {cellsAlive: boolean[rows][cols], x,y}
+  };
+
+  function isShieldCellAliveShape(cx, cy) {
+    // Arch-shaped block: remove cells from bottom corners to form arch.
+    // We'll keep top rows mostly; open concavity at bottom.
+    // Map: cy=0 top..15 bottom
+    // For arch, width decreases towards bottom.
+    // Use radius-like shaping: allow cells where abs(mid - cx) <= widthLimit(cy)
+    const mid = (SHIELD.cols - 1) / 2; // 19/2=9.5
+    const distFromCenter = Math.abs(cx - mid);
+    // Maximum half-width allowed at each cy
+    // At cy=0.. maybe almost full width, at bottom tighter
+    // Choose: full-ish at top, gradually tighten:
+    const t = cy / (SHIELD.rows - 1); // 0..1
+    // Keep narrower in middle-late: widthLimit decreases to around 6 at bottom
+    const maxHalfWidth = 9.5 - t * 5.0; // 9.5 -> ~4.5
+    // Additionally carve a "notch" in bottom corners:
+    return distFromCenter <= maxHalfWidth + 0.25;
+  }
+
+  function makeShields() {
+    SHIELD.shields = [];
+    for (let i=0; i<SHIELD.shieldsX.length; i++) {
+      const sx = SHIELD.shieldsX[i];
+      const sy = SHIELD.y;
+      const cellsAlive = Array.from({length: SHIELD.rows}, () => Array(SHIELD.cols).fill(false));
+      for (let r=0; r<SHIELD.rows; r++) {
+        for (let c=0; c<SHIELD.cols; c++) {
+          // define arch: alive where isShieldCellAliveShape true
+          if (isShieldCellAliveShape(c, r)) cellsAlive[r][c] = true;
+        }
+      }
+      SHIELD.shields.push({ x: sx, y: sy, cellsAlive });
+    }
+  }
+
+  function anyShieldCellAlive() {
+    for (const sh of SHIELD.shields) {
+      for (let r=0; r<SHIELD.rows; r++) for (let c=0; c<SHIELD.cols; c++) if (sh.cellsAlive[r][c]) return true;
+    }
+    return false;
+  }
+
+  // Mystery ship (UFO)
+  const UFO = {
+    w: 48, h: 16,
+    color: '#FF0000',
+    active: false,
+    x: -100,
+    y: 35,
+    speed: 150,
+    nextSpawnIn: 0,
+    spawnMin: 20, // seconds
+    spawnMax: 30,
+    pointsOptions: [50, 100, 150, 300],
+    points: 0,
+    resetTimerWhenExitOrDestroyed: true
+  };
+
+  function scheduleUfoSpawn() {
+    UFO.active = false;
+    UFO.x = -UFO.w - 10;
+    UFO.points = UFO.pointsOptions[randInt(0, UFO.pointsOptions.length - 1)];
+    UFO.nextSpawnIn = randRange(UFO.spawnMin, UFO.spawnMax);
+  }
+
+  function spawnUfoIfNeeded() {
+    if (UFO.active) return;
+    UFO.nextSpawnIn -= dtGlobal;
+    if (UFO.nextSpawnIn <= 0) {
+      UFO.active = true;
+      UFO.x = -UFO.w - 4;
+      UFO.y = 35;
+      UFO.speed = 150;
+      UFO.points = UFO.pointsOptions[randInt(0, UFO.pointsOptions.length - 1)];
+    }
+  }
+
+  // ---------- Scores / HUD ----------
+  let score = 0;
+  let best = 0;
+
+  function loadBest() {
+    const v = localStorage.getItem('space-invaders-best');
+    best = v ? parseInt(v, 10) : 0;
+    if (!Number.isFinite(best)) best = 0;
+  }
+  function saveBest() {
+    if (score > best) {
+      best = score;
+      localStorage.setItem('space-invaders-best', String(best));
+    }
+  }
+
+  // ---------- Controls ----------
+  const keys = new Set();
+  function onKeyDown(e) {
+    const k = e.key;
+    if (k === 'ArrowLeft' || k === 'a' || k === 'A') { keys.add('left'); e.preventDefault(); }
+    if (k === 'ArrowRight' || k === 'd' || k === 'D') { keys.add('right'); e.preventDefault(); }
+    if (k === ' ' || k === 'Spacebar') { keys.add('space'); e.preventDefault(); }
+    if (k === 'Enter') { keys.add('enter'); e.preventDefault(); }
+    if (k === 'p' || k === 'P') { keys.add('p'); e.preventDefault(); }
+    if (k === 'm' || k === 'M') { keys.add('m'); e.preventDefault(); } // optional audio toggle
+  }
+  function onKeyUp(e) {
+    const k = e.key;
+    if (k === 'ArrowLeft' || k === 'a' || k === 'A') keys.delete('left');
+    if (k === 'ArrowRight' || k === 'd' || k === 'D') keys.delete('right');
+    if (k === ' ' || k === 'Spacebar') keys.delete('space');
+    if (k === 'Enter') keys.delete('enter');
+    if (k === 'p' || k === 'P') keys.delete('p');
+    if (k === 'm' || k === 'M') keys.delete('m');
+  }
+
+  window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('keyup', onKeyUp);
+
+  // ---------- Input handling for actions (edge-triggered) ----------
+  let prevEnter = false;
+  let prevPause = false;
+
+  function tryHandleEnter() {
+    const enterNow = keys.has('enter');
+    if (enterNow && !prevEnter) {
+      if (state === GameState.IDLE || state === GameState.GAME_OVER) {
+        startOrRestart();
+      } else if (state === GameState.PAUSED) {
+        state = GameState.PLAYING;
+      }
+      // prevent repeated action
+    }
+    prevEnter = enterNow;
+    keys.delete('enter'); // make it edge-like
+  }
+
+  function tryTogglePause() {
+    const pauseNow = keys.has('p');
+    if (pauseNow && !prevPause) {
+      if (state === GameState.PLAYING) state = GameState.PAUSED;
+      else if (state === GameState.PAUSED) state = GameState.PLAYING;
+    }
+    prevPause = pauseNow;
+    keys.delete('p');
+  }
+
+  function tryToggleAudio() {
+    const mNow = keys.has('m');
+    if (mNow) {
+      audioEnabled = !audioEnabled;
+      keys.delete('m');
+      if (!audioEnabled && audioCtx) {
+        try { audioCtx.close(); } catch {}
+        audioCtx = null;
+      }
+    }
+  }
+
+  // ---------- Game reset ----------
+  function resetPlayer() {
+    PLAYER.x = 380;
+    PLAYER.y = 550;
+    PLAYER.lives = 3;
+  }
+
+  function resetBullets() {
+    playerBullet.active = false;
+    alienBullets.length = 0;
+  }
+
+  function computeAlienSpeed() {
+    // formation speed increases by 5px/s for every 5 aliens destroyed
+    const destroyed = 55 - getAliensAliveCount();
+    const bonusSteps = Math.floor(destroyed / 5);
+    formation.speed = formation.speedBase + waveBaseSpeedBonus(wave) + bonusSteps * 5;
+    // Spec: base bonus per level is +10px/s per wave (wave resets +10 base bonus per level)
+    // speedBase already 30.
+  }
+
+  function waveBaseSpeedBonus(w) {
+    return (w - 1) * formation.speedBonusPerWave;
+  }
+
+  function startOrRestart() {
+    loadBest();
+    score = 0;
+    wave = 1;
+    resetPlayer();
+    makeAliens();
+    formation.dir = 1;
+    formation.speedBase = 30;
+    formation.speed = 30;
+    computeAlienSpeed();
+    resetBullets();
+    makeShields();
+    scheduleUfoSpawn();
+    state = GameState.PLAYING;
+  }
+
+  // ---------- Collision & Shield helpers ----------
+  function destroyShieldCellAt(sh, cellCx, cellCy) {
+    if (sh.cellsAlive[cellCy][cellCx]) {
+      sh.cellsAlive[cellCy][cellCx] = false;
+      // no score
+      return true;
+    }
+    return false;
+  }
+
+  function checkBulletVsShields(bullet, isPlayerBullet) {
+    // bullets have AABB points; check each shield cell AABB
+    // But do efficient by mapping bullet position to cell indices
+    for (const sh of SHIELD.shields) {
+      const bx0 = bullet.x, by0 = bullet.y, bw = bullet.w, bh = bullet.h;
+      // If bullet doesn't intersect shield bounding box, skip
+      const shieldW = SHIELD.cols * SHIELD.cell;
+      const shieldH = SHIELD.rows * SHIELD.cell;
+      if (!rectsOverlap(bx0, by0, bw, bh, sh.x, sh.y, shieldW, shieldH)) continue;
+
+      const cMin = clamp(Math.floor((bx0 - sh.x) / SHIELD.cell), 0, SHIELD.cols - 1);
+      const cMax = clamp(Math.floor((bx0 + bw - 1 - sh.x) / SHIELD.cell), 0, SHIELD.cols - 1);
+      const rMin = clamp(Math.floor((by0 - sh.y) / SHIELD.cell), 0, SHIELD.rows - 1);
+      const rMax = clamp(Math.floor((by0 + bh - 1 - sh.y) / SHIELD.cell), 0, SHIELD.rows - 1);
+
+      for (let r=rMin; r<=rMax; r++) {
+        for (let c=cMin; c<=cMax; c++) {
+          if (!sh.cellsAlive[r][c]) continue;
+          const cx = sh.x + c*SHIELD.cell;
+          const cy = sh.y + r*SHIELD.cell;
+          if (bulletHitsAABB(bullet, cx, cy, SHIELD.cell, SHIELD.cell)) {
+            destroyShieldCellAt(sh, c, r);
+            bullet.active = false;
+            if (isPlayerBullet) playExplosion();
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  function destroyAlienAndBullet(alien, bullet) {
+    alien.alive = false;
+    bullet.active = false;
+    playExplosion();
+
+    // score by type
+    score += alien.points;
+    computeAlienSpeed(); // update after each kill
+  }
+
+  function updateAliens(dt) {
+    if (state !== GameState.PLAYING) return;
+
+    const aliveCount = getAliensAliveCount();
+    if (aliveCount <= 0) return;
+
+    // March horizontally; edge detection based on alive aliens
+    const rightMost = getRightmostAliveX();
+    const leftMost = getLeftmostAliveX();
+
+    const nextDir = formation.dir;
+
+    // Check edge hit: if any alien reaches boundary then drop all 20 and reverse
+    let shouldDrop = false;
+    if (formation.dir === 1 && rightMost >= formation.edgeRight) shouldDrop = true;
+    if (formation.dir === -1 && leftMost <= formation.edgeLeft) shouldDrop = true;
+
+    // Always drop simultaneously when edge reached: apply once per update tick
+    if (shouldDrop) {
+      formation.dir *= -1;
+      // Drop all aliens by 20px simultaneously
+      for (let r=0; r<ALIEN.rows; r++) for (let c=0; c<ALIEN.cols; c++) {
+        const a = formation.alive[r][c];
+        if (a && a.alive) a.y += formation.dropAmount;
+      }
+      // After drop, if any reaches y>=540, game over immediately
+      for (let r=0; r<ALIEN.rows; r++) for (let c=0; c<ALIEN.cols; c++) {
+        const a = formation.alive[r][c];
+        if (a && a.alive && a.y >= 540) {
+          endGame();
+          return;
+        }
+      }
+    } else {
+      const dx = formation.speed * dt * formation.dir;
+      for (let r=0; r<ALIEN.rows; r++) for (let c=0; c<ALIEN.cols; c++) {
+        const a = formation.alive[r][c];
+        if (a && a.alive) a.x += dx;
+      }
+    }
+
+    // Check alien bottom condition even without edge drop (if dt large)
+    for (let r=0; r<ALIEN.rows; r++) for (let c=0; c<ALIEN.cols; c++) {
+      const a = formation.alive[r][c];
+      if (a && a.alive && a.y >= 540) {
+        endGame();
+        return;
+      }
+    }
+
+    // Enemy bullets
+    updateAlienShooting(dt);
+  }
+
+  let alienFireTimer = 0;
+  let alienFireNextIn = randRange(0.7, 1.3); // ~1s ±0.3
+
+  function updateAlienShooting(dt) {
+    alienFireTimer += dt;
+    if (alienFireTimer >= alienFireNextIn) {
+      alienFireTimer = 0;
+      alienFireNextIn = 1.0 + randRange(-0.3, 0.3);
+      if (alienBullets.length < MAX_ALIEN_BULLETS) {
+        // bottom-row alien fires every ~1s; only bottom-row aliens (lowest alive alien per column) should fire bullets
+        // Randomly select a column with an alive bottom alien
+        const colsWithAliveBottom = [];
+        for (let c=0; c<ALIEN.cols; c++) {
+          const a = getAlienBottomInColumn(c);
+          if (a) colsWithAliveBottom.push(c);
+        }
+        if (colsWithAliveBottom.length > 0) {
+          const c = colsWithAliveBottom[Math.floor(Math.random() * colsWithAliveBottom.length)];
+          const a = getAlienBottomInColumn(c);
+          // Fire from alien bottom center
+          const bx = a.x + (a.w/2) - (3/2);
+          const by = a.y + a.h + 1;
+          // Limit max 3
+          if (alienBullets.length < MAX_ALIEN_BULLETS) alienBullets.push(newAlienBullet(bx, by));
+        }
+      }
+    }
+  }
+
+  function updateBullets(dt) {
+    // Player bullet
+    if (playerBullet.active) {
+      playerBullet.y -= playerBullet.speed * dt;
+      if (playerBullet.y + playerBullet.h < 0) playerBullet.active = false;
+
+      // Collision: player bullet vs aliens
+      if (playerBullet.active) {
+        for (let r=0; r<ALIEN.rows; r++) for (let c=0; c<ALIEN.cols; c++) {
+          const a = formation.alive[r][c];
+          if (!a.alive) continue;
+          const hit = rectsOverlap(playerBullet.x, playerBullet.y, playerBullet.w, playerBullet.h, a.x, a.y, a.w, a.h);
+          if (hit) {
+            destroyAlienAndBullet(a, playerBullet);
+            return; // bullet destroyed
+          }
+        }
+      }
+
+      // Player bullet vs shields
+      if (playerBullet.active) {
+        checkBulletVsShields(playerBullet, true);
+      }
+
+      // Player bullet vs UFO
+      if (playerBullet.active && UFO.active) {
+        if (rectsOverlap(playerBullet.x, playerBullet.y, playerBullet.w, playerBullet.h, UFO.x, UFO.y, UFO.w, UFO.h)) {
+          playerBullet.active = false;
+          playExplosion();
+          score += UFO.points;
+          UFO.active = false;
+          scheduleUfoSpawn();
+        }
+      }
+    }
+
+    // Alien bullets
+    for (let i=alienBullets.length-1; i>=0; i--) {
+      const b = alienBullets[i];
+      b.y += b.speed * dt;
+      if (b.y > H) {
+        alienBullets.splice(i, 1);
+        continue;
+      }
+
+      // Alien bullet vs player
+      if (rectsOverlap(b.x, b.y, b.w, b.h, PLAYER.x - (PLAYER.w/2 - PLAYER.w/2), PLAYER.y, PLAYER.w, PLAYER.h)) {
+        // hit
+        b.active = false;
+        alienBullets.splice(i, 1);
+        PLAYER.lives--;
+        playHit();
+        if (PLAYER.lives <= 0) {
+          endGame();
+          return;
+        }
+        continue;
+      }
+
+      // Alien bullet vs shields
+      // Treat as any bullet destroys any shield cell
+      // We'll use bullet vs shield cells
+      checkBulletVsShields(b, false);
+
+      // If checkBulletVsShields deactivated it: remove it
+      if (!b.active) {
+        alienBullets.splice(i, 1);
+      }
+    }
+  }
+
+  function updatePlayer(dt) {
+    if (state !== GameState.PLAYING) return;
+
+    const left = keys.has('left');
+    const right = keys.has('right');
+
+    if (left && !right) PLAYER.x -= PLAYER.speed * dt;
+    if (right && !left) PLAYER.x += PLAYER.speed * dt;
+
+    // Clamp to canvas based on bounding box. PLAYER.x is center? spec says starting position x=380. We'll interpret x as center.
+    const half = PLAYER.w/2;
+    PLAYER.x = clamp(PLAYER.x, half, W - half);
+
+    // Fire
+    if (keys.has('space')) {
+      keys.delete('space'); // one-shot per keydown repeat
+      if (!playerBullet.active) {
+        playShoot();
+        // Bullet from player center slightly above turret
+        const px = PLAYER.x - playerBullet.w/2;
+        const py = PLAYER.y - 2; // near top
+        playerBullet.active = true;
+        playerBullet.x = px;
+        playerBullet.y = py - playerBullet.h;
+      }
+    }
+  }
+
+  function endGame() {
+    state = GameState.GAME_OVER;
+    saveBest();
+    // disable bullets
+    playerBullet.active = false;
+    alienBullets.length = 0;
+  }
+
+  function nextWave() {
+    wave++;
+    // Reset formation, shields, bullets, player position
+    makeAliens();
+    formation.dir = 1;
+    computeAlienSpeed();
+    resetBullets();
+    // shields persist (spec doesn't say reset). It says destructible shields; normally remain. We'll keep as is.
+    // But acceptance doesn't require reset. We'll keep shields.
+    scheduleUfoSpawn();
+    // Continue playing if still alive
+  }
+
+  // ---------- Rendering ----------
+  function drawText(x, y, text, size, color, align='left') {
+    ctx.fillStyle = color;
+    ctx.font = `${size}px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace`;
+    ctx.textAlign = align;
+    ctx.textBaseline = 'top';
+    ctx.fillText(text, x, y);
+  }
+
+  function drawBackground() {
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  function drawPlayer() {
+    // Player shape: Upward-pointing trapezoid; simplified as flat-bottom triangle tip at top-center.
+    // Simplified: 40×24px rectangle with 10×8px turret centered on top (spec).
+    const cx = PLAYER.x;
+    const x0 = cx - PLAYER.w/2;
+    const y0 = PLAYER.y;
+
+    // Body rectangle (40x24) starting at y0+8 so turret sits on top? total 32 => rectangle 24 plus turret 8.
+    const bodyH = 24, turretH = 8;
+    const bodyY = y0 + turretH;
+
+    ctx.fillStyle = '#00FF00';
+    // body
+    ctx.fillRect(x0, bodyY, PLAYER.w, bodyH);
+
+    // Turret 10x8 centered on top of rectangle, pointing upward
+    const turretW = 10;
+    const turretX = cx - turretW/2;
+    const turretY = y0;
+    // trapezoid-ish as flat-bottom triangle: we'll use a small triangle with base 10 at turretY+8? but spec asks simplified: 10x8 turret centered on top.
+    // We'll draw a triangle for style: tip at top-center, base at bottom.
+    ctx.beginPath();
+    ctx.moveTo(cx, turretY);
+    ctx.lineTo(turretX + turretW, turretY + turretH);
+    ctx.lineTo(turretX, turretY + turretH);
+    ctx.closePath();
+    ctx.fill();
+
+    // small outline glow
+    ctx.fillStyle = 'rgba(0,255,0,0.15)';
+    ctx.fillRect(x0, bodyY, PLAYER.w, bodyH);
+  }
+
+  function drawAlien(a) {
+    ctx.fillStyle = a.color;
+    // draw as rectangle with slight inset for pixel vibe
+    ctx.fillRect(a.x, a.y, a.w, a.h);
+  }
+
+  function drawAliens() {
+    for (let r=0; r<ALIEN.rows; r++) for (let c=0; c<ALIEN.cols; c++) {
+      const a = formation.alive[r][c];
+      if (a && a.alive) drawAlien(a);
+    }
+  }
+
+  function drawBullet(b, color) {
+    if (!b.active) return;
+    ctx.fillStyle = color;
+    ctx.fillRect(b.x, b.y, b.w, b.h);
+  }
+
+  function drawShields() {
+    ctx.fillStyle = '#00FF00';
+    for (const sh of SHIELD.shields) {
+      for (let r=0; r<SHIELD.rows; r++) {
+        for (let c=0; c<SHIELD.cols; c++) {
+          if (!sh.cellsAlive[r][c]) continue;
+          ctx.fillRect(sh.x + c*SHIELD.cell, sh.y + r*SHIELD.cell, SHIELD.cell, SHIELD.cell);
+        }
+      }
+    }
+  }
+
+  function drawUFO() {
+    if (!UFO.active) return;
+    // Draw rounded rectangle / saucer
+    const x = UFO.x, y = UFO.y;
+    const w = UFO.w, h = UFO.h;
+    ctx.fillStyle = UFO.color;
+
+    const r = 8;
+    // Rounded rect
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+    ctx.fill();
+
+    // window stripe
+    ctx.fillStyle = 'rgba(255,255,255,0.25)';
+    ctx.fillRect(x + 10, y + 5, w - 20, 6);
+  }
+
+  function drawLives() {
+    const text = `×${PLAYER.lives}`;
+    // Ship icons 20x16 green: draw as tiny trapezoids/rectangles
+    const iconW = 20, iconH = 16;
+    const margin = 10;
+    const y = H - 26;
+    let x = 10;
+    for (let i=0; i<PLAYER.lives; i++) {
+      // icon per life
+      const ix = x + i*(iconW+6);
+      const topY = y;
+      ctx.fillStyle = '#00FF00';
+      // body rect 20x12
+      ctx.fillRect(ix, topY + 4, iconW, 12);
+      // turret triangle 6x4
+      const cx = ix + iconW/2;
+      ctx.beginPath();
+      ctx.moveTo(cx, topY);
+      ctx.lineTo(cx + 3, topY + 4);
+      ctx.lineTo(cx - 3, topY + 4);
+      ctx.closePath();
+      ctx.fill();
+    }
+    drawText(W/2 - 10, H - 24, text, 16, '#00FF00', 'left');
+  }
+
+  function drawHUD() {
+    drawText(10, 24, `Score: ${score}`, 16, '#FFFFFF', 'left');
+    drawText(W - 10, 24, `Best: ${best}`, 16, '#FFFFFF', 'right');
+    drawText(W - 10, H - 18, `Wave: ${wave}`, 14, '#AAAAAA', 'right');
+    // lives
+    // We'll show bottom-left. Use ship icons plus ×N
+    ctx.fillStyle = '#00FF00';
+    const y = H - 28;
+    const iconW = 20, iconH = 16;
+    const spacing = 6;
+    let startX = 10;
+    for (let i=0; i<PLAYER.lives; i++) {
+      const ix = startX + i*(iconW + spacing);
+      const topY = y + 6;
+      // icon
+      ctx.fillStyle = '#00FF00';
+      ctx.fillRect(ix, topY + 4, iconW, 12);
+      ctx.beginPath();
+      ctx.moveTo(ix + iconW/2, topY);
+      ctx.lineTo(ix + iconW/2 + 3, topY + 4);
+      ctx.lineTo(ix + iconW/2 - 3, topY + 4);
+      ctx.closePath();
+      ctx.fill();
+    }
+    drawText(10, H - 24, `×${PLAYER.lives}`, 16, '#00FF00', 'left');
+  }
+
+  function drawStartScreen() {
+    // Start: centered y=220 48px #00FF00 monospace. Alien type legend below and press enter
+    drawText(W/2, 220, 'SPACE INVADERS', 48, '#00FF00', 'center');
+
+    // legend
+    const lx = W/2;
+    const legendY = 290;
+    const lines = [
+      `Small: 30 (#FF0000)`,
+      `Medium: 20 (#FFCC00)`,
+      `Large: 10 (#00CCFF)`
+    ];
+    for (let i=0;i<lines.length;i++){
+      drawText(lx, legendY + i*26, lines[i], 16, '#AAAAAA', 'center');
+    }
+    drawText(W/2, 400, 'Press Enter to Start', 20, '#AAAAAA', 'center');
+
+    // Also render a dim background scene: shields & formation faint?
+    ctx.save();
+    ctx.globalAlpha = 0.35;
+    makeShieldsIfNeededForDisplay();
+    drawShields();
+    drawAliens();
+    drawUFO();
+    ctx.restore();
+  }
+
+  function makeShieldsIfNeededForDisplay() {
+    if (!SHIELD.shields || SHIELD.shields.length===0) makeShields();
+  }
+
+  function drawGameOverScreen() {
+    ctx.fillStyle = '#000000CC';
+    ctx.fillRect(0,0,W,H);
+
+    drawText(W/2, 240, 'GAME OVER', 40, '#FFFFFF', 'center');
+    drawText(W/2, 310, `Final Score: ${score}`, 22, '#FFFFFF', 'center');
+    drawText(W/2, 360, 'Press Enter to Restart', 18, '#AAAAAA', 'center');
+  }
+
+  function drawPauseScreen() {
+    ctx.fillStyle = '#000000CC';
+    ctx.fillRect(0,0,W,H);
+    drawText(W/2, 260, 'PAUSED', 36, '#FFFFFF', 'center');
+  }
+
+  // ---------- UFO spawn timer management uses dt ----------
+  let dtGlobal = 0;
+
+  function loop(t) {
+    if (!loop.last) loop.last = t;
+    const dt = Math.min(0.033, (t - loop.last) / 1000); // cap to avoid huge jumps
+    loop.last = t;
+    dtGlobal = dt;
+
+    // Handle actions
+    tryToggleAudio();
+    tryHandleEnter();
+    tryTogglePause();
+
+    // Update
+    if (state === GameState.PLAYING) {
+      updatePlayer(dt);
+      updateAliens(dt);
+      updateBullets(dt);
+      // UFO
+      spawnUfoIfNeeded();
+      if (UFO.active) {
+        UFO.x += UFO.speed * dt;
+        // exit or destroyed
+        if (UFO.x > W + UFO.w + 10) {
+          scheduleUfoSpawn();
+        }
+      }
+
+      // Wave progression
+      if (getAliensAliveCount() <= 0) {
+        // Advance wave. Speed bonus per level and reset +10 base bonus per wave handled by computeAlienSpeed/waveBase.
+        nextWave();
+        // computeAlienSpeed resets base + wave bonus + destroyed bonus (which is 0 initially)
+        // Still keep current destroyed bonus computed from alive counts.
+        computeAlienSpeed();
+      }
+
+      // March audio
+      const alive = getAliensAliveCount();
+      if (alive > 0) playMarch(dt, alive);
+
+      // If shields are destroyed completely, keep them empty. Fine.
+    }
+
+    // Render
+    drawBackground();
+
+    if (state === GameState.IDLE) {
+      // Ensure aliens/shields exist for display and proper positioning
+      if (!formation.alive || formation.alive.length === 0) makeAliens();
+      if (!SHIELD.shields || SHIELD.shields.length === 0) makeShields();
+      drawAliens();
+      drawShields();
+      drawUFO(); // may be inactive
+      drawPlayer();
+      drawHUD();
+      drawStartScreen();
+    } else {
+      // For all non-IDLE states render playfield
+      drawAliens();
+      drawShields();
+      drawUFO();
+
+      drawPlayer();
+      drawBullet(playerBullet, '#FFFFFF');
+      for (const b of alienBullets) drawBullet(b, '#FF4444');
+
+      // HUD
+      drawHUD();
+
+      if (state === GameState.PAUSED) drawPauseScreen();
+      if (state === GameState.GAME_OVER) {
+        drawGameOverScreen();
+      }
+    }
+
+    requestAnimationFrame(loop);
+  }
+
+  // Initial setup
+  loadBest();
+  makeAliens();
+  makeShields();
+  scheduleUfoSpawn();
+  // Set initial visible player
+  resetPlayer();
+  resetBullets();
+
+  // Keyboard focus
+  canvas.addEventListener('click', () => canvas.focus());
+
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

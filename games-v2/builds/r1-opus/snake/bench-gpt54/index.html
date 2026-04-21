@@ -1,0 +1,905 @@
+<!--
+  GAME:      Snake
+  RUN:       r1-opus
+  BUILDER:   openai/gpt-5.4
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Snake</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background: #0a0a0a;
+      overflow: hidden;
+      font-family: monospace;
+    }
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    canvas {
+      display: block;
+      width: min(100vw, 660px);
+      height: auto;
+      max-height: 100vh;
+      background: #0a0a0a;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+      box-shadow: 0 0 24px rgba(0,0,0,0.45);
+    }
+  </style>
+</head>
+<body>
+<canvas id="game" width="660" height="700" aria-label="Snake game canvas"></canvas>
+<script>
+(() => {
+  'use strict';
+
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  const WIDTH = 660;
+  const HEIGHT = 700;
+  const HUD_H = 40;
+  const AREA_X = 20;
+  const AREA_Y = 40;
+  const AREA_SIZE = 620;
+  const GRID = 20;
+  const CELL = 31;
+  const CELL_INSET = 2;
+  const SEG_SIZE = 27;
+  const SEG_RADIUS = 5;
+  const FOOD_RADIUS = 12;
+  const BONUS_DURATION = 8000;
+  const MAX_TICKS_PER_FRAME = 2;
+  const MAX_DT_MS = 500;
+
+  const BG = '#0a0a0a';
+  const PLAY_BG = '#111111';
+  const GRID_LINE = '#1a1a1a';
+  const BORDER = '#333333';
+  const HEAD_COLOR = '#4caf50';
+  const BODY_A = '#388e3c';
+  const BODY_B = '#2e7d32';
+  const RED = '#f44336';
+  const GOLD = '#ffd740';
+  const WHITE = '#ffffff';
+
+  const STATES = {
+    TITLE: 'TITLE',
+    COUNTDOWN: 'COUNTDOWN',
+    PLAYING: 'PLAYING',
+    PAUSED: 'PAUSED',
+    DYING: 'DYING',
+    GAME_OVER: 'GAME_OVER'
+  };
+
+  const DIRS = {
+    up: { x: 0, y: -1, name: 'up' },
+    down: { x: 0, y: 1, name: 'down' },
+    left: { x: -1, y: 0, name: 'left' },
+    right: { x: 1, y: 0, name: 'right' }
+  };
+
+  const OPPOSITE = { up: 'down', down: 'up', left: 'right', right: 'left' };
+  const SCORE_LEVELS = [
+    { threshold: 0, tps: 7 },
+    { threshold: 50, tps: 8 },
+    { threshold: 100, tps: 9 },
+    { threshold: 180, tps: 10 },
+    { threshold: 280, tps: 11 },
+    { threshold: 420, tps: 12 },
+    { threshold: 600, tps: 13 },
+    { threshold: 800, tps: 14 },
+    { threshold: 1100, tps: 15 }
+  ];
+
+  let state = STATES.TITLE;
+  let pausedFrom = STATES.PLAYING;
+  let lastTime = 0;
+  let accumulator = 0;
+  let tickInterval = 1000 / 7;
+  let tickProgress = 0;
+  let score = 0;
+  let best = loadBest();
+  let level = 1;
+  let foodEaten = 0;
+  let growthPending = 0;
+  let directionQueue = [];
+  let currentDir = DIRS.right;
+  let pendingDirChangedThisTick = false;
+  let food = null;
+  let bonus = null;
+  let snake = [];
+  let deathTimer = 0;
+  let newBestThisRun = false;
+  let gameOverBlink = 0;
+  let titlePulse = 0;
+  let countdownTimer = 0;
+  let countdownPhase = 0;
+  let demo = null;
+  let demoRespawnTimer = 0;
+  let audioCtx = null;
+  let countdownStarted = false;
+
+  function loadBest() {
+    try {
+      const raw = localStorage.getItem('snake_best');
+      const n = raw ? parseInt(raw, 10) : 0;
+      return Number.isFinite(n) ? n : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  function saveBest() {
+    try { localStorage.setItem('snake_best', String(best)); } catch {}
+  }
+
+  function ensureAudio() {
+    if (!audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) {
+        try { audioCtx = new AC(); } catch {}
+      }
+    }
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+  }
+
+  function tone(freq, duration, gainValue, type = 'square', endFreq = null, delay = 0) {
+    if (!audioCtx) return;
+    const start = audioCtx.currentTime + delay;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, start);
+    if (endFreq !== null) osc.frequency.linearRampToValueAtTime(endFreq, start + duration);
+    gain.gain.setValueAtTime(Math.max(0.0001, gainValue), start);
+    gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start(start);
+    osc.stop(start + duration);
+  }
+
+  function soundEat() { tone(600, 0.055, 0.2, 'square'); }
+  function soundBonus() {
+    tone(600, 0.045, 0.2, 'square', null, 0);
+    tone(800, 0.045, 0.2, 'square', null, 0.05);
+    tone(1050, 0.045, 0.2, 'square', null, 0.1);
+  }
+  function soundTurn() { tone(140, 0.012, 0.06, 'triangle'); }
+  function soundLevel() { tone(350, 0.2, 0.18, 'sawtooth', 700); }
+  function soundDeath() { tone(200, 0.45, 0.3, 'square', 55); }
+  function soundBest() {
+    [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.065, 0.2, 'square', null, i * 0.07));
+  }
+
+  function roundRectPath(x, y, w, h, r) {
+    if (ctx.roundRect) {
+      ctx.beginPath();
+      ctx.roundRect(x, y, w, h, r);
+      return;
+    }
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function cloneCell(c) {
+    return { x: c.x, y: c.y, prevX: c.prevX ?? c.x, prevY: c.prevY ?? c.y };
+  }
+
+  function makeSnake(cells) {
+    return cells.map(c => ({ x: c.x, y: c.y, prevX: c.x, prevY: c.y }));
+  }
+
+  function keyToDir(code) {
+    switch (code) {
+      case 'ArrowUp':
+      case 'KeyW': return DIRS.up;
+      case 'ArrowDown':
+      case 'KeyS': return DIRS.down;
+      case 'ArrowLeft':
+      case 'KeyA': return DIRS.left;
+      case 'ArrowRight':
+      case 'KeyD': return DIRS.right;
+      default: return null;
+    }
+  }
+
+  function dirEquals(a, b) {
+    return a && b && a.name === b.name;
+  }
+
+  function isOpposite(a, b) {
+    return a && b && OPPOSITE[a.name] === b.name;
+  }
+
+  function clamp(v, min, max) {
+    return Math.max(min, Math.min(max, v));
+  }
+
+  function lerp(a, b, t) {
+    return a + (b - a) * t;
+  }
+
+  function gridToPixelX(gx) { return gx * CELL + AREA_X; }
+  function gridToPixelY(gy) { return gy * CELL + AREA_Y; }
+
+  function getLevelForScore(s) {
+    let idx = 0;
+    for (let i = 0; i < SCORE_LEVELS.length; i++) {
+      if (s >= SCORE_LEVELS[i].threshold) idx = i;
+    }
+    return idx + 1;
+  }
+
+  function updateSpeedFromScore() {
+    const newLevel = getLevelForScore(score);
+    if (newLevel !== level) {
+      level = newLevel;
+      tickInterval = 1000 / SCORE_LEVELS[level - 1].tps;
+      ensureAudio();
+      soundLevel();
+    } else {
+      tickInterval = 1000 / SCORE_LEVELS[level - 1].tps;
+    }
+  }
+
+  function updateBestMaybe() {
+    if (score > best) {
+      const wasBest = best;
+      best = score;
+      saveBest();
+      newBestThisRun = true;
+      if (wasBest !== best) {
+        ensureAudio();
+        soundBest();
+      }
+    }
+  }
+
+  function occupiedSet(includeFood = false, includeBonus = false, useSnake = snake) {
+    const set = new Set();
+    for (const seg of useSnake) set.add(seg.x + ',' + seg.y);
+    if (includeFood && food) set.add(food.x + ',' + food.y);
+    if (includeBonus && bonus) set.add(bonus.x + ',' + bonus.y);
+    return set;
+  }
+
+  function pickRandomEmptyCell(excludeFood = false, excludeBonus = false, useSnake = snake) {
+    const occ = occupiedSet(excludeFood, excludeBonus, useSnake);
+    const empty = [];
+    for (let x = 0; x < GRID; x++) {
+      for (let y = 0; y < GRID; y++) {
+        const key = x + ',' + y;
+        if (!occ.has(key)) empty.push({ x, y });
+      }
+    }
+    if (!empty.length) return null;
+    return empty[(Math.random() * empty.length) | 0];
+  }
+
+  function spawnFood() {
+    food = pickRandomEmptyCell(false, true);
+  }
+
+  function spawnBonus() {
+    const cell = pickRandomEmptyCell(true, false);
+    if (!cell) return;
+    bonus = {
+      x: cell.x,
+      y: cell.y,
+      remaining: BONUS_DURATION
+    };
+  }
+
+  function resetGameplayState() {
+    score = 0;
+    level = 1;
+    tickInterval = 1000 / 7;
+    accumulator = 0;
+    tickProgress = 0;
+    foodEaten = 0;
+    growthPending = 0;
+    directionQueue = [];
+    currentDir = DIRS.right;
+    pendingDirChangedThisTick = false;
+    food = null;
+    bonus = null;
+    snake = makeSnake([{ x: 10, y: 10 }, { x: 9, y: 10 }, { x: 8, y: 10 }]);
+    newBestThisRun = false;
+    deathTimer = 0;
+    spawnFood();
+  }
+
+  function startCountdown() {
+    resetGameplayState();
+    state = STATES.COUNTDOWN;
+    countdownTimer = 0;
+    countdownPhase = 0;
+    countdownStarted = true;
+  }
+
+  function startTitle() {
+    state = STATES.TITLE;
+    accumulator = 0;
+    tickProgress = 0;
+    directionQueue = [];
+    initDemo();
+  }
+
+  function startDying() {
+    state = STATES.DYING;
+    deathTimer = 0;
+    bonus = null;
+    ensureAudio();
+    soundDeath();
+  }
+
+  function finishToGameOver() {
+    state = STATES.GAME_OVER;
+    bonus = null;
+    gameOverBlink = 0;
+  }
+
+  function canOccupy(x, y, arr = snake) {
+    return x >= 0 && x < GRID && y >= 0 && y < GRID && !arr.some(seg => seg.x === x && seg.y === y);
+  }
+
+  function queueDirection(dir) {
+    if (!dir || state === STATES.DYING || state === STATES.GAME_OVER) return;
+    if (directionQueue.length >= 2) return;
+    const reference = directionQueue.length ? directionQueue[directionQueue.length - 1] : currentDir;
+    if (isOpposite(dir, reference) || dirEquals(dir, reference)) return;
+    directionQueue.push(dir);
+    if (state === STATES.PLAYING || state === STATES.COUNTDOWN) {
+      ensureAudio();
+      soundTurn();
+    }
+  }
+
+  function applyQueuedDirection() {
+    pendingDirChangedThisTick = false;
+    if (!directionQueue.length) return;
+    const candidate = directionQueue.shift();
+    if (!isOpposite(candidate, currentDir) && !dirEquals(candidate, currentDir)) {
+      currentDir = candidate;
+      pendingDirChangedThisTick = true;
+    }
+  }
+
+  function advanceSnakeTick() {
+    applyQueuedDirection();
+
+    for (const seg of snake) {
+      seg.prevX = seg.x;
+      seg.prevY = seg.y;
+    }
+
+    const head = snake[0];
+    const newHead = { x: head.x + currentDir.x, y: head.y + currentDir.y, prevX: head.x, prevY: head.y };
+
+    if (newHead.x < 0 || newHead.x >= GRID || newHead.y < 0 || newHead.y >= GRID) {
+      startDying();
+      return;
+    }
+
+    const willGrow = growthPending > 0;
+    const bodyCheckLen = willGrow ? snake.length : snake.length - 1;
+    for (let i = 0; i < bodyCheckLen; i++) {
+      const seg = snake[i];
+      if (seg.x === newHead.x && seg.y === newHead.y) {
+        startDying();
+        return;
+      }
+    }
+
+    let ateFood = food && newHead.x === food.x && newHead.y === food.y;
+    let ateBonus = bonus && newHead.x === bonus.x && newHead.y === bonus.y;
+
+    snake.unshift(newHead);
+
+    if (ateFood) {
+      growthPending += 1;
+      score += 10;
+      foodEaten += 1;
+      updateBestMaybe();
+      updateSpeedFromScore();
+      ensureAudio();
+      soundEat();
+      spawnFood();
+      if (foodEaten % 5 === 0) spawnBonus();
+    }
+
+    if (ateBonus) {
+      score += 50;
+      bonus = null;
+      updateBestMaybe();
+      updateSpeedFromScore();
+      ensureAudio();
+      soundBonus();
+    }
+
+    if (growthPending > 0) {
+      growthPending -= 1;
+    } else {
+      snake.pop();
+    }
+  }
+
+  function updateCountdown(dt) {
+    countdownTimer += dt;
+    const total = 650 * 3 + 450;
+    if (countdownTimer >= total) {
+      state = STATES.PLAYING;
+      accumulator = 0;
+      countdownTimer = total;
+    }
+  }
+
+  function updatePlaying(dt) {
+    if (bonus) {
+      bonus.remaining -= dt;
+      if (bonus.remaining <= 0) bonus = null;
+    }
+
+    accumulator += dt;
+    let ticks = 0;
+    while (accumulator >= tickInterval && ticks < MAX_TICKS_PER_FRAME && state === STATES.PLAYING) {
+      advanceSnakeTick();
+      accumulator -= tickInterval;
+      ticks++;
+    }
+    if (ticks >= MAX_TICKS_PER_FRAME && accumulator > tickInterval) accumulator = tickInterval * 0.5;
+    tickProgress = clamp(accumulator / tickInterval, 0, 1);
+  }
+
+  function updateDying(dt) {
+    deathTimer += dt;
+    if (deathTimer >= 800) finishToGameOver();
+  }
+
+  function updateDemo(dt) {
+    if (!demo) initDemo();
+    if (demo.dead) {
+      demoRespawnTimer -= dt;
+      if (demoRespawnTimer <= 0) initDemo();
+      return;
+    }
+    demo.acc += dt;
+    const interval = 150;
+    while (demo.acc >= interval) {
+      demo.acc -= interval;
+      stepDemo();
+      if (demo.dead) break;
+    }
+    demo.progress = clamp(demo.acc / interval, 0, 1);
+  }
+
+  function initDemo() {
+    demo = {
+      snake: makeSnake([{ x: 8, y: 10 }, { x: 7, y: 10 }, { x: 6, y: 10 }]),
+      dir: DIRS.right,
+      food: { x: 14, y: 10 },
+      growth: 0,
+      acc: 0,
+      progress: 0,
+      dead: false
+    };
+    demo.food = pickRandomEmptyCell(false, false, demo.snake) || { x: 14, y: 10 };
+    demoRespawnTimer = 0;
+  }
+
+  function isLethalDemo(x, y) {
+    if (x < 0 || x >= GRID || y < 0 || y >= GRID) return true;
+    const bodyCheck = demo.growth > 0 ? demo.snake.length : demo.snake.length - 1;
+    for (let i = 0; i < bodyCheck; i++) {
+      const seg = demo.snake[i];
+      if (seg.x === x && seg.y === y) return true;
+    }
+    return false;
+  }
+
+  function stepDemo() {
+    for (const seg of demo.snake) { seg.prevX = seg.x; seg.prevY = seg.y; }
+    const head = demo.snake[0];
+    const desired = [];
+    const dx = demo.food.x - head.x;
+    const dy = demo.food.y - head.y;
+    if (Math.abs(dx) >= Math.abs(dy)) {
+      if (dx !== 0) desired.push(dx > 0 ? DIRS.right : DIRS.left);
+      if (dy !== 0) desired.push(dy > 0 ? DIRS.down : DIRS.up);
+    } else {
+      if (dy !== 0) desired.push(dy > 0 ? DIRS.down : DIRS.up);
+      if (dx !== 0) desired.push(dx > 0 ? DIRS.right : DIRS.left);
+    }
+    const turns = [DIRS.up, DIRS.right, DIRS.down, DIRS.left].filter(d => !desired.includes(d));
+    const options = [...desired, ...turns, demo.dir].filter((d, i, arr) => !isOpposite(d, demo.dir) || d === demo.dir || arr.indexOf(d) !== i);
+    let chosen = demo.dir;
+    for (const dir of options) {
+      if (isOpposite(dir, demo.dir)) continue;
+      const nx = head.x + dir.x;
+      const ny = head.y + dir.y;
+      if (!isLethalDemo(nx, ny)) { chosen = dir; break; }
+    }
+    const nx = head.x + chosen.x;
+    const ny = head.y + chosen.y;
+    if (isLethalDemo(nx, ny)) {
+      demo.dead = true;
+      demoRespawnTimer = 1000;
+      return;
+    }
+    demo.dir = chosen;
+    demo.snake.unshift({ x: nx, y: ny, prevX: head.x, prevY: head.y });
+    if (nx === demo.food.x && ny === demo.food.y) {
+      demo.growth += 1;
+      demo.food = pickRandomEmptyCell(false, false, demo.snake) || demo.food;
+    }
+    if (demo.growth > 0) demo.growth--;
+    else demo.snake.pop();
+  }
+
+  function update(dt) {
+    titlePulse += dt;
+    gameOverBlink += dt;
+    if (state === STATES.TITLE) updateDemo(dt);
+    else if (state === STATES.COUNTDOWN) updateCountdown(dt);
+    else if (state === STATES.PLAYING) updatePlaying(dt);
+    else if (state === STATES.DYING) updateDying(dt);
+  }
+
+  function drawGrid(dim = 1) {
+    ctx.save();
+    ctx.globalAlpha = dim;
+    ctx.fillStyle = PLAY_BG;
+    ctx.fillRect(AREA_X, AREA_Y, AREA_SIZE, AREA_SIZE);
+    ctx.strokeStyle = BORDER;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(AREA_X + 1, AREA_Y + 1, AREA_SIZE - 2, AREA_SIZE - 2);
+    ctx.strokeStyle = GRID_LINE;
+    ctx.lineWidth = 1;
+    for (let i = 1; i < GRID; i++) {
+      const x = AREA_X + i * CELL + 0.5;
+      const y = AREA_Y + i * CELL + 0.5;
+      ctx.beginPath(); ctx.moveTo(x, AREA_Y); ctx.lineTo(x, AREA_Y + AREA_SIZE); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(AREA_X, y); ctx.lineTo(AREA_X + AREA_SIZE, y); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawHUD() {
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, WIDTH, HUD_H);
+    ctx.fillStyle = WHITE;
+    ctx.font = '17px monospace';
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+    ctx.fillText(`Score: ${score}`, 24, 27);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#555555';
+    ctx.fillText(`Best: ${best}`, 636, 27);
+    const dots = 9;
+    const radius = 3;
+    const spacing = 12;
+    const totalW = (dots - 1) * spacing;
+    const startX = WIDTH / 2 - totalW / 2;
+    for (let i = 0; i < dots; i++) {
+      ctx.beginPath();
+      ctx.arc(startX + i * spacing, 22, radius, 0, Math.PI * 2);
+      ctx.fillStyle = i < level ? HEAD_COLOR : '#2a2a2a';
+      ctx.fill();
+    }
+    ctx.strokeStyle = '#222222';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, 39.5);
+    ctx.lineTo(WIDTH, 39.5);
+    ctx.stroke();
+  }
+
+  function segmentColor(index) {
+    return index === 0 ? HEAD_COLOR : (index % 2 === 1 ? BODY_A : BODY_B);
+  }
+
+  function drawEyes(px, py, dir) {
+    const eyeSize = 5;
+    const pupil = 2;
+    let positions;
+    if (dir.name === 'right') positions = [{ x: 18, y: 7 }, { x: 18, y: 17 }];
+    else if (dir.name === 'left') positions = [{ x: 4, y: 7 }, { x: 4, y: 17 }];
+    else if (dir.name === 'up') positions = [{ x: 7, y: 4 }, { x: 17, y: 4 }];
+    else positions = [{ x: 7, y: 18 }, { x: 17, y: 18 }];
+    for (const pos of positions) {
+      roundRectPath(px + pos.x, py + pos.y, eyeSize, eyeSize, 1.5);
+      ctx.fillStyle = WHITE;
+      ctx.fill();
+      roundRectPath(px + pos.x + 1.5, py + pos.y + 1.5, pupil, pupil, 0.5);
+      ctx.fillStyle = '#1a1a1a';
+      ctx.fill();
+    }
+  }
+
+  function getDeathSegmentColor(index) {
+    if (deathTimer < 500) {
+      const segInterval = 500 / Math.max(1, snake.length);
+      const threshold = index * segInterval;
+      const local = clamp((deathTimer - threshold) / 50, 0, 1);
+      const base = segmentColor(index);
+      return mixColor(base, RED, local);
+    }
+    if (deathTimer < 600) return WHITE;
+    const t = clamp((deathTimer - 600) / 200, 0, 1);
+    return mixColor(WHITE, '#444444', t);
+  }
+
+  function hexToRgb(hex) {
+    const m = hex.replace('#', '');
+    const v = m.length === 3 ? m.split('').map(c => c + c).join('') : m;
+    return {
+      r: parseInt(v.slice(0, 2), 16),
+      g: parseInt(v.slice(2, 4), 16),
+      b: parseInt(v.slice(4, 6), 16)
+    };
+  }
+
+  function mixColor(a, b, t) {
+    const ca = hexToRgb(a), cb = hexToRgb(b);
+    const r = Math.round(lerp(ca.r, cb.r, t));
+    const g = Math.round(lerp(ca.g, cb.g, t));
+    const bl = Math.round(lerp(ca.b, cb.b, t));
+    return `rgb(${r},${g},${bl})`;
+  }
+
+  function drawFoodItem(cell) {
+    if (!cell) return;
+    const cx = gridToPixelX(cell.x) + CELL / 2;
+    const cy = gridToPixelY(cell.y) + CELL / 2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, 20, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(244,67,54,0.2)';
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(cx, cy, FOOD_RADIUS, 0, Math.PI * 2);
+    ctx.fillStyle = RED;
+    ctx.fill();
+  }
+
+  function drawBonusItem() {
+    if (!bonus) return;
+    const cx = gridToPixelX(bonus.x) + CELL / 2;
+    const cy = gridToPixelY(bonus.y) + CELL / 2;
+    const blink = bonus.remaining <= 2000 ? (Math.floor((2000 - bonus.remaining) / (1000 / 6)) % 2 === 0) : true;
+    if (!blink) return;
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(Math.PI / 4);
+    ctx.fillStyle = GOLD;
+    ctx.fillRect(-7, -7, 14, 14);
+    ctx.restore();
+    const radius = 14 * clamp(bonus.remaining / BONUS_DURATION, 0, 1);
+    if (radius > 0.2) {
+      ctx.beginPath();
+      ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+      ctx.strokeStyle = GOLD;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+  }
+
+  function drawSnakeEntity(arr, progress, dir, dying = false, grey = false) {
+    if (!arr.length) return;
+    for (let i = arr.length - 1; i >= 0; i--) {
+      const seg = arr[i];
+      let gx = seg.x;
+      let gy = seg.y;
+      let useSnap = false;
+      if (i === 0 && pendingDirChangedThisTick && (state === STATES.PLAYING || state === STATES.COUNTDOWN)) {
+        useSnap = true;
+      }
+      if (!useSnap) {
+        gx = lerp(seg.prevX ?? seg.x, seg.x, progress);
+        gy = lerp(seg.prevY ?? seg.y, seg.y, progress);
+      }
+      const px = gridToPixelX(gx) + CELL_INSET;
+      const py = gridToPixelY(gy) + CELL_INSET;
+      roundRectPath(px, py, SEG_SIZE, SEG_SIZE, SEG_RADIUS);
+      if (grey) ctx.fillStyle = '#444444';
+      else if (dying) ctx.fillStyle = getDeathSegmentColor(i);
+      else ctx.fillStyle = segmentColor(i);
+      ctx.fill();
+
+      if (i === arr.length - 1 && state === STATES.PLAYING && growthPending === 0) {
+        const tp = 1 - progress;
+        if (tp > 0.01) {
+          const tailPx = gridToPixelX(seg.prevX ?? seg.x) + CELL_INSET;
+          const tailPy = gridToPixelY(seg.prevY ?? seg.y) + CELL_INSET;
+          ctx.save();
+          ctx.globalAlpha = tp * 0.5;
+          roundRectPath(tailPx, tailPy, SEG_SIZE, SEG_SIZE, SEG_RADIUS);
+          ctx.fillStyle = i % 2 === 1 ? BODY_A : BODY_B;
+          ctx.fill();
+          ctx.restore();
+        }
+      }
+    }
+
+    const head = arr[0];
+    const hx = (i => {
+      if (pendingDirChangedThisTick && (state === STATES.PLAYING || state === STATES.COUNTDOWN)) return head.x;
+      return lerp(head.prevX ?? head.x, head.x, progress);
+    })();
+    const hy = (i => {
+      if (pendingDirChangedThisTick && (state === STATES.PLAYING || state === STATES.COUNTDOWN)) return head.y;
+      return lerp(head.prevY ?? head.y, head.y, progress);
+    })();
+    drawEyes(gridToPixelX(hx) + CELL_INSET, gridToPixelY(hy) + CELL_INSET, dir);
+  }
+
+  function drawDemoSnake() {
+    if (!demo || demo.dead) return;
+    drawSnakeEntity(demo.snake, demo.progress, demo.dir, false, false);
+    drawFoodItem(demo.food);
+  }
+
+  function drawTitleOverlay() {
+    const pulse = 0.65 + 0.35 * Math.sin((titlePulse / 1000) * Math.PI);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = HEAD_COLOR;
+    ctx.font = 'bold 48px monospace';
+    ctx.fillText('SNAKE', WIDTH / 2, 250);
+    ctx.fillStyle = `rgba(136,136,136,${clamp(pulse, 0.3, 1)})`;
+    ctx.font = '18px monospace';
+    ctx.fillText('Press Enter', WIDTH / 2, 400);
+    ctx.fillStyle = '#555555';
+    ctx.font = '15px monospace';
+    ctx.fillText(`Best: ${best}`, WIDTH / 2, 440);
+  }
+
+  function drawCountdown() {
+    const phases = [
+      { text: '3', ms: 650, color: WHITE },
+      { text: '2', ms: 650, color: WHITE },
+      { text: '1', ms: 650, color: WHITE },
+      { text: 'GO!', ms: 450, color: HEAD_COLOR }
+    ];
+    let remaining = countdownTimer;
+    let current = phases[phases.length - 1];
+    let before = 0;
+    for (const phase of phases) {
+      if (remaining < phase.ms) { current = phase; break; }
+      remaining -= phase.ms;
+      before += phase.ms;
+    }
+    const local = current.ms ? remaining / current.ms : 0;
+    const scale = 1 + 0.2 * (1 - local);
+    ctx.save();
+    ctx.translate(WIDTH / 2, 330);
+    ctx.scale(scale, scale);
+    ctx.fillStyle = current.color;
+    ctx.font = '60px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(current.text, 0, 0);
+    ctx.restore();
+  }
+
+  function drawPauseOverlay() {
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(AREA_X, AREA_Y, AREA_SIZE, AREA_SIZE);
+    ctx.fillStyle = WHITE;
+    ctx.font = '36px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('PAUSED', WIDTH / 2, AREA_Y + AREA_SIZE / 2 - 10);
+    ctx.fillStyle = '#888888';
+    ctx.font = '14px monospace';
+    ctx.fillText('P to resume', WIDTH / 2, AREA_Y + AREA_SIZE / 2 + 28);
+  }
+
+  function drawGameOverOverlay() {
+    const blinkOn = Math.floor(gameOverBlink / 500) % 2 === 0;
+    const pulse = 0.75 + 0.25 * Math.sin(gameOverBlink / 1000 * Math.PI * 2);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = RED;
+    ctx.font = '38px monospace';
+    ctx.fillText('GAME OVER', WIDTH / 2, 270);
+    ctx.fillStyle = WHITE;
+    ctx.font = '22px monospace';
+    ctx.fillText(`Score: ${score}`, WIDTH / 2, 320);
+    if (newBestThisRun) {
+      ctx.fillStyle = `rgba(255,215,64,${clamp(pulse, 0.5, 1)})`;
+      ctx.font = '16px monospace';
+      ctx.fillText('NEW BEST!', WIDTH / 2, 350);
+    }
+    ctx.fillStyle = '#888888';
+    ctx.font = '14px monospace';
+    ctx.fillText(`Length: ${snake.length}`, WIDTH / 2, 380);
+    if (blinkOn) {
+      ctx.fillStyle = '#666666';
+      ctx.fillText('Enter to play again', WIDTH / 2, 430);
+    }
+  }
+
+  function render() {
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+    drawHUD();
+
+    if (state === STATES.TITLE) {
+      drawGrid(0.3);
+      drawDemoSnake();
+      drawTitleOverlay();
+      return;
+    }
+
+    drawGrid(1);
+
+    if (state !== STATES.GAME_OVER) drawFoodItem(food);
+    if (state === STATES.PLAYING || state === STATES.COUNTDOWN || state === STATES.PAUSED) drawBonusItem();
+
+    if (state === STATES.DYING) drawSnakeEntity(snake, 1, currentDir, true, false);
+    else if (state === STATES.GAME_OVER) drawSnakeEntity(snake, 1, currentDir, false, true);
+    else drawSnakeEntity(snake, tickProgress, currentDir, false, false);
+
+    if (state === STATES.COUNTDOWN) drawCountdown();
+    else if (state === STATES.PAUSED) drawPauseOverlay();
+    else if (state === STATES.GAME_OVER) drawGameOverOverlay();
+  }
+
+  function loop(ts) {
+    if (!lastTime) lastTime = ts;
+    const dt = Math.min(MAX_DT_MS, ts - lastTime);
+    lastTime = ts;
+    if (state !== STATES.PAUSED && state !== STATES.GAME_OVER) update(dt);
+    render();
+    requestAnimationFrame(loop);
+  }
+
+  window.addEventListener('keydown', (e) => {
+    const code = e.code;
+    if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','KeyW','KeyA','KeyS','KeyD','Enter','KeyP','Escape'].includes(code)) {
+      e.preventDefault();
+    }
+    const dir = keyToDir(code);
+    if (dir && (state === STATES.PLAYING || state === STATES.COUNTDOWN)) queueDirection(dir);
+
+    if (code === 'Enter') {
+      ensureAudio();
+      if (state === STATES.TITLE) startCountdown();
+      else if (state === STATES.GAME_OVER) startTitle();
+      return;
+    }
+
+    if (code === 'KeyP' || code === 'Escape') {
+      if (state === STATES.PLAYING) {
+        pausedFrom = STATES.PLAYING;
+        state = STATES.PAUSED;
+      } else if (state === STATES.COUNTDOWN) {
+        pausedFrom = STATES.COUNTDOWN;
+        state = STATES.PAUSED;
+      } else if (state === STATES.PAUSED) {
+        state = pausedFrom;
+      }
+    }
+  });
+
+  startTitle();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

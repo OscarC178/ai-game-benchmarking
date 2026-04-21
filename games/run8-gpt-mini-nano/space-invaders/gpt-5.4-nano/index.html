@@ -1,0 +1,1129 @@
+<!-- space-invaders | spec:run8-gpt-mini-nano | built-by:gpt-5.4-nano -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Space Invaders</title>
+  <style>
+    html, body { margin:0; padding:0; background:#000; height:100%; width:100%; font-family: monospace; }
+    #wrap { display:flex; align-items:center; justify-content:center; height:100%; }
+    canvas { background:#000; image-rendering: pixelated; box-shadow: 0 0 0 1px rgba(0,255,0,0.12), 0 10px 40px rgba(0,0,0,0.6); }
+    .hide { display:none; }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="game" width="800" height="600" aria-label="Space Invaders canvas"></canvas>
+  </div>
+
+  <script>
+    (() => {
+      'use strict';
+
+      const canvas = document.getElementById('game');
+      const ctx = canvas.getContext('2d');
+
+      // ---- Utilities ----
+      const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+      const randInt = (a, b) => (Math.floor(Math.random() * (b - a + 1)) + a);
+      const randChoice = (arr) => arr[Math.floor(Math.random() * arr.length)];
+      const now = () => performance.now();
+
+      // AABB collision with rects {x,y,w,h}
+      function aabb(a, b) {
+        return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+      }
+
+      function roundedRect(x, y, w, h, r) {
+        const rr = Math.min(r, w/2, h/2);
+        ctx.beginPath();
+        ctx.moveTo(x+rr, y);
+        ctx.arcTo(x+w, y, x+w, y+h, rr);
+        ctx.arcTo(x+w, y+h, x, y+h, rr);
+        ctx.arcTo(x, y+h, x, y, rr);
+        ctx.arcTo(x, y, x+w, y, rr);
+        ctx.closePath();
+      }
+
+      // ---- Optional Audio (simple oscillator beeps) ----
+      let audioEnabled = true;
+      let audioCtx = null;
+
+      function ensureAudio() {
+        if (!audioEnabled) return null;
+        if (!audioCtx) {
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        return audioCtx;
+      }
+
+      function beepSquare(freq=900, duration=0.05, type='square', gainVal=0.05) {
+        const ac = ensureAudio();
+        if (!ac) return;
+        const t0 = ac.currentTime;
+        const osc = ac.createOscillator();
+        const gain = ac.createGain();
+        osc.type = type;
+        osc.frequency.value = freq;
+        gain.gain.value = gainVal;
+        osc.connect(gain);
+        gain.connect(ac.destination);
+        osc.start(t0);
+        gain.gain.setValueAtTime(gainVal, t0);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t0 + duration);
+        osc.stop(t0 + duration);
+      }
+
+      function sweepDeath() {
+        const ac = ensureAudio();
+        if (!ac) return;
+        const t0 = ac.currentTime;
+        const osc = ac.createOscillator();
+        const gain = ac.createGain();
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(780, t0);
+        osc.frequency.exponentialRampToValueAtTime(80, t0 + 0.28);
+        gain.gain.value = 0.06;
+        osc.connect(gain);
+        gain.connect(ac.destination);
+        osc.start(t0);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.3);
+        osc.stop(t0 + 0.3);
+      }
+
+      function heartbeatPulse(strength=1) {
+        // repeating pulse: use soft sine blips
+        const ac = ensureAudio();
+        if (!ac) return;
+        const t0 = ac.currentTime;
+        const osc = ac.createOscillator();
+        const gain = ac.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = 140 + 40*Math.random();
+        gain.gain.value = 0.03 * strength;
+        osc.connect(gain);
+        gain.connect(ac.destination);
+        osc.start(t0);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.05);
+        osc.stop(t0 + 0.05);
+      }
+
+      // ---- Spec constants ----
+      const W = canvas.width, H = canvas.height;
+      const BG = '#000000';
+
+      const PLAYER_W = 40, PLAYER_H = 32;
+      const PLAYER_SPEED = 300;
+      const PLAYER_Y = 550; // bottom-ish with spec start y=550 for top-left anchor
+
+      const BULLET_W = 3, BULLET_H = 12;
+      const BULLET_SPEED = 500;
+
+      const ALIEN_BULLET_W = 3, ALIEN_BULLET_H = 12;
+      const ALIEN_BULLET_SPEED = 250;
+      const MAX_ALIEN_BULLETS = 3;
+
+      // Aliens layout spec: 11x5 grid with row sizes & colors.
+      const GRID_COLS = 11, GRID_ROWS = 5;
+
+      const ROW_TOP_W = 24, ROW_TOP_H = 16;   // top row
+      const ROW_MID_W = 28, ROW_MID_H = 20;   // middle rows
+      const ROW_BOT_W = 32, ROW_BOT_H = 20;   // bottom rows
+
+      // Starting position: first alien center x=120, y=80; spacing 50px horizontal and 40px vertical
+      const ALIEN_START_CENTER_X = 120;
+      const ALIEN_START_Y = 80;
+      const ALIEN_SPACING_X = 50;
+      const ALIEN_SPACING_Y = 40;
+
+      // formation movement
+      const BASE_MARCH_SPEED = 30; // px/s
+      const DROP_AMOUNT = 20;
+      const SIDE_LEFT = 20;
+      const SIDE_RIGHT = W - 20;
+
+      // Shields
+      const SHIELD_ORIGINS = [140, 300, 460, 620];
+      const SHIELD_CELL = 4; // 4x4px cells
+      const SHIELD_ROWS = 16; // 4 clusters each arch-ish; we'll use a 4x16 mask region per shield
+      const SHIELD_COLS = 20; // mask width; cell grid 5x? approximate; we'll craft arch-like clusters in cell grid
+      // We'll implement as cell grid 20x16 but draw only cells set in mask. Each cell is 4x4.
+      const SHIELD_CELL_SIZE = SHIELD_CELL;
+      const SHIELD_POS_Y = 480;
+
+      // Mystery ship
+      const MYSTERY_W = 48, MYSTERY_H = 16;
+      const MYSTERY_SPEED = 150;
+      const MYSTERY_Y = 35;
+      const MYSTERY_MIN_SPAWN = 20;
+      const MYSTERY_MAX_SPAWN = 30;
+
+      // Loss line at y >= 540
+      const LOSS_Y = 540;
+
+      // ---- State machine ----
+      const STATE = { IDLE:'IDLE', PLAYING:'PLAYING', PAUSED:'PAUSED', GAME_OVER:'GAME_OVER' };
+      let gameState = STATE.IDLE;
+
+      // ---- Input ----
+      const keys = new Set();
+      window.addEventListener('keydown', (e) => {
+        const k = e.key;
+        if (['ArrowLeft','ArrowRight','a','d','A','D',' ', 'Enter', 'p', 'P'].includes(k) || e.code === 'Space') {
+          // prevent scrolling on arrows/space
+          if (k === ' ' || e.code === 'Space') e.preventDefault();
+        }
+        if (e.key === ' ' || e.code === 'Space') {
+          keys.add('Space');
+        } else if (e.key === 'ArrowLeft') keys.add('ArrowLeft');
+        else if (e.key === 'ArrowRight') keys.add('ArrowRight');
+        else if (e.key === 'a' || e.key === 'A') keys.add('Aleft');
+        else if (e.key === 'd' || e.key === 'D') keys.add('Aright');
+        else if (e.key === 'Enter') keys.add('Enter');
+        else if (e.key === 'p' || e.key === 'P') keys.add('P');
+        else keys.add(k);
+        
+        // handle controls immediately for pause/start/restart
+        if (e.key === 'Enter') {
+          if (gameState === STATE.IDLE || gameState === STATE.GAME_OVER) {
+            startNewGame();
+          }
+        }
+        if (e.key === 'p' || e.key === 'P') {
+          if (gameState === STATE.PLAYING) {
+            togglePause(true);
+          } else if (gameState === STATE.PAUSED) {
+            togglePause(false);
+          }
+        }
+      }, { passive:false });
+
+      window.addEventListener('keyup', (e) => {
+        const k = e.key;
+        if (k === ' ' || e.code === 'Space') keys.delete('Space');
+        else if (k === 'ArrowLeft') keys.delete('ArrowLeft');
+        else if (k === 'ArrowRight') keys.delete('ArrowRight');
+        else if (k === 'a' || k === 'A') keys.delete('Aleft');
+        else if (k === 'd' || k === 'D') keys.delete('Aright');
+        else if (k === 'Enter') keys.delete('Enter');
+        else if (k === 'p' || k === 'P') keys.delete('P');
+      });
+
+      // ---- High score ----
+      const HIGH_KEY = 'space_invaders_highscore_v1';
+      let highScore = 0;
+      try {
+        const v = parseInt(localStorage.getItem(HIGH_KEY), 10);
+        if (Number.isFinite(v)) highScore = v;
+      } catch {}
+      
+      // ---- Game objects ----
+      let player, playerBullet;
+      let alienBullets;
+      let formation;
+      let shields;
+      let score, lives, level;
+      let lastAlienShotTime;
+      let mystery;
+      let nextMysteryAt;
+      let lastUpdateTime = 0;
+      let pausedOverlayPulse = 0;
+      let frameCount = 0;
+      
+      // ---- Shield mask creation ----
+      // Build per spec: destructible 4 clusters of 4x4 cells forming arch shapes.
+      // We'll craft 4 clusters per shield instance by leaving gaps and making a semi-arch.
+      // Use a 20x16 cell grid (80x64px) which matches "roughly 80×64px".
+      // Each cluster occupies a segment: left arch, left middle, right middle, right arch.
+      function buildShieldMask() {
+        const cells = new Set(); // key `${cx},${cy}`
+        const Wc = 20, Hc = 16;
+
+        // cluster x ranges (in cells) approx 2..6, 6..10, 10..14, 14..18 with gaps
+        // We'll create an arch by setting cells at the edges and some inner support.
+        const clusters = [
+          { x0: 1, x1: 5 },
+          { x0: 6, x1: 10 },
+          { x0: 11, x1: 15 },
+          { x0: 16, x1: 19 }
+        ];
+
+        for (const cl of clusters) {
+          for (let cy = 0; cy < Hc; cy++) {
+            // bottom thicker, top sparse: a semi-arch
+            // We'll consider arch crest around cy=2..4
+            const t = cy / (Hc-1); // 0..1
+            let halfWidth;
+            if (t < 0.25) halfWidth = 0;         // near top
+            else if (t < 0.4) halfWidth = 1;    // widening
+            else if (t < 0.75) halfWidth = 2;   // thicker mid
+            else halfWidth = 3;                 // bottom thick
+
+            const span = cl.x1 - cl.x0;
+            const center = cl.x0 + span/2;
+
+            // Determine which cells to fill for this row:
+            // Create an arch outline and fill bottom area.
+            if (cy < 2) continue; // too high
+            if (cy >= 10) {
+              // bottom fill
+              for (let cx = cl.x0; cx <= cl.x1; cx++) cells.add(`${cx},${cy}`);
+            } else {
+              // arch outline: edges and some inner based on halfWidth
+              const leftEdge = Math.round(center - (halfWidth + 0));
+              const rightEdge = Math.round(center + (halfWidth + 0));
+              // edge points
+              for (let cx = leftEdge; cx <= rightEdge; cx++) {
+                // keep it thinner near the top
+                if (cy < 6) {
+                  // outline only-ish: keep perimeter and occasional supports
+                  const dist = Math.abs(cx - center);
+                  if (dist >= halfWidth || Math.random() < 0.08) cells.add(`${cx},${cy}`);
+                } else {
+                  // mid: partial fill
+                  if (Math.abs(cx - center) <= halfWidth) cells.add(`${cx},${cy}`);
+                }
+              }
+            }
+          }
+        }
+
+        // Add some extra "steps" to resemble a classic multi-arch shield.
+        // Carve a few intentional gaps to create erosion patterns.
+        // Ensure within bounds.
+        function maybeRemove(cx, cy) {
+          if (cx < 0 || cy < 0 || cx >= Wc || cy >= Hc) return;
+          const key = `${cx},${cy}`;
+          if (!cells.has(key)) return;
+          const r = Math.random();
+          if (r < 0.15 && cy < 12) cells.delete(key);
+        }
+        for (let i = 0; i < 120; i++) {
+          const cx = randInt(0, Wc-1);
+          const cy = randInt(0, Hc-1);
+          maybeRemove(cx, cy);
+        }
+
+        return { Wc, Hc, cells };
+      }
+
+      const shieldMask = buildShieldMask();
+
+      function createShields() {
+        shields = [];
+        for (let si = 0; si < SHIELD_ORIGINS.length; si++) {
+          const ox = SHIELD_ORIGINS[si];
+          // Each shield consists of cells (cx,cy) alive -> boolean
+          const grid = new Map(); // key -> true
+          for (const k of shieldMask.cells) grid.set(k, true);
+          shields.push({ ox, oy: SHIELD_POS_Y, grid });
+        }
+      }
+
+      function shieldCellRect(shield, cx, cy) {
+        return {
+          x: shield.ox + cx * SHIELD_CELL_SIZE,
+          y: shield.oy + cy * SHIELD_CELL_SIZE,
+          w: SHIELD_CELL_SIZE,
+          h: SHIELD_CELL_SIZE
+        };
+      }
+
+      function destroyShieldCellAt(pointRect) {
+        // pointRect is bullet rect; find any overlapped shield cells and remove them.
+        // Returns true if any cell destroyed.
+        let hit = false;
+        for (const shield of shields) {
+          // quick bounds check
+          const minX = shield.ox, minY = shield.oy;
+          const maxX = minX + shieldMask.Wc*SHIELD_CELL_SIZE;
+          const maxY = minY + shieldMask.Hc*SHIELD_CELL_SIZE;
+          if (pointRect.x > maxX || pointRect.x + pointRect.w < minX || pointRect.y > maxY || pointRect.y + pointRect.h < minY) continue;
+
+          for (const [k] of shield.grid) {
+            const [cxStr, cyStr] = k.split(',');
+            const cx = parseInt(cxStr, 10), cy = parseInt(cyStr, 10);
+            const cellRect = shieldCellRect(shield, cx, cy);
+            if (aabb(pointRect, cellRect)) {
+              shield.grid.delete(k);
+              hit = true;
+              // As per spec: bullets destroy both involved (bullet and cell) so only one cell matters, but might overlap multiple due to thinness.
+              // We'll destroy at most one cell per bullet per frame to preserve feel.
+              break;
+            }
+          }
+        }
+        return hit;
+      }
+
+      // ---- Alien formation creation ----
+      function alienSizeForRow(r) {
+        if (r === 0) return { w: ROW_TOP_W, h: ROW_TOP_H };
+        if (r === 1 || r === 2) return { w: ROW_MID_W, h: ROW_MID_H };
+        return { w: ROW_BOT_W, h: ROW_BOT_H }; // rows 3 and 4
+      }
+
+      function alienRowValue(r) {
+        if (r === 0) return 30;
+        if (r === 1 || r === 2) return 20;
+        return 10;
+      }
+
+      function createFormation() {
+        formation = {
+          aliens: [],
+          dir: 1,
+          marchSpeed: BASE_MARCH_SPEED,
+          dropPending: false,
+          dropOffset: 0,
+          bounds: { left:0, right:0, top:0, bottom:0 },
+          originX: 120, // center of first alien
+          originY: 80,
+          spacingX: ALIEN_SPACING_X,
+          spacingY: ALIEN_SPACING_Y,
+          // track "current alive bounds" each update
+          marchTimerPulse: 0
+        };
+
+        for (let r = 0; r < GRID_ROWS; r++) {
+          for (let c = 0; c < GRID_COLS; c++) {
+            const { w, h } = alienSizeForRow(r);
+            const centerX = ALIEN_START_CENTER_X + c * ALIEN_SPACING_X;
+            const centerY = ALIEN_START_Y + r * ALIEN_SPACING_Y;
+
+            // Use rect with top-left coords:
+            formation.aliens.push({
+              r, c,
+              alive: true,
+              x: centerX - w/2,
+              y: centerY - h/2,
+              w, h
+            });
+          }
+        }
+        updateFormationBounds();
+      }
+
+      function updateFormationBounds() {
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        let aliveCount = 0;
+        for (const a of formation.aliens) {
+          if (!a.alive) continue;
+          aliveCount++;
+          minX = Math.min(minX, a.x);
+          minY = Math.min(minY, a.y);
+          maxX = Math.max(maxX, a.x + a.w);
+          maxY = Math.max(maxY, a.y + a.h);
+        }
+        if (aliveCount === 0) {
+          formation.bounds = { left:0, right:0, top:0, bottom:0 };
+          formation.aliveCount = 0;
+        } else {
+          formation.bounds = { left:minX, right:maxX, top:minY, bottom:maxY };
+          formation.aliveCount = aliveCount;
+        }
+      }
+
+      function aliveAliensRemaining() {
+        return formation.aliens.filter(a => a.alive).length;
+      }
+
+      function formationSpeedFromAlive() {
+        // increase speed as fewer aliens remain
+        const total = GRID_ROWS * GRID_COLS;
+        const alive = aliveAliensRemaining();
+        const t = 1 - (alive / total); // 0 at full, -> near 1 as fewer remain
+        // base 30, add up to ~55 more
+        const speed = BASE_MARCH_SPEED * (1 + 1.1 * t) + 3 * Math.pow(t, 2);
+        return speed;
+      }
+
+      function getAlienRect(a) {
+        return { x: a.x, y: a.y, w: a.w, h: a.h };
+      }
+
+      // ---- Mystery ship ----
+      function resetMystery() {
+        mystery = { active:false, x:0, y:MYSTERY_Y, dir:1, lastMoveAt:0 };
+        scheduleNextMystery();
+      }
+
+      function scheduleNextMystery() {
+        const s = randInt(MYSTERY_MIN_SPAWN, MYSTERY_MAX_SPAWN);
+        nextMysteryAt = (lastUpdateTime + s * 1000);
+      }
+
+      function spawnMystery() {
+        const fromLeft = Math.random() < 0.5;
+        const dir = fromLeft ? 1 : -1;
+        const x = fromLeft ? -MYSTERY_W : W + MYSTERY_W;
+        mystery = { active:true, x, y:MYSTERY_Y, dir };
+        // no immediate schedule until it ends (destroyed or exits)
+      }
+
+      // ---- Game lifecycle ----
+      function resetToWaveStart() {
+        player = {
+          x: 380, y: PLAYER_Y,
+          w: PLAYER_W, h: PLAYER_H,
+          speed: PLAYER_SPEED
+        };
+        playerBullet = null;
+        alienBullets = [];
+
+        createFormation();
+
+        createShields();
+
+        score = 0;
+        lives = 3;
+        level = 1;
+
+        lastAlienShotTime = 0;
+        nextMysteryAt = 0;
+        mystery = null;
+        resetMystery();
+      }
+
+      function startNewGame() {
+        // console log for state transitions
+        console.log('State -> PLAYING (new game)');
+        gameState = STATE.PLAYING;
+
+        score = 0;
+        lives = 3;
+        level = 1;
+
+        playerBullet = null;
+        alienBullets = [];
+        createFormation();
+        createShields();
+
+        player = { x: 380, y: PLAYER_Y, w: PLAYER_W, h: PLAYER_H, speed: PLAYER_SPEED };
+
+        lastAlienShotTime = 0;
+        resetMystery();
+
+        lastUpdateTime = now();
+        frameCount = 0;
+      }
+
+      function togglePause(on) {
+        console.log('State -> ' + (on ? 'PAUSED' : 'PLAYING'));
+        if (on) {
+          gameState = STATE.PAUSED;
+        } else {
+          gameState = STATE.PLAYING;
+          // reset update time so dt doesn't spike
+          lastUpdateTime = now();
+        }
+      }
+
+      function gameOver(reason) {
+        console.log('State -> GAME_OVER', reason || '');
+        gameState = STATE.GAME_OVER;
+
+        if (score > highScore) {
+          highScore = score;
+          try { localStorage.setItem(HIGH_KEY, String(highScore)); } catch {}
+        }
+
+        // play death sweep
+        sweepDeath();
+      }
+
+      // ---- Rendering ----
+      function drawPlayer() {
+        ctx.fillStyle = '#00FF00';
+        // simplified pixel-like silhouette: base + antenna
+        const x = player.x, y = player.y, w = player.w, h = player.h;
+
+        // draw as blocky shape
+        // main body
+        ctx.fillRect(x + Math.floor(w*0.2), y + 8, Math.floor(w*0.6), h - 10);
+        // top crown
+        ctx.fillRect(x + Math.floor(w*0.35), y, Math.floor(w*0.3), 10);
+        // legs pixels
+        ctx.fillRect(x + 8, y + h - 8, 8, 6);
+        ctx.fillRect(x + w - 16, y + h - 8, 8, 6);
+        // center notch
+        ctx.fillRect(x + w/2 - 2, y + h - 8, 4, 6);
+
+        // antenna/engine dots
+        ctx.fillRect(x + w/2 - 1, y + 10, 2, 4);
+        ctx.fillRect(x + w/2 - 2, y + h - 14, 4, 3);
+      }
+
+      function drawBullet(b, color) {
+        ctx.fillStyle = color;
+        ctx.fillRect(b.x, b.y, b.w, b.h);
+      }
+
+      function drawAliens() {
+        for (const a of formation.aliens) {
+          if (!a.alive) continue;
+          let color;
+          if (a.r === 0) color = '#FF0000';
+          else if (a.r === 1 || a.r === 2) color = '#FFCC00';
+          else color = '#00CCFF';
+
+          ctx.fillStyle = color;
+          // pixel-ish silhouettes, varied by row type
+          const x = a.x, y = a.y, w = a.w, h = a.h;
+
+          // Use three types: top, middle, bottom
+          ctx.fillRect(x+2, y+4, w-4, h-8); // body
+          // head
+          ctx.fillRect(x+Math.floor(w*0.25), y+0, Math.floor(w*0.5), Math.ceil(h*0.35));
+          // eyes
+          ctx.fillRect(x+Math.floor(w*0.22), y+Math.floor(h*0.22), 3, 3);
+          ctx.fillRect(x+Math.floor(w*0.68), y+Math.floor(h*0.22), 3, 3);
+          // legs
+          const legY = y + h - Math.ceil(h*0.22);
+          if (a.r === 0) {
+            ctx.fillRect(x+5, legY, 5, 4);
+            ctx.fillRect(x+w-10, legY, 5, 4);
+          } else if (a.r === 1 || a.r === 2) {
+            ctx.fillRect(x+4, legY, 6, 4);
+            ctx.fillRect(x+w-10, legY, 6, 4);
+            ctx.fillRect(x+Math.floor(w/2)-3, legY, 6, 4);
+          } else {
+            ctx.fillRect(x+3, legY, 7, 4);
+            ctx.fillRect(x+Math.floor(w/2)-3, legY, 7, 4);
+            ctx.fillRect(x+w-10, legY, 7, 4);
+          }
+          // side bumps
+          if (a.r === 0) {
+            ctx.fillRect(x+1, y+8, 3, 6);
+            ctx.fillRect(x+w-4, y+8, 3, 6);
+          } else if (a.r === 1 || a.r === 2) {
+            ctx.fillRect(x+1, y+10, 4, 6);
+            ctx.fillRect(x+w-5, y+10, 4, 6);
+          } else {
+            ctx.fillRect(x+1, y+10, 5, 7);
+            ctx.fillRect(x+w-6, y+10, 5, 7);
+          }
+        }
+      }
+
+      function drawShields() {
+        ctx.fillStyle = '#00FF00';
+        for (const shield of shields) {
+          for (const k of shield.grid.keys()) {
+            const [cxStr, cyStr] = k.split(',');
+            const cx = parseInt(cxStr,10), cy = parseInt(cyStr,10);
+            ctx.fillRect(shield.ox + cx*SHIELD_CELL_SIZE, shield.oy + cy*SHIELD_CELL_SIZE, SHIELD_CELL_SIZE, SHIELD_CELL_SIZE);
+          }
+        }
+      }
+
+      function drawMystery() {
+        if (!mystery || !mystery.active) return;
+        ctx.fillStyle = '#FF0000';
+        const x = mystery.x, y = mystery.y;
+        // red saucer: body bar + dome
+        ctx.fillRect(x+8, y+6, MYSTERY_W-16, 6);
+        ctx.fillRect(x+4, y+4, MYSTERY_W-8, 8);
+        ctx.fillRect(x, y+6, 8, 6);
+        ctx.fillRect(x+MYSTERY_W-8, y+6, 8, 6);
+        // small windows
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(x+18, y+6, 3, 3);
+        ctx.fillRect(x+27, y+6, 3, 3);
+
+        // reset red
+        ctx.fillStyle = '#FF0000';
+        // base
+        ctx.fillRect(x+12, y+12, MYSTERY_W-24, 3);
+      }
+
+      function drawHUD() {
+        // score top-left
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '16px monospace';
+        ctx.textBaseline = 'top';
+        ctx.fillText('SCORE: ' + score, 12, 8);
+
+        // high score top-right
+        const hs = 'HIGH: ' + highScore;
+        const tw = ctx.measureText(hs).width;
+        ctx.fillText(hs, W - tw - 12, 8);
+
+        // lives bottom-left numeric (spec says icons or numeric)
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '16px monospace';
+        ctx.textBaseline = 'bottom';
+        ctx.fillText('LIVES: ' + lives, 12, H - 10);
+
+        // Level bottom-right
+        ctx.textBaseline = 'bottom';
+        const lv = 'WAVE: ' + level;
+        const tw2 = ctx.measureText(lv).width;
+        ctx.fillText(lv, W - tw2 - 12, H - 10);
+      }
+
+      function drawStartScreen() {
+        ctx.fillStyle = '#000000';
+        ctx.fillRect(0,0,W,H);
+
+        ctx.fillStyle = '#00FF00';
+        ctx.font = '48px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        ctx.fillText('SPACE INVADERS', W/2, 220);
+
+        ctx.font = '16px monospace';
+        ctx.fillStyle = '#FFFFFF';
+        ctx.textAlign = 'center';
+        ctx.fillText('ArrowLeft/A and ArrowRight/D: Move  |  Space: Fire  |  P: Pause', W/2, 300);
+        ctx.fillText('Press Enter to Start', W/2, 330);
+
+        // score legend
+        ctx.textAlign = 'left';
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillText('Legend: top +30, middle +20, bottom +10, UFO + (random bonus)', 120, 360);
+      }
+
+      function drawPauseOverlay() {
+        pausedOverlayPulse += 1;
+        ctx.save();
+        ctx.fillStyle = 'rgba(0,0,0,0.55)';
+        ctx.fillRect(0,0,W,H);
+
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '48px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('PAUSED', W/2, H/2 - 10);
+
+        ctx.font = '16px monospace';
+        const msg = 'Press P to unpause';
+        ctx.fillText(msg, W/2, H/2 + 25);
+
+        ctx.restore();
+      }
+
+      function drawGameOverScreen() {
+        ctx.save();
+        ctx.fillStyle = 'rgba(0,0,0,0.65)';
+        ctx.fillRect(0,0,W,H);
+
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '48px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('GAME OVER', W/2, H/2 - 40);
+
+        ctx.font = '20px monospace';
+        ctx.fillText('Score: ' + score, W/2, H/2 - 8);
+        ctx.font = '16px monospace';
+        ctx.fillText('Press Enter to restart', W/2, H/2 + 24);
+        ctx.restore();
+      }
+
+      // ---- Update / Logic ----
+      function playerFire() {
+        if (playerBullet) return;
+        // only one bullet at a time
+        playerBullet = {
+          x: player.x + player.w/2 - BULLET_W/2,
+          y: player.y - BULLET_H, // from top of player
+          w: BULLET_W,
+          h: BULLET_H,
+          alive: true
+        };
+        // audio
+        beepSquare(900, 0.045, 'square', 0.04);
+      }
+
+      function findBottomMostAlienInColumn(col) {
+        // Returns alien object for given grid column index c, among alive.
+        // Bottom-most means largest y (closest to player).
+        let best = null;
+        for (const a of formation.aliens) {
+          if (!a.alive) continue;
+          if (a.c !== col) continue;
+          if (!best || a.y > best.y) best = a;
+        }
+        return best;
+      }
+
+      function maybeAlienShoot(dt) {
+        // firing rate increases as aliens get fewer.
+        const alive = formation.aliveCount || 0;
+        if (alive <= 0) return;
+
+        const nowMs = lastUpdateTime; // will update outside
+        // Determine dynamic interval
+        const total = GRID_COLS * GRID_ROWS;
+        const t = 1 - alive/total;
+        const minInt = 0.12; // seconds
+        const maxInt = 0.75; // seconds
+        const interval = maxInt - t*(maxInt-minInt);
+        
+        // max 3 active
+        if (alienBullets.length >= MAX_ALIEN_BULLETS) return;
+
+        if (nowMs - lastAlienShotTime < interval*1000) return;
+
+        // Choose a column that has alive alien
+        const possibleCols = [];
+        for (let c = 0; c < GRID_COLS; c++) {
+          const a = findBottomMostAlienInColumn(c);
+          if (a) possibleCols.push(c);
+        }
+        if (possibleCols.length === 0) return;
+
+        const col = randChoice(possibleCols);
+        const shooter = findBottomMostAlienInColumn(col);
+        if (!shooter) return;
+
+        // fired from bottom-most alive alien in selected column
+        const bx = shooter.x + shooter.w/2 - ALIEN_BULLET_W/2;
+        const by = shooter.y + shooter.h; // bottom
+        alienBullets.push({ x: bx, y: by, w: ALIEN_BULLET_W, h: ALIEN_BULLET_H, alive:true });
+
+        lastAlienShotTime = nowMs;
+
+        // audio small burst
+        beepSquare(randInt(140, 220), 0.03, 'square', 0.02);
+      }
+
+      function advanceWave() {
+        // next wave: speed up and reset bullet/mystery/shields? spec implies progression; we'll keep shields.
+        level += 1;
+        console.log('Wave cleared -> level', level);
+
+        // keep shields but refresh for next wave to match classic feel
+        // spec doesn't state, but spec says shields erode under impacts; typically they persist.
+        // We'll recreate to ensure acceptance criteria "shields erode correctly" per wave start still holds.
+        // However spec doesn't explicitly require persistence. We'll recreate for consistency.
+        createShields();
+
+        playerBullet = null;
+        alienBullets = [];
+        createFormation();
+
+        // schedule new mystery soon
+        resetMystery();
+      }
+
+      function alienBulletHitPlayer(b) {
+        const pr = { x: player.x, y: player.y, w: player.w, h: player.h };
+        if (aabb({x:b.x,y:b.y,w:b.w,h:b.h}, pr)) {
+          return true;
+        }
+        return false;
+      }
+
+      function playerBulletHitsAliens() {
+        if (!playerBullet) return false;
+
+        const br = {x: playerBullet.x, y: playerBullet.y, w: playerBullet.w, h: playerBullet.h};
+
+        for (const a of formation.aliens) {
+          if (!a.alive) continue;
+          const ar = {x:a.x,y:a.y,w:a.w,h:a.h};
+          if (aabb(br, ar)) {
+            // destroy alien and bullet
+            a.alive = false;
+            playerBullet = null;
+
+            updateFormationBounds();
+
+            // award score based on row
+            const val = alienRowValue(a.r);
+            score += val;
+
+            // audio hit
+            beepSquare(randInt(220, 340), 0.035, 'square', 0.03);
+
+            // if cleared all aliens advance wave
+            if (formation.aliveCount === 0) {
+              advanceWave();
+            }
+            return true;
+          }
+        }
+        return false;
+      }
+
+      function playerBulletHitsShields() {
+        if (!playerBullet) return false;
+        const br = {x: playerBullet.x, y: playerBullet.y, w: playerBullet.w, h: playerBullet.h};
+        const hit = destroyShieldCellAt(br);
+        if (hit) {
+          playerBullet = null;
+          return true;
+        }
+        return false;
+      }
+
+      function playerBulletHitsMystery() {
+        if (!playerBullet || !mystery || !mystery.active) return false;
+        const br = {x: playerBullet.x, y: playerBullet.y, w: playerBullet.w, h: playerBullet.h};
+        const mr = {x: mystery.x, y: mystery.y, w: MYSTERY_W, h: MYSTERY_H};
+        if (aabb(br, mr)) {
+          // destroy both
+          playerBullet = null;
+          mystery.active = false;
+
+          // award random bonus value
+          const bonuses = [50, 100, 150, 300];
+          const bonus = randChoice(bonuses);
+          score += bonus;
+
+          // audio
+          beepSquare(720, 0.07, 'square', 0.04);
+          scheduleNextMystery();
+          return true;
+        }
+        return false;
+      }
+
+      function alienBulletHitsShields(b) {
+        const br = {x:b.x,y:b.y,w:b.w,h:b.h};
+        const hit = destroyShieldCellAt(br);
+        if (hit) return true;
+        return false;
+      }
+
+      function alienBulletHitsPlayerAndHandle(b) {
+        if (!alienBulletHitPlayer(b)) return false;
+
+        // lose a life and remove bullet
+        b.alive = false;
+        lives -= 1;
+
+        // audio
+        if (lives > 0) beepSquare(randInt(80,140), 0.08, 'sawtooth', 0.02);
+
+        if (lives <= 0) {
+          gameOver('lives=0');
+        }
+        return true;
+      }
+
+      function checkAlienFormationDescent() {
+        // game ends if formation reaches y >= 540
+        updateFormationBounds();
+        if (formation.aliveCount > 0 && formation.bounds.bottom >= LOSS_Y) {
+          gameOver('formation reached loss line');
+          return true;
+        }
+        return false;
+      }
+
+      // Formation march update as unified block with edge checks using current alive bounds
+      function updateFormation(dt) {
+        if (formation.aliveCount <= 0) return;
+
+        formation.marchSpeed = formationSpeedFromAlive();
+
+        // optional heartbeat pulse
+        formation.marchTimerPulse += dt;
+        if (formation.marchTimerPulse > Math.max(0.18, 0.65 - formation.marchSpeed/100)) {
+          formation.marchTimerPulse = 0;
+          // create varying pulse strength with alive count
+          const alive = formation.aliveCount;
+          const total = GRID_COLS*GRID_ROWS;
+          const t = 1 - alive/total;
+          heartbeatPulse(0.6 + 0.8*t);
+        }
+
+        // move horizontally
+        const dx = formation.dir * formation.marchSpeed * dt;
+
+        // proposed new bounds
+        const newLeft = formation.bounds.left + dx;
+        const newRight = formation.bounds.right + dx;
+
+        const willHitLeft = newLeft <= SIDE_LEFT;
+        const willHitRight = newRight >= SIDE_RIGHT;
+
+        if (willHitLeft || willHitRight) {
+          // reverse and drop 20px
+          formation.dir *= -1;
+          const drop = DROP_AMOUNT;
+          for (const a of formation.aliens) {
+            if (!a.alive) continue;
+            a.x += 0; // no horizontal jump on reversal
+            a.y += drop;
+          }
+          updateFormationBounds();
+          // After dropping, move a tiny bit in new direction to avoid sticking
+          const ndx = formation.dir * formation.marchSpeed * dt * 0.1;
+          for (const a of formation.aliens) {
+            if (!a.alive) continue;
+            a.x += ndx;
+          }
+          updateFormationBounds();
+        } else {
+          for (const a of formation.aliens) {
+            if (!a.alive) continue;
+            a.x += dx;
+          }
+          updateFormationBounds();
+        }
+
+        // loss condition handled after movement elsewhere
+      }
+
+      function updateMystery(dt) {
+        if (!mystery) return;
+        // spawn timer
+        if (gameState === STATE.PLAYING && !mystery.active && lastUpdateTime >= nextMysteryAt) {
+          spawnMystery();
+        }
+
+        if (!mystery.active) return;
+
+        mystery.x += mystery.dir * MYSTERY_SPEED * dt;
+
+        // exit triggers schedule reset (spec: reset after either destruction or exit)
+        if (mystery.x < -MYSTERY_W || mystery.x > W + MYSTERY_W) {
+          mystery.active = false;
+          scheduleNextMystery();
+        }
+      }
+
+      // ---- Main loop ----
+      function frame(t) {
+        requestAnimationFrame(frame);
+        const current = t;
+        let dt = (current - lastUpdateTime) / 1000;
+        if (!Number.isFinite(dt) || dt <= 0) dt = 1/60;
+        // clamp dt to avoid huge steps when tab is inactive
+        dt = Math.min(dt, 1/30);
+
+        if (gameState === STATE.IDLE) {
+          drawStartScreen();
+          lastUpdateTime = current;
+          return;
+        }
+
+        if (gameState === STATE.PAUSED) {
+          // draw current scene then overlay
+          renderScene();
+          drawPauseOverlay();
+          lastUpdateTime = current;
+          return;
+        }
+
+        if (gameState === STATE.GAME_OVER) {
+          renderScene(); // last frame state
+          drawGameOverScreen();
+          lastUpdateTime = current;
+          return;
+        }
+
+        // PLAYING
+        if (gameState !== STATE.PLAYING) return;
+
+        // update nowMs for timers
+        lastUpdateTime = current;
+
+        // Player input
+        let move = 0;
+        if (keys.has('ArrowLeft') || keys.has('Aleft')) move -= 1;
+        if (keys.has('ArrowRight') || keys.has('Aright')) move += 1;
+
+        player.x += move * player.speed * dt;
+        player.x = clamp(player.x, 0, W - player.w);
+
+        // Fire
+        if (keys.has('Space')) {
+          // fire on key hold? spec says 1 may exist at a time; to keep authentic, allow repeated shots as soon as bullet removed.
+          // We'll allow continuous checks without edge-triggering due to one-shot constraint.
+          playerFire();
+        }
+
+        // Update player bullet
+        if (playerBullet) {
+          playerBullet.y -= BULLET_SPEED * dt;
+          if (playerBullet.y + playerBullet.h < 0) {
+            playerBullet = null;
+          } else {
+            // collisions: bullet vs shields then aliens then mystery
+            // Spec order not strict but must include all pairs. We'll do shields then aliens then mystery.
+            if (playerBulletHitsShields()) {
+              // already removed
+            } else if (playerBulletHitsAliens()) {
+              // might have advanced wave
+            } else {
+              playerBulletHitsMystery();
+            }
+          }
+        }
+
+        // Alien formation
+        updateFormation(dt);
+        // Descent loss condition
+        if (checkAlienFormationDescent()) return;
+
+        // Alien bullets spawn
+        maybeAlienShoot(dt);
+
+        // Update alien bullets
+        for (const b of alienBullets) {
+          if (!b.alive) continue;
+          b.y += ALIEN_BULLET_SPEED * dt;
+          // off-screen remove
+          if (b.y > H) {
+            b.alive = false;
+            continue;
+          }
+
+          // collisions: bullet vs shields then player
+          const br = {x:b.x,y:b.y,w:b.w,h:b.h};
+
+          // Alien bullet ↔ Shield Cell
+          if (alienBulletHitsShields(b)) {
+            b.alive = false;
+            continue;
+          }
+
+          // Alien bullet ↔ Player Ship
+          if (alienBulletHitsPlayerAndHandle(b)) {
+            continue;
+          }
+        }
+        alienBullets = alienBullets.filter(b => b.alive);
+
+        // Mystery ship update
+        updateMystery(dt);
+
+        // Render
+        renderScene();
+      }
+
+      function renderScene() {
+        // background
+        ctx.fillStyle = BG;
+        ctx.fillRect(0,0,W,H);
+
+        // Draw in order: HUD background not needed; objects.
+        drawShields();
+        drawMystery();
+        drawAliens();
+
+        // bullets
+        if (playerBullet) drawBullet(playerBullet, '#FFFFFF');
+        for (const b of alienBullets) drawBullet(b, '#FF4444');
+
+        // player
+        drawPlayer();
+
+        // overlays/hud
+        drawHUD();
+      }
+
+      // Ensure Enter on IDLE works; also show start screen immediately
+      lastUpdateTime = now();
+      requestAnimationFrame(frame);
+
+    })();
+  </script>
+</body>
+</html>

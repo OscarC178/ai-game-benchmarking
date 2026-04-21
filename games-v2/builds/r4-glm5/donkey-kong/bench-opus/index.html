@@ -1,0 +1,610 @@
+<!--
+  GAME:      Donkey Kong
+  RUN:       r4-glm5
+  BUILDER:   anthropic/claude-opus-4.6
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Donkey Kong</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;display:flex;justify-content:center;align-items:center;height:100vh;overflow:hidden}
+canvas{display:block}
+</style>
+</head>
+<body>
+<canvas id="c" width="448" height="512"></canvas>
+<script>
+(function(){
+'use strict';
+const cv=document.getElementById('c'),cx=cv.getContext('2d');
+const W=448,H=512;
+
+let ac=null;
+function ia(){if(ac)return;try{ac=new(AudioContext||webkitAudioContext)();}catch(e){}}
+function tone(f,d,v,t){if(!ac)return;try{const o=ac.createOscillator(),g=ac.createGain();o.type=t||'square';o.frequency.value=f;g.gain.value=v||0.03;g.gain.linearRampToValueAtTime(0,ac.currentTime+d);o.connect(g);g.connect(ac.destination);o.start();o.stop(ac.currentTime+d);}catch(e){}}
+function sndJump(){tone(300,0.04,0.05,'sine');setTimeout(()=>tone(500,0.04,0.05,'sine'),40);}
+function sndDie(){for(let i=0;i<5;i++)setTimeout(()=>tone(400-i*50,0.1,0.04,'sawtooth'),i*80);}
+function sndScore(){tone(800,0.03,0.05,'sine');setTimeout(()=>tone(1000,0.03,0.05,'sine'),40);}
+function sndHammer(){tone(200,0.04,0.04,'square');}
+function sndWin(){for(let i=0;i<6;i++)setTimeout(()=>tone(400+i*80,0.08,0.05,'sine'),i*80);}
+
+// Platform definitions for Stage 1 (Girders)
+// Each: {x,y,w,h,angle} — angle in radians for slope
+const PLATS=[
+  // Bottom (row 0) — slight slope up-right
+  {x:30,y:462,w:388,h:6,slope:0},
+  // Row 1 — slopes down-right
+  {x:30,y:388,w:388,h:6,slope:0.035},
+  // Row 2 — slopes down-left
+  {x:30,y:314,w:388,h:6,slope:-0.035},
+  // Row 3 — slopes down-right
+  {x:30,y:240,w:388,h:6,slope:0.035},
+  // Row 4 — slopes down-left
+  {x:30,y:166,w:388,h:6,slope:-0.035},
+  // Row 5 (top) — DK platform
+  {x:50,y:100,w:160,h:6,slope:0},
+  // Pauline platform
+  {x:240,y:80,w:140,h:6,slope:0}
+];
+
+function platYAt(p,x){
+  const rx=x-p.x;
+  return p.y+rx*p.slope;
+}
+
+// Ladders: {x, topY, botY, broken} broken means only top half visible
+const LADDERS=[
+  // Row 0→1
+  {x:100,topY:388,botY:462},{x:300,topY:388,botY:462},{x:200,topY:400,botY:462,broken:true},
+  // Row 1→2
+  {x:370,topY:314,botY:388},{x:160,topY:314,botY:388},{x:80,topY:326,botY:388,broken:true},
+  // Row 2→3
+  {x:100,topY:240,botY:314},{x:300,topY:240,botY:314},{x:220,topY:252,botY:314,broken:true},
+  // Row 3→4
+  {x:370,topY:166,botY:240},{x:160,topY:166,botY:240},{x:260,topY:178,botY:240,broken:true},
+  // Row 4→5 (to DK)
+  {x:100,topY:100,botY:166}
+];
+
+// Hammer locations
+const HAMMER_POS=[{x:70,y:308},{x:350,y:160}];
+
+const ST_TITLE=0,ST_READY=1,ST_PLAY=2,ST_PAUSE=3,ST_DEAD=4,ST_WIN=5,ST_OVER=6;
+let state=ST_TITLE,stateTimer=0;
+
+let mario,barrels,fireballs,hammersOnMap;
+let score,hiScore,lives,stage,cycle;
+let dk,pauline,oilDrum;
+let throwTimer,globalTime;
+
+hiScore=0;
+try{const v=localStorage.getItem('dk4_best');if(v)hiScore=parseInt(v)||0;}catch(e){}
+function saveHi(){if(score>hiScore){hiScore=score;try{localStorage.setItem('dk4_best',String(hiScore));}catch(e){}}}
+
+function getPlatAt(x,y){
+  for(const p of PLATS){
+    if(x>=p.x&&x<=p.x+p.w){
+      const py=platYAt(p,x);
+      if(Math.abs(y-py)<8)return p;
+    }
+  }
+  return null;
+}
+
+function platYUnder(x,y){
+  let best=null,bestY=H+100;
+  for(const p of PLATS){
+    if(x>=p.x-4&&x<=p.x+p.w+4){
+      const py=platYAt(p,x);
+      if(py>=y-2&&py<bestY){bestY=py;best=p;}
+    }
+  }
+  return best;
+}
+
+function getLadderAt(x,y){
+  for(const l of LADDERS){
+    if(Math.abs(x-l.x)<10&&y>=l.topY-6&&y<=l.botY+6)return l;
+  }
+  return null;
+}
+
+function resetLevel(){
+  mario={x:60,y:456,vx:0,vy:0,w:14,h:20,dir:1,jumping:false,jumpT:0,
+    climbing:false,alive:true,onGround:true,walkFrame:0,
+    hammer:false,hammerTimer:0,hammerSwing:0,invuln:0};
+  barrels=[];fireballs=[];
+  hammersOnMap=HAMMER_POS.map(h=>({x:h.x,y:h.y,taken:false}));
+  dk={x:70,y:68,throwAnim:0,throwTimer:2.5};
+  pauline={x:300,y:52};
+  oilDrum={x:38,y:444};
+  throwTimer=2.5;
+}
+
+function startGame(){
+  score=0;lives=3;stage=1;cycle=1;
+  resetLevel();state=ST_READY;stateTimer=2;globalTime=0;
+}
+
+function startStage(){
+  resetLevel();state=ST_READY;stateTimer=2;
+}
+
+function killMario(){
+  if(!mario.alive)return;
+  mario.alive=false;sndDie();lives--;
+  state=ST_DEAD;stateTimer=2;
+}
+
+function winStage(){
+  sndWin();state=ST_WIN;stateTimer=3;
+  score+=1000;saveHi();
+}
+
+const keys={};
+addEventListener('keydown',e=>{
+  keys[e.code]=true;ia();e.preventDefault();
+  if(state===ST_TITLE&&(e.code==='Space'||e.code==='Enter'))startGame();
+  if(state===ST_OVER&&(e.code==='KeyR'||e.code==='Enter'))state=ST_TITLE;
+  if(state===ST_PLAY){
+    if(e.code==='KeyP'||e.code==='Escape')state=ST_PAUSE;
+    if(e.code==='KeyR')startGame();
+    if(e.code==='Space'&&mario.alive&&!mario.climbing&&!mario.jumping&&mario.onGround&&!mario.hammer){
+      mario.jumping=true;mario.jumpT=0;mario.vy=-5.5;sndJump();
+    }
+  }
+  if(state===ST_PAUSE){
+    if(e.code==='KeyP'||e.code==='Escape')state=ST_PLAY;
+    if(e.code==='KeyR')startGame();
+  }
+});
+addEventListener('keyup',e=>{keys[e.code]=false;});
+
+function update(dt){
+  globalTime+=dt;
+  if(state===ST_READY){stateTimer-=dt;if(stateTimer<=0)state=ST_PLAY;return;}
+  if(state===ST_DEAD){stateTimer-=dt;if(stateTimer<=0){if(lives<=0){state=ST_OVER;saveHi();}else startStage();}return;}
+  if(state===ST_WIN){stateTimer-=dt;if(stateTimer<=0){stage++;if(stage>4){stage=1;cycle++;}startStage();}return;}
+  if(state!==ST_PLAY)return;
+
+  const spd=2*(1+cycle*0.1);
+
+  // Mario movement
+  if(mario.alive){
+    if(mario.invuln>0)mario.invuln-=dt;
+
+    if(mario.climbing){
+      mario.vx=0;
+      const ladder=getLadderAt(mario.x,mario.y);
+      if(!ladder){mario.climbing=false;}
+      else{
+        mario.x+=(ladder.x-mario.x)*0.2;
+        if(keys['ArrowUp']||keys['KeyW']){
+          mario.y-=1.5;mario.walkFrame+=dt*6;
+          if(mario.y<=ladder.topY){mario.y=ladder.topY-2;mario.climbing=false;}
+        }
+        if(keys['ArrowDown']||keys['KeyS']){
+          mario.y+=1.5;mario.walkFrame+=dt*6;
+          if(mario.y>=ladder.botY){mario.y=ladder.botY;mario.climbing=false;}
+        }
+      }
+    }else{
+      // Horizontal
+      let mx=0;
+      if(keys['ArrowLeft']||keys['KeyA']){mx=-spd;mario.dir=-1;}
+      if(keys['ArrowRight']||keys['KeyD']){mx=spd;mario.dir=1;}
+      if(mario.hammer)mario.walkFrame+=dt*4;
+      else if(mx!==0)mario.walkFrame+=dt*8;
+      mario.x+=mx;
+      mario.x=Math.max(16,Math.min(W-16,mario.x));
+
+      // Gravity
+      if(mario.jumping){
+        mario.jumpT+=dt;
+        mario.vy+=15*dt;
+        mario.y+=mario.vy;
+        // Check landing
+        const pp=platYUnder(mario.x,mario.y);
+        if(pp&&mario.vy>0){
+          const py=platYAt(pp,mario.x);
+          if(mario.y>=py-mario.h){
+            mario.y=py-mario.h;mario.jumping=false;mario.vy=0;mario.onGround=true;
+          }
+        }
+        if(mario.y>H+20){killMario();return;}
+      }else if(!mario.onGround){
+        mario.vy+=15*dt;
+        mario.y+=mario.vy;
+        const pp=platYUnder(mario.x,mario.y+mario.h);
+        if(pp){
+          const py=platYAt(pp,mario.x);
+          if(mario.y+mario.h>=py){
+            mario.y=py-mario.h;mario.vy=0;mario.onGround=true;
+          }
+        }
+        if(mario.y>H+20){killMario();return;}
+      }else{
+        // Check still on platform
+        const pp=getPlatAt(mario.x,mario.y+mario.h);
+        if(pp){
+          mario.y=platYAt(pp,mario.x)-mario.h;
+        }else{
+          mario.onGround=false;mario.vy=0;
+        }
+      }
+
+      // Ladder interaction
+      if(!mario.jumping&&!mario.hammer){
+        if(keys['ArrowUp']||keys['KeyW']){
+          const l=getLadderAt(mario.x,mario.y+mario.h);
+          if(l&&mario.y+mario.h>l.topY){mario.climbing=true;mario.onGround=false;}
+        }
+        if(keys['ArrowDown']||keys['KeyS']){
+          const l=getLadderAt(mario.x,mario.y+mario.h+8);
+          if(l&&mario.y+mario.h<l.botY){mario.climbing=true;mario.onGround=false;mario.y+=4;}
+        }
+      }
+
+      // Hammer pickup
+      for(const hm of hammersOnMap){
+        if(!hm.taken&&Math.abs(mario.x-hm.x)<16&&Math.abs(mario.y+mario.h/2-hm.y)<16){
+          hm.taken=true;mario.hammer=true;mario.hammerTimer=6;sndHammer();
+        }
+      }
+      // Hammer timer
+      if(mario.hammer){
+        mario.hammerTimer-=dt;
+        mario.hammerSwing+=dt*10;
+        if(mario.hammerTimer<=0){mario.hammer=false;}
+      }
+    }
+
+    // Win check — reach Pauline
+    if(Math.abs(mario.x-pauline.x)<24&&Math.abs(mario.y-pauline.y)<30){
+      winStage();return;
+    }
+  }
+
+  // DK throws barrels
+  throwTimer-=dt;
+  dk.throwAnim=throwTimer<0.4?1:0;
+  if(throwTimer<=0){
+    throwTimer=Math.max(1.2,2.8-cycle*0.3)+Math.random()*1;
+    barrels.push({x:dk.x+30,y:dk.y+40,vx:1.5+cycle*0.2,vy:0,onPlat:null,rolling:true,row:5,
+      falling:false,rotation:0});
+  }
+
+  // Update barrels
+  for(let i=barrels.length-1;i>=0;i--){
+    const b=barrels[i];
+    b.rotation+=b.vx*0.1;
+
+    if(b.falling){
+      b.vy+=12*dt;b.y+=b.vy;
+      // Check landing on platform below
+      const pp=platYUnder(b.x,b.y+8);
+      if(pp){
+        const py=platYAt(pp,b.x);
+        if(b.y+8>=py){
+          b.y=py-8;b.falling=false;b.vy=0;
+          b.vx=pp.slope>0?2:-2;
+          b.vx*=(1+cycle*0.15);
+        }
+      }
+      if(b.y>H+20){barrels.splice(i,1);continue;}
+    }else{
+      // Rolling on platform
+      const pp=getPlatAt(b.x,b.y+8);
+      if(pp){
+        b.y=platYAt(pp,b.x)-8;
+        b.x+=b.vx;
+        // Slope drift
+        if(pp.slope>0)b.y=platYAt(pp,b.x)-8;
+        if(pp.slope<0)b.y=platYAt(pp,b.x)-8;
+      }else{
+        // Fell off platform
+        b.falling=true;b.vy=0;
+      }
+
+      // Edge reversal / fall
+      if(b.x<26||b.x>W-26){
+        b.falling=true;b.vy=0;
+      }
+
+      // Ladder interaction
+      const l=getLadderAt(b.x,b.y+8);
+      if(l&&!l.broken&&Math.random()<0.004){
+        b.falling=true;b.vy=0;b.x=l.x;
+      }
+    }
+
+    // Oil drum collision → spawn fireball
+    if(Math.abs(b.x-oilDrum.x)<16&&Math.abs(b.y-oilDrum.y)<16){
+      barrels.splice(i,1);
+      if(fireballs.length<2){
+        fireballs.push({x:oilDrum.x,y:oilDrum.y-10,vx:1+Math.random(),dir:1,climbing:false,climbLadder:null});
+      }
+      continue;
+    }
+
+    // Collision with Mario
+    if(mario.alive&&mario.invuln<=0){
+      if(Math.abs(mario.x-b.x)<12&&Math.abs((mario.y+mario.h/2)-b.y)<14){
+        if(mario.hammer){
+          barrels.splice(i,1);score+=500;saveHi();sndScore();continue;
+        }
+        if(mario.jumping&&mario.vy>0&&(mario.y+mario.h)<b.y+4){
+          score+=100;saveHi();sndScore();
+        }else{
+          killMario();return;
+        }
+      }
+    }
+
+    // Remove old barrels
+    if(b.y>H+50){barrels.splice(i,1);}
+  }
+
+  // Fireballs
+  for(let i=fireballs.length-1;i>=0;i--){
+    const f=fireballs[i];
+    if(f.climbing){
+      f.y-=1;
+      if(f.climbLadder&&f.y<=f.climbLadder.topY){
+        f.climbing=false;f.climbLadder=null;
+      }
+    }else{
+      f.x+=f.vx*f.dir;
+      // Stay on platform
+      const pp=getPlatAt(f.x,f.y+6);
+      if(pp){
+        f.y=platYAt(pp,f.x)-6;
+      }
+      // Wall bounce
+      if(f.x<30||f.x>W-30)f.dir*=-1;
+      // Chase Mario slightly
+      if(Math.random()<0.01)f.dir=mario.x>f.x?1:-1;
+      // Climb ladder randomly
+      const l=getLadderAt(f.x,f.y+6);
+      if(l&&!l.broken&&Math.random()<0.008&&f.y>mario.y){
+        f.climbing=true;f.climbLadder=l;f.x=l.x;
+      }
+    }
+
+    // Collision
+    if(mario.alive&&mario.invuln<=0){
+      if(Math.abs(mario.x-f.x)<12&&Math.abs((mario.y+mario.h/2)-f.y)<12){
+        if(mario.hammer){fireballs.splice(i,1);score+=500;saveHi();sndScore();continue;}
+        killMario();return;
+      }
+    }
+  }
+}
+
+function drawPlats(){
+  for(const p of PLATS){
+    cx.fillStyle='#4444ff';
+    cx.save();
+    cx.beginPath();
+    cx.moveTo(p.x,p.y);
+    cx.lineTo(p.x+p.w,p.y+p.w*p.slope);
+    cx.lineTo(p.x+p.w,p.y+p.w*p.slope+p.h);
+    cx.lineTo(p.x,p.y+p.h);
+    cx.closePath();cx.fill();
+    cx.restore();
+  }
+}
+
+function drawLadders(){
+  cx.strokeStyle='#4af';cx.lineWidth=2;
+  for(const l of LADDERS){
+    const top=l.broken?l.topY+(l.botY-l.topY)*0.4:l.topY;
+    cx.beginPath();cx.moveTo(l.x-5,top);cx.lineTo(l.x-5,l.botY);cx.stroke();
+    cx.beginPath();cx.moveTo(l.x+5,top);cx.lineTo(l.x+5,l.botY);cx.stroke();
+    for(let ry=top+8;ry<l.botY;ry+=12){
+      cx.beginPath();cx.moveTo(l.x-5,ry);cx.lineTo(l.x+5,ry);cx.stroke();
+    }
+  }
+}
+
+function drawMario(){
+  if(!mario.alive)return;
+  const mx=mario.x,my=mario.y;
+  const blink=mario.invuln>0&&Math.floor(mario.invuln*8)%2;
+  if(blink)return;
+  cx.save();cx.translate(mx,my);
+
+  if(mario.hammer){
+    // Hammer swing
+    const sw=Math.sin(mario.hammerSwing);
+    const hx=mario.dir*12,hy=-14+sw*10;
+    cx.fillStyle='#a52';cx.fillRect(hx-2,hy,4,14);
+    cx.fillStyle='#888';cx.fillRect(hx-5,hy-6,10,6);
+    if(mario.hammerTimer<1.5&&Math.floor(globalTime*6)%2){
+      cx.globalAlpha=0.5;
+    }
+  }
+
+  // Body
+  cx.fillStyle='#00f';cx.fillRect(-5,6,10,14);
+  // Shirt
+  cx.fillStyle='#f00';cx.fillRect(-6,0,12,8);
+  // Head
+  cx.fillStyle='#fca';cx.fillRect(-4,-8,8,8);
+  // Cap
+  cx.fillStyle='#f00';cx.fillRect(-5,-10,10,4);cx.fillRect(-6,-8,12,2);
+  // Eyes
+  cx.fillStyle='#000';cx.fillRect(mario.dir>0?1:-3,-6,2,2);
+
+  if(mario.climbing){
+    const cf=Math.floor(mario.walkFrame)%2;
+    cx.fillStyle='#fca';
+    cx.fillRect(-8,4+cf*4,4,6);cx.fillRect(4,4+(1-cf)*4,4,6);
+  }else{
+    const wf=Math.floor(mario.walkFrame)%2;
+    if(!mario.jumping&&Math.abs(mario.vx)>0.1){
+      cx.fillStyle='#a52';
+      cx.fillRect(-4+wf*3,16,4,4);cx.fillRect(0+(1-wf)*3,16,4,4);
+    }else{
+      cx.fillStyle='#a52';cx.fillRect(-4,16,4,4);cx.fillRect(2,16,4,4);
+    }
+  }
+
+  cx.globalAlpha=1;
+  cx.restore();
+}
+
+function drawDK(){
+  cx.save();cx.translate(dk.x,dk.y);
+  // Body
+  cx.fillStyle='#8B4513';cx.fillRect(-20,-20,40,40);
+  // Face
+  cx.fillStyle='#daa';cx.fillRect(-10,-10,20,15);
+  // Eyes
+  cx.fillStyle='#000';cx.fillRect(-6,-6,4,4);cx.fillRect(2,-6,4,4);
+  // Mouth
+  cx.fillRect(-4,2,8,3);
+  // Arms
+  cx.fillStyle='#8B4513';
+  if(dk.throwAnim){
+    cx.fillRect(-28,-15,10,8);cx.fillRect(18,-15,10,8);
+  }else{
+    cx.fillRect(-28,0,10,8);cx.fillRect(18,0,10,8);
+  }
+  cx.restore();
+}
+
+function drawPauline(){
+  cx.save();cx.translate(pauline.x,pauline.y);
+  cx.fillStyle='#f6a';cx.fillRect(-6,-12,12,20);
+  cx.fillStyle='#fca';cx.fillRect(-4,-18,8,8);
+  cx.fillStyle='#422';cx.fillRect(-5,-22,10,5);
+  if(Math.floor(globalTime*2)%2){cx.fillStyle='#fff';cx.font='8px monospace';cx.textAlign='center';cx.fillText('HELP!',0,-26);}
+  cx.restore();
+}
+
+function drawBarrel(b){
+  cx.save();cx.translate(b.x,b.y);cx.rotate(b.rotation);
+  cx.fillStyle='#e60';cx.beginPath();cx.arc(0,0,8,0,Math.PI*2);cx.fill();
+  cx.fillStyle='#a40';cx.fillRect(-8,-1,16,2);
+  cx.fillRect(-1,-8,2,16);
+  cx.restore();
+}
+
+function drawFireball(f){
+  cx.save();cx.translate(f.x,f.y);
+  const fl=Math.sin(globalTime*12)*2;
+  cx.fillStyle='#f80';cx.beginPath();cx.arc(0,0,6+fl,0,Math.PI*2);cx.fill();
+  cx.fillStyle='#ff0';cx.beginPath();cx.arc(0,0,3+fl*0.5,0,Math.PI*2);cx.fill();
+  cx.restore();
+}
+
+function drawOilDrum(){
+  cx.fillStyle='#33f';cx.fillRect(oilDrum.x-10,oilDrum.y-8,20,16);
+  cx.fillStyle='#226';cx.fillRect(oilDrum.x-10,oilDrum.y-8,20,3);
+  cx.fillRect(oilDrum.x-10,oilDrum.y+5,20,3);
+  // Flame
+  const fh=4+Math.sin(globalTime*10)*3;
+  cx.fillStyle='#f80';cx.beginPath();cx.arc(oilDrum.x,oilDrum.y-12,fh,0,Math.PI*2);cx.fill();
+  cx.fillStyle='#ff0';cx.beginPath();cx.arc(oilDrum.x,oilDrum.y-14,fh*0.5,0,Math.PI*2);cx.fill();
+}
+
+function drawHammers(){
+  for(const h of hammersOnMap){
+    if(h.taken)continue;
+    cx.fillStyle='#a52';cx.fillRect(h.x-2,h.y-6,4,12);
+    cx.fillStyle='#888';cx.fillRect(h.x-5,h.y-10,10,6);
+  }
+}
+
+function render(now){
+  cx.fillStyle='#000';cx.fillRect(0,0,W,H);
+
+  if(state===ST_TITLE){
+    cx.fillStyle='#f00';cx.font='bold 44px monospace';cx.textAlign='center';
+    cx.fillText('DONKEY KONG',W/2,180);
+    // DK
+    cx.fillStyle='#8B4513';cx.fillRect(W/2-20,220,40,40);
+    cx.fillStyle='#daa';cx.fillRect(W/2-10,230,20,15);
+    cx.fillStyle='#000';cx.fillRect(W/2-6,234,4,4);cx.fillRect(W/2+2,234,4,4);
+    cx.fillStyle='#ccc';cx.font='16px monospace';
+    cx.fillText('Help Mario rescue Pauline!',W/2,310);
+    cx.fillText('Arrows/WASD move   Space jump',W/2,340);
+    cx.fillText('P Pause   R Restart',W/2,366);
+    cx.fillStyle='#fff';cx.font='22px monospace';
+    if(Math.floor(now/600)%2)cx.fillText('Press SPACE / ENTER',W/2,430);
+    if(hiScore>0){cx.fillStyle='#555';cx.font='14px monospace';cx.fillText('Best: '+hiScore,W/2,470);}
+    return;
+  }
+
+  drawPlats();drawLadders();drawOilDrum();drawHammers();
+  for(const b of barrels)drawBarrel(b);
+  for(const f of fireballs)drawFireball(f);
+  drawDK();drawPauline();drawMario();
+
+  // HUD
+  cx.fillStyle='#fff';cx.font='14px monospace';cx.textAlign='left';
+  cx.fillText('SCORE: '+score,8,16);
+  cx.textAlign='center';cx.fillText(stage===1?'25m':stage===2?'50m':stage===3?'75m':'100m',W/2,16);
+  cx.textAlign='right';cx.fillText('HI: '+hiScore,W-8,16);
+
+  // Lives
+  for(let i=0;i<lives;i++){
+    cx.fillStyle='#f00';cx.fillRect(8+i*18,H-16,10,4);
+    cx.fillStyle='#00f';cx.fillRect(8+i*18,H-12,10,8);
+  }
+
+  if(mario.hammer){
+    const pct=mario.hammerTimer/6;
+    cx.fillStyle='#333';cx.fillRect(W-110,H-12,100,8);
+    cx.fillStyle=pct>0.3?'#ff0':'#f00';cx.fillRect(W-110,H-12,100*pct,8);
+  }
+
+  // State overlays
+  if(state===ST_READY){
+    cx.fillStyle='#ff0';cx.font='bold 28px monospace';cx.textAlign='center';
+    cx.fillText('STAGE '+stage+(stage===1?' (25m)':stage===2?' (50m)':stage===3?' (75m)':' (100m)'),W/2,H/2-10);
+    cx.fillStyle='#fff';cx.font='16px monospace';
+    cx.fillText('GET READY!',W/2,H/2+20);
+  }
+  if(state===ST_WIN){
+    cx.fillStyle='rgba(0,0,0,0.4)';cx.fillRect(0,H/2-40,W,80);
+    cx.fillStyle='#ff0';cx.font='bold 28px monospace';cx.textAlign='center';
+    cx.fillText('STAGE CLEAR!',W/2,H/2);
+    cx.fillStyle='#fff';cx.font='16px monospace';
+    cx.fillText('+1000 bonus',W/2,H/2+25);
+  }
+  if(state===ST_PAUSE){
+    cx.fillStyle='rgba(0,0,0,0.55)';cx.fillRect(0,0,W,H);
+    cx.fillStyle='#fff';cx.font='bold 36px monospace';cx.textAlign='center';
+    cx.fillText('PAUSED',W/2,H/2-10);
+    cx.font='16px monospace';cx.fillText('P to resume   R to restart',W/2,H/2+25);
+  }
+  if(state===ST_OVER){
+    cx.fillStyle='rgba(0,0,0,0.6)';cx.fillRect(0,0,W,H);
+    cx.fillStyle='#f44';cx.font='bold 44px monospace';cx.textAlign='center';
+    cx.fillText('GAME OVER',W/2,H/2-40);
+    cx.fillStyle='#fff';cx.font='22px monospace';
+    cx.fillText('Score: '+score,W/2,H/2+5);
+    if(score>=hiScore&&score>0){cx.fillStyle='#fd0';cx.font='16px monospace';cx.fillText('NEW HIGH SCORE!',W/2,H/2+35);}
+    cx.fillStyle='#aaa';cx.font='16px monospace';
+    if(Math.floor(now/600)%2)cx.fillText('ENTER / R to Continue',W/2,H/2+70);
+  }
+}
+
+let lastTime=0;
+function loop(now){
+  requestAnimationFrame(loop);
+  if(!lastTime){lastTime=now;return;}
+  let dt=(now-lastTime)/1000;lastTime=now;
+  if(dt>0.05)dt=0.05;
+  update(dt);render(now);
+}
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

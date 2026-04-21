@@ -1,0 +1,440 @@
+<!--
+  GAME:           Breakout
+  RUN:            run1-opus-plan
+  BUILDER:        anthropic/claude-opus-4-6
+  PLANNER:        anthropic/claude-opus-4.6
+  BUILD TIME:     50 seconds
+  TOKENS IN:      6200
+  TOKENS OUT:     6800
+  ESTIMATED COST: $1.60
+  ITERATIONS:     1
+  TOOLS USED:     write, read
+  STATUS:         complete
+  TIMESTAMP:      2026-03-30T23:26:33Z
+  TASKS DONE:     T01,T02,T03,T04,T05,T06,T07,T08,T09,T10,T11,T12
+  FIRST FAILURE:  none
+-->
+<!-- Breakout | spec:run1-opus-plan | built-by:anthropic/claude-opus-4-6 -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Breakout</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #111; display: flex; justify-content: center; align-items: center; min-height: 100vh; overflow: hidden; }
+  canvas { display: block; background: #000000; cursor: none; }
+</style>
+</head>
+<body>
+<canvas id="game" width="800" height="600"></canvas>
+<script>
+(function() {
+  'use strict';
+
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const W = 800, H = 600;
+
+  // === T03: State machine ===
+  const STATE = { IDLE: 0, PLAYING: 1, PAUSED: 2, GAME_OVER: 3 };
+  let gameState = STATE.IDLE;
+  let ballAttached = true;
+
+  // === T04: Paddle ===
+  const PADDLE_W = 100, PADDLE_H = 14, PADDLE_Y = 560, PADDLE_SPEED = 500;
+  let paddleX = 350;
+  let useMouseX = false;
+  let mouseX = 400;
+
+  // === T06: Ball ===
+  const BALL_R = 8;
+  const BALL_INIT_SPEED = 350;
+  const BALL_SPEED_INC = 20;
+  const BALL_MAX_SPEED = 500;
+  let ballX, ballY, ballVX, ballVY, ballSpeed;
+
+  // === T05: Bricks ===
+  const BRICK_COLS = 10, BRICK_ROWS = 6;
+  const BRICK_W = 70, BRICK_H = 20;
+  const BRICK_HGAP = 6, BRICK_VGAP = 4;
+  const BRICK_OFFSET_X = 19, BRICK_OFFSET_Y = 50;
+  const ROW_COLORS = ['#FF0000', '#FF6600', '#FFCC00', '#00CC00', '#0088FF', '#8800FF'];
+  const ROW_POINTS = [7, 5, 4, 3, 2, 1];
+  let bricks = [];
+  let bricksAlive = 0;
+
+  // === T09/T10: Score, lives, level ===
+  let score = 0;
+  let lives = 3;
+  let level = 1;
+  let highScore = parseInt(localStorage.getItem('breakout_high_score') || '0', 10);
+
+  // === Audio ===
+  let audioCtx = null;
+  function getAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    return audioCtx;
+  }
+  function playTone(freq, dur, type) {
+    try {
+      const ac = getAudio();
+      const osc = ac.createOscillator();
+      const gain = ac.createGain();
+      osc.type = type || 'square';
+      osc.frequency.value = freq;
+      gain.gain.value = 0.06;
+      osc.connect(gain); gain.connect(ac.destination);
+      osc.start(ac.currentTime); osc.stop(ac.currentTime + dur);
+    } catch(_){}
+  }
+  function playPaddleHit() { playTone(440, 0.03, 'square'); }
+  function playBrickHit()  { playTone(660, 0.03, 'square'); }
+  function playLoseLife() {
+    try {
+      const ac = getAudio();
+      const osc = ac.createOscillator();
+      const gain = ac.createGain();
+      osc.type = 'square';
+      osc.frequency.setValueAtTime(440, ac.currentTime);
+      osc.frequency.linearRampToValueAtTime(110, ac.currentTime + 0.3);
+      gain.gain.value = 0.06;
+      osc.connect(gain); gain.connect(ac.destination);
+      osc.start(ac.currentTime); osc.stop(ac.currentTime + 0.3);
+    } catch(_){}
+  }
+  function playLevelClear() {
+    try {
+      const ac = getAudio();
+      [440, 550, 660, 880].forEach(function(f, i) {
+        const osc = ac.createOscillator();
+        const gain = ac.createGain();
+        osc.type = 'square'; osc.frequency.value = f;
+        gain.gain.value = 0.05;
+        osc.connect(gain); gain.connect(ac.destination);
+        osc.start(ac.currentTime + i * 0.1);
+        osc.stop(ac.currentTime + i * 0.1 + 0.1);
+      });
+    } catch(_){}
+  }
+
+  // === Input ===
+  const keys = {};
+  document.addEventListener('keydown', function(e) {
+    keys[e.key] = true;
+    if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown',' '].includes(e.key)) e.preventDefault();
+
+    if (e.key === 'Enter') {
+      if (gameState === STATE.IDLE || gameState === STATE.GAME_OVER) startGame();
+    }
+    if (e.key === 'p' || e.key === 'P') {
+      if (gameState === STATE.PLAYING) gameState = STATE.PAUSED;
+      else if (gameState === STATE.PAUSED) gameState = STATE.PLAYING;
+    }
+    if (e.key === ' ' && gameState === STATE.PLAYING && ballAttached) {
+      launchBall();
+    }
+  });
+  document.addEventListener('keyup', function(e) { keys[e.key] = false; });
+
+  canvas.addEventListener('mousemove', function(e) {
+    const rect = canvas.getBoundingClientRect();
+    mouseX = (e.clientX - rect.left) * (W / rect.width);
+    useMouseX = true;
+  });
+
+  // === Game setup ===
+  function initBricks() {
+    bricks = [];
+    bricksAlive = 0;
+    for (let r = 0; r < BRICK_ROWS; r++) {
+      for (let c = 0; c < BRICK_COLS; c++) {
+        bricks.push({
+          x: BRICK_OFFSET_X + c * (BRICK_W + BRICK_HGAP),
+          y: BRICK_OFFSET_Y + r * (BRICK_H + BRICK_VGAP),
+          w: BRICK_W,
+          h: BRICK_H,
+          row: r,
+          alive: true
+        });
+        bricksAlive++;
+      }
+    }
+  }
+
+  function resetBall() {
+    ballAttached = true;
+    ballSpeed = BALL_INIT_SPEED + BALL_SPEED_INC * (level - 1);
+    if (ballSpeed > BALL_MAX_SPEED) ballSpeed = BALL_MAX_SPEED;
+    ballVX = 0;
+    ballVY = 0;
+    ballX = paddleX + PADDLE_W / 2;
+    ballY = PADDLE_Y - BALL_R;
+  }
+
+  function launchBall() {
+    ballAttached = false;
+    // Random angle between 225° and 315° (upward hemisphere)
+    const angleDeg = 225 + Math.random() * 90;
+    const angle = angleDeg * Math.PI / 180;
+    ballVX = Math.cos(angle) * ballSpeed;
+    ballVY = Math.sin(angle) * ballSpeed;
+  }
+
+  function startGame() {
+    score = 0;
+    lives = 3;
+    level = 1;
+    paddleX = 350;
+    initBricks();
+    resetBall();
+    gameState = STATE.PLAYING;
+  }
+
+  function advanceLevel() {
+    level++;
+    initBricks();
+    resetBall();
+    playLevelClear();
+  }
+
+  function saveHighScore() {
+    if (score > highScore) {
+      highScore = score;
+      localStorage.setItem('breakout_high_score', highScore.toString());
+    }
+  }
+
+  // === T02: Game loop ===
+  let lastTime = 0;
+
+  function gameLoop(timestamp) {
+    const dt = Math.min((timestamp - lastTime) / 1000, 0.05);
+    lastTime = timestamp;
+
+    if (gameState === STATE.PLAYING) update(dt);
+    render();
+    requestAnimationFrame(gameLoop);
+  }
+
+  function update(dt) {
+    // === T04: Paddle movement ===
+    if (useMouseX) {
+      paddleX = mouseX - PADDLE_W / 2;
+      useMouseX = false; // reset each frame; keyboard overrides
+    }
+    if (keys['ArrowLeft'] || keys['a'] || keys['A']) paddleX -= PADDLE_SPEED * dt;
+    if (keys['ArrowRight'] || keys['d'] || keys['D']) paddleX += PADDLE_SPEED * dt;
+    paddleX = Math.max(0, Math.min(W - PADDLE_W, paddleX));
+
+    // === Ball attached ===
+    if (ballAttached) {
+      ballX = paddleX + PADDLE_W / 2;
+      ballY = PADDLE_Y - BALL_R;
+      return;
+    }
+
+    // === T06: Ball movement ===
+    ballX += ballVX * dt;
+    ballY += ballVY * dt;
+
+    // Wall bounces
+    if (ballX - BALL_R <= 0) {
+      ballX = BALL_R;
+      ballVX = Math.abs(ballVX);
+    }
+    if (ballX + BALL_R >= W) {
+      ballX = W - BALL_R;
+      ballVX = -Math.abs(ballVX);
+    }
+    if (ballY - BALL_R <= 0) {
+      ballY = BALL_R;
+      ballVY = Math.abs(ballVY);
+    }
+
+    // === T07: Paddle collision ===
+    if (ballVY > 0 &&
+        ballY + BALL_R >= PADDLE_Y &&
+        ballY + BALL_R <= PADDLE_Y + PADDLE_H + 10 &&
+        ballX >= paddleX - BALL_R &&
+        ballX <= paddleX + PADDLE_W + BALL_R) {
+      ballY = PADDLE_Y - BALL_R;
+      const offset = (ballX - (paddleX + PADDLE_W / 2)) / (PADDLE_W / 2);
+      const angle = offset * 60 * Math.PI / 180;
+      ballVX = Math.sin(angle) * ballSpeed;
+      ballVY = -Math.cos(angle) * ballSpeed;
+      playPaddleHit();
+    }
+
+    // === T08: Brick collision ===
+    let hitBrick = null;
+    for (let i = 0; i < bricks.length; i++) {
+      const b = bricks[i];
+      if (!b.alive) continue;
+
+      // Circle-AABB collision
+      const closestX = Math.max(b.x, Math.min(ballX, b.x + b.w));
+      const closestY = Math.max(b.y, Math.min(ballY, b.y + b.h));
+      const dx = ballX - closestX;
+      const dy = ballY - closestY;
+      if (dx * dx + dy * dy <= BALL_R * BALL_R) {
+        hitBrick = b;
+        break; // only first hit per frame
+      }
+    }
+
+    if (hitBrick) {
+      hitBrick.alive = false;
+      bricksAlive--;
+      score += ROW_POINTS[hitBrick.row];
+      playBrickHit();
+
+      // Determine reflection axis based on hit face
+      const bCX = hitBrick.x + hitBrick.w / 2;
+      const bCY = hitBrick.y + hitBrick.h / 2;
+      const relX = ballX - bCX;
+      const relY = ballY - bCY;
+      // Compare overlap ratios
+      const overlapX = (hitBrick.w / 2 + BALL_R) - Math.abs(relX);
+      const overlapY = (hitBrick.h / 2 + BALL_R) - Math.abs(relY);
+
+      if (overlapX < overlapY) {
+        ballVX = -ballVX;
+        ballX += (relX > 0 ? overlapX : -overlapX);
+      } else {
+        ballVY = -ballVY;
+        ballY += (relY > 0 ? overlapY : -overlapY);
+      }
+
+      // Check level clear
+      if (bricksAlive <= 0) {
+        advanceLevel();
+        return;
+      }
+    }
+
+    // === T10: Ball falls below paddle ===
+    if (ballY - BALL_R > H) {
+      lives--;
+      playLoseLife();
+      if (lives <= 0) {
+        gameState = STATE.GAME_OVER;
+        saveHighScore();
+      } else {
+        resetBall();
+      }
+    }
+  }
+
+  // === Rendering ===
+  function render() {
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, W, H);
+
+    if (gameState === STATE.IDLE) {
+      renderStartScreen();
+      return;
+    }
+
+    // T05: Bricks
+    for (let i = 0; i < bricks.length; i++) {
+      const b = bricks[i];
+      if (!b.alive) continue;
+      ctx.fillStyle = ROW_COLORS[b.row];
+      ctx.fillRect(b.x, b.y, b.w, b.h);
+    }
+
+    // T04: Paddle
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(paddleX, PADDLE_Y, PADDLE_W, PADDLE_H);
+
+    // T06: Ball
+    ctx.fillStyle = '#FFFFFF';
+    ctx.beginPath();
+    ctx.arc(ballX, ballY, BALL_R, 0, Math.PI * 2);
+    ctx.fill();
+
+    // === HUD ===
+    // T09: Score
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = '16px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText('Score: ' + score, 10, 24);
+
+    // High score
+    ctx.textAlign = 'right';
+    ctx.fillText('Best: ' + highScore, W - 10, 40);
+
+    // T10: Lives
+    ctx.fillStyle = '#FF0000';
+    ctx.font = '18px monospace';
+    ctx.textAlign = 'right';
+    let hearts = '';
+    for (let i = 0; i < lives; i++) hearts += '\u2665';
+    ctx.fillText(hearts, W - 10, 24);
+
+    // Level
+    ctx.fillStyle = '#AAAAAA';
+    ctx.font = '16px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('Level: ' + level, W / 2, 24);
+
+    // Ball attached hint
+    if (ballAttached && gameState === STATE.PLAYING) {
+      ctx.fillStyle = '#666666';
+      ctx.font = '14px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('Press Space to launch', W / 2, H / 2);
+    }
+
+    ctx.textAlign = 'left';
+
+    // === T03: Pause overlay ===
+    if (gameState === STATE.PAUSED) {
+      ctx.fillStyle = '#000000CC';
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = '36px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('PAUSED', W / 2, H / 2);
+      ctx.textAlign = 'left';
+    }
+
+    // === T11: Game Over ===
+    if (gameState === STATE.GAME_OVER) {
+      ctx.fillStyle = '#000000CC';
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = '40px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('GAME OVER', W / 2, H / 2 - 40);
+      ctx.font = '24px monospace';
+      ctx.fillText('Score: ' + score, W / 2, H / 2 + 10);
+      ctx.fillStyle = '#AAAAAA';
+      ctx.font = '18px monospace';
+      ctx.fillText('Press Enter to Restart', W / 2, H / 2 + 50);
+      ctx.textAlign = 'left';
+    }
+  }
+
+  // T11: Start screen
+  function renderStartScreen() {
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = '56px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('BREAKOUT', W / 2, 250);
+    ctx.fillStyle = '#AAAAAA';
+    ctx.font = '20px monospace';
+    ctx.fillText('Press Enter to Start', W / 2, 330);
+    ctx.textAlign = 'left';
+  }
+
+  // === Start ===
+  requestAnimationFrame(gameLoop);
+
+})();
+</script>
+</body>
+</html>

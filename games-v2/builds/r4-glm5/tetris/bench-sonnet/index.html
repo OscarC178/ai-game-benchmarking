@@ -1,0 +1,485 @@
+<!--
+  GAME:      Tetris
+  RUN:       r4-glm5
+  BUILDER:   anthropic/claude-sonnet-4.6
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Tetris</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#111; display:flex; align-items:center; justify-content:center; width:100vw; height:100vh; overflow:hidden; }
+canvas { display:block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+'use strict';
+
+// ---- Canvas ----
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const COLS=10, ROWS=20, CELL=30;
+const WELL_W=COLS*CELL, WELL_H=ROWS*CELL;
+const SIDE=160;
+const CW=WELL_W+SIDE, CH=WELL_H+40;
+canvas.width=CW; canvas.height=CH;
+
+function resize(){
+  const s=Math.min(window.innerWidth/CW, window.innerHeight/CH);
+  canvas.style.width=(CW*s)+'px'; canvas.style.height=(CH*s)+'px';
+}
+window.addEventListener('resize',resize); resize();
+
+const WX=0, WY=40; // well origin on canvas
+
+// ---- Piece definitions ----
+const PIECES={
+  I:{shape:[[0,0,0,0],[1,1,1,1],[0,0,0,0],[0,0,0,0]],color:'#00FFFF'},
+  O:{shape:[[0,0,0,0],[0,1,1,0],[0,1,1,0],[0,0,0,0]],color:'#FFFF00'},
+  T:{shape:[[0,0,0,0],[1,1,1,0],[0,1,0,0],[0,0,0,0]],color:'#AA00FF'},
+  S:{shape:[[0,0,0,0],[0,1,1,0],[1,1,0,0],[0,0,0,0]],color:'#00FF00'},
+  Z:{shape:[[0,0,0,0],[1,1,0,0],[0,1,1,0],[0,0,0,0]],color:'#FF0000'},
+  J:{shape:[[0,0,0,0],[1,0,0,0],[1,1,1,0],[0,0,0,0]],color:'#0000FF'},
+  L:{shape:[[0,0,0,0],[0,0,1,0],[1,1,1,0],[0,0,0,0]],color:'#FF8800'}
+};
+const PIECE_TYPES=['I','O','T','S','Z','J','L'];
+
+// SRS wall kicks for J,L,S,T,Z
+const KICKS={
+  '0>1':[[ 0,0],[-1,0],[-1, 1],[0,-2],[-1,-2]],
+  '1>0':[[ 0,0],[ 1,0],[ 1,-1],[0, 2],[ 1, 2]],
+  '1>2':[[ 0,0],[ 1,0],[ 1,-1],[0, 2],[ 1, 2]],
+  '2>1':[[ 0,0],[-1,0],[-1, 1],[0,-2],[-1,-2]],
+  '2>3':[[ 0,0],[ 1,0],[ 1, 1],[0,-2],[ 1,-2]],
+  '3>2':[[ 0,0],[-1,0],[-1,-1],[0, 2],[-1, 2]],
+  '3>0':[[ 0,0],[-1,0],[-1,-1],[0, 2],[-1, 2]],
+  '0>3':[[ 0,0],[ 1,0],[ 1, 1],[0,-2],[ 1,-2]]
+};
+const KICKS_I={
+  '0>1':[[ 0,0],[-2,0],[ 1,0],[-2,-1],[ 1, 2]],
+  '1>0':[[ 0,0],[ 2,0],[-1,0],[ 2, 1],[-1,-2]],
+  '1>2':[[ 0,0],[-1,0],[ 2,0],[-1, 2],[ 2,-1]],
+  '2>1':[[ 0,0],[ 1,0],[-2,0],[ 1,-2],[-2, 1]],
+  '2>3':[[ 0,0],[ 2,0],[-1,0],[ 2, 1],[-1,-2]],
+  '3>2':[[ 0,0],[-2,0],[ 1,0],[-2,-1],[ 1, 2]],
+  '3>0':[[ 0,0],[ 1,0],[-2,0],[ 1,-2],[-2, 1]],
+  '0>3':[[ 0,0],[-1,0],[ 2,0],[-1, 2],[ 2,-1]]
+};
+
+// ---- State ----
+const ST={TITLE:0,PLAYING:1,PAUSED:2,GAMEOVER:3};
+let state=ST.TITLE;
+let grid,bag,current,next,held,canHold;
+let score,level,lines,hiScore;
+hiScore=parseInt(localStorage.getItem('tet4_hi')||'0');
+let dropTimer=0,dropInterval=800;
+let lockTimer=0, lockDelay=500, lockActive=false;
+let clearAnim=[], clearAnimTimer=0;
+let dasTimer=0,arrTimer=0,dasActive=false;
+const DAS=170,ARR=50;
+
+// ---- Audio ----
+let AC=null;
+function initAC(){ if(AC)return; try{ AC=new(window.AudioContext||window.webkitAudioContext)(); }catch(e){} }
+function beep(freq,dur,type,gain){
+  if(!AC)return;
+  try{
+    const o=AC.createOscillator(),g=AC.createGain();
+    o.connect(g); g.connect(AC.destination);
+    o.type=type||'square'; o.frequency.value=freq;
+    g.gain.setValueAtTime(gain||0.1,AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001,AC.currentTime+dur);
+    o.start(); o.stop(AC.currentTime+dur+0.02);
+  }catch(e){}
+}
+
+// ---- Input ----
+const keys={}, wasDown={};
+window.addEventListener('keydown',e=>{
+  const k=e.key;
+  if(['ArrowLeft','ArrowRight','ArrowDown','ArrowUp',' '].includes(k)) e.preventDefault();
+  if(!keys[k]) wasDown[k]=true;
+  keys[k]=true;
+  initAC();
+  if(state===ST.TITLE&&(k===' '||k==='Enter')){ startGame(); return; }
+  if(k==='r'||k==='R'){ if(state!==ST.TITLE){ startGame(); return; } }
+  if(k==='Escape'||k==='p'||k==='P'){
+    if(state===ST.PLAYING) state=ST.PAUSED;
+    else if(state===ST.PAUSED) state=ST.PLAYING;
+    else if(state===ST.GAMEOVER) state=ST.TITLE;
+  }
+});
+window.addEventListener('keyup',e=>{ keys[e.key]=false; });
+window.addEventListener('blur',()=>{ for(const k in keys) keys[k]=false; });
+function consume(k){ const v=wasDown[k]; wasDown[k]=false; return v; }
+
+// ---- Bag randomizer ----
+function refillBag(){ bag=['I','O','T','S','Z','J','L'].sort(()=>Math.random()-0.5); }
+function nextFromBag(){ if(!bag||bag.length===0) refillBag(); return bag.pop(); }
+
+function makePiece(type){
+  const p=PIECES[type];
+  return { type, shape:p.shape.map(r=>[...r]), color:p.color, x:3, y:0, rot:0 };
+}
+
+// ---- Game init ----
+function startGame(){
+  grid=Array.from({length:ROWS},()=>Array(COLS).fill(null));
+  bag=[]; refillBag();
+  next=nextFromBag();
+  held=null; canHold=true;
+  score=0; level=1; lines=0;
+  dropInterval=800; dropTimer=0;
+  lockTimer=0; lockActive=false; clearAnim=[]; clearAnimTimer=0;
+  current=spawnPiece();
+  state=ST.PLAYING;
+}
+
+function spawnPiece(){
+  const type=next;
+  next=nextFromBag();
+  const p=makePiece(type);
+  if(!valid(p,0,0)){ endGame(); return p; }
+  return p;
+}
+
+function endGame(){
+  if(score>hiScore){ hiScore=score; localStorage.setItem('tet4_hi',hiScore); }
+  state=ST.GAMEOVER;
+  beep(100,0.5,'sawtooth',0.2);
+}
+
+// ---- Rotation ----
+function rotateCW(shape){
+  const n=shape.length, r=[];
+  for(let i=0;i<n;i++){ r[i]=[]; for(let j=0;j<n;j++) r[i][j]=shape[n-1-j][i]; }
+  return r;
+}
+function rotateCCW(shape){
+  const n=shape.length, r=[];
+  for(let i=0;i<n;i++){ r[i]=[]; for(let j=0;j<n;j++) r[i][j]=shape[j][n-1-i]; }
+  return r;
+}
+
+// ---- Collision ----
+function valid(p, ox, oy){
+  for(let y=0;y<4;y++) for(let x=0;x<4;x++){
+    if(!p.shape[y][x]) continue;
+    const gx=p.x+x+ox, gy=p.y+y+oy;
+    if(gx<0||gx>=COLS||gy>=ROWS) return false;
+    if(gy>=0&&grid[gy][gx]) return false;
+  }
+  return true;
+}
+
+function tryRotate(cw){
+  const newShape=cw?rotateCW(current.shape):rotateCCW(current.shape);
+  const newRot=(cw?(current.rot+1):(current.rot+3))%4;
+  const key=current.rot+'>'+newRot;
+  const table=current.type==='I'?KICKS_I:(current.type==='O'?null:KICKS);
+  const offsets=(table&&table[key])||[[0,0]];
+  for(const [ox,oy] of offsets){
+    const test={...current,shape:newShape,rot:newRot,x:current.x+ox,y:current.y-oy};
+    if(valid(test,0,0)){ Object.assign(current,test); lockActive=false; lockTimer=0; beep(300,0.04,'square',0.06); return; }
+  }
+}
+
+// ---- Ghost piece ----
+function ghostY(){
+  let gy=0;
+  while(valid(current,0,gy+1)) gy++;
+  return gy;
+}
+
+// ---- Lock & clear ----
+function lockCurrent(){
+  for(let y=0;y<4;y++) for(let x=0;x<4;x++){
+    if(!current.shape[y][x]) continue;
+    const gy=current.y+y, gx=current.x+x;
+    if(gy>=0) grid[gy][gx]=current.color;
+  }
+  beep(220,0.08,'square',0.12);
+  checkLines();
+  canHold=true;
+  lockActive=false; lockTimer=0;
+  current=spawnPiece();
+  dropTimer=0;
+}
+
+function checkLines(){
+  const full=[];
+  for(let y=0;y<ROWS;y++) if(grid[y].every(c=>c!==null)) full.push(y);
+  if(full.length===0) return;
+  clearAnim=full; clearAnimTimer=200;
+  setTimeout(()=>{
+    for(let i=clearAnim.length-1;i>=0;i--){
+      grid.splice(clearAnim[i],1);
+      grid.unshift(Array(COLS).fill(null));
+    }
+    const n=clearAnim.length;
+    lines+=n;
+    const pts=[0,100,300,500,800][n]*(level||1);
+    score+=pts;
+    if(score>hiScore){ hiScore=score; localStorage.setItem('tet4_hi',hiScore); }
+    level=Math.floor(lines/10)+1;
+    dropInterval=Math.max(50,800-((level-1)*70));
+    clearAnim=[];
+    beep(660,0.12,'sine',0.15);
+  },200);
+}
+
+// ---- Hold ----
+function doHold(){
+  if(!canHold) return;
+  canHold=false;
+  if(!held){ held=current.type; current=spawnPiece(); }
+  else { const t=held; held=current.type; current=makePiece(t); }
+  if(!valid(current,0,0)) endGame();
+  dropTimer=0; lockActive=false; lockTimer=0;
+  beep(440,0.05,'sine',0.08);
+}
+
+// ---- Hard drop ----
+function hardDrop(){
+  let d=0;
+  while(valid(current,0,1)){ current.y++; d++; }
+  score+=d*2;
+  lockCurrent();
+}
+
+// ---- Update ----
+let lastTime=performance.now();
+function update(now){
+  if(state!==ST.PLAYING){ lastTime=now; return; }
+  const dt=Math.min(now-lastTime,100);
+  lastTime=now;
+
+  if(clearAnim.length>0) return; // wait for clear animation
+
+  // Rotation
+  if(consume('ArrowUp')||consume('x')||consume('X')) tryRotate(true);
+  if(consume('z')||consume('Z')||consume('Control')) tryRotate(false);
+
+  // Hold
+  if(consume('c')||consume('C')||consume('Shift')) doHold();
+
+  // Hard drop
+  if(consume(' ')){ hardDrop(); return; }
+
+  // DAS/ARR left/right
+  const leftHeld=keys['ArrowLeft']||keys['a']||keys['A'];
+  const rightHeld=keys['ArrowRight']||keys['d']||keys['D'];
+  const anyHoriz=leftHeld||rightHeld;
+  const dir=leftHeld?-1:1;
+
+  if(consume('ArrowLeft')||consume('a')||consume('A')){
+    if(valid(current,-1,0)){ current.x--; lockTimer=0; } beep(200,0.03,'square',0.05);
+    dasTimer=0; dasActive=false;
+  }
+  if(consume('ArrowRight')||consume('d')||consume('D')){
+    if(valid(current,1,0)){ current.x++; lockTimer=0; } beep(200,0.03,'square',0.05);
+    dasTimer=0; dasActive=false;
+  }
+
+  if(anyHoriz){
+    dasTimer+=dt;
+    if(!dasActive&&dasTimer>=DAS){ dasActive=true; arrTimer=ARR; }
+    if(dasActive){ arrTimer-=dt; if(arrTimer<=0){ arrTimer=ARR; if(valid(current,dir,0)){ current.x+=dir; lockTimer=0; } } }
+  } else { dasTimer=0; dasActive=false; }
+
+  // Soft drop
+  const softDrop=keys['ArrowDown']||keys['s']||keys['S'];
+  const effectiveInterval=softDrop?Math.max(50,dropInterval/20):dropInterval;
+
+  dropTimer+=dt;
+  if(dropTimer>=effectiveInterval){
+    dropTimer=0;
+    if(valid(current,0,1)){ current.y++; if(softDrop) score+=1; lockActive=false; lockTimer=0; }
+    else { lockActive=true; }
+  }
+
+  // Lock delay
+  if(lockActive){
+    lockTimer+=dt;
+    if(lockTimer>=lockDelay) lockCurrent();
+  } else {
+    if(!valid(current,0,1)) lockActive=true;
+  }
+}
+
+// ---- Draw helpers ----
+function drawCell(x,y,color,alpha){
+  if(alpha!==undefined) ctx.globalAlpha=alpha;
+  ctx.fillStyle=color;
+  ctx.fillRect(WX+x*CELL+1,WY+y*CELL+1,CELL-2,CELL-2);
+  ctx.globalAlpha=1;
+  // Highlight
+  ctx.fillStyle='rgba(255,255,255,0.25)';
+  ctx.fillRect(WX+x*CELL+1,WY+y*CELL+1,CELL-2,5);
+}
+
+function drawPieceAt(shape,color,px,py,ghost){
+  for(let y=0;y<4;y++) for(let x=0;x<4;x++){
+    if(!shape[y][x]) continue;
+    const gx=px+x, gy=py+y;
+    if(gy<0) continue;
+    if(ghost){
+      ctx.strokeStyle=color; ctx.lineWidth=1;
+      ctx.strokeRect(WX+gx*CELL+2,WY+gy*CELL+2,CELL-4,CELL-4);
+      ctx.globalAlpha=0.2; ctx.fillStyle=color;
+      ctx.fillRect(WX+gx*CELL+2,WY+gy*CELL+2,CELL-4,CELL-4);
+      ctx.globalAlpha=1;
+    } else {
+      drawCell(gx,gy,color);
+    }
+  }
+}
+
+function drawMiniPiece(shape,color,cx,cy){
+  const mc=14;
+  // Find bounding box
+  let minR=4,maxR=-1,minC=4,maxC=-1;
+  for(let y=0;y<4;y++) for(let x=0;x<4;x++) if(shape[y][x]){ minR=Math.min(minR,y);maxR=Math.max(maxR,y);minC=Math.min(minC,x);maxC=Math.max(maxC,x); }
+  const pw=(maxC-minC+1)*mc, ph=(maxR-minR+1)*mc;
+  const ox=cx-pw/2, oy=cy-ph/2;
+  for(let y=minR;y<=maxR;y++) for(let x=minC;x<=maxC;x++){
+    if(!shape[y][x]) continue;
+    ctx.fillStyle=color;
+    ctx.fillRect(ox+(x-minC)*mc+1,oy+(y-minR)*mc+1,mc-2,mc-2);
+    ctx.fillStyle='rgba(255,255,255,0.25)';
+    ctx.fillRect(ox+(x-minC)*mc+1,oy+(y-minR)*mc+1,mc-2,4);
+  }
+}
+
+// ---- Render ----
+function render(){
+  ctx.fillStyle='#111'; ctx.fillRect(0,0,CW,CH);
+
+  if(state===ST.TITLE){
+    ctx.fillStyle='#00FFFF'; ctx.font='bold 52px monospace'; ctx.textAlign='center';
+    ctx.fillText('TETRIS',CW/2,120);
+    ctx.fillStyle='#fff'; ctx.font='18px monospace';
+    ctx.fillText('Press SPACE to start',CW/2,200);
+    ctx.fillStyle='#888'; ctx.font='13px monospace';
+    ['← → / A D : Move','↓ / S : Soft drop','↑ / X : Rotate CW','Z / Ctrl : Rotate CCW','Space : Hard drop','C / Shift : Hold','P / Esc : Pause'].forEach((t,i)=>{
+      ctx.fillText(t,CW/2,260+i*22);
+    });
+    ctx.fillStyle='#ffff00'; ctx.font='15px monospace';
+    ctx.fillText('Best: '+hiScore,CW/2,430);
+    return;
+  }
+
+  // Well border
+  ctx.strokeStyle='#333'; ctx.lineWidth=2;
+  ctx.strokeRect(WX-1,WY-1,WELL_W+2,WELL_H+2);
+
+  // Grid lines
+  ctx.strokeStyle='#1a1a1a'; ctx.lineWidth=1;
+  for(let x=0;x<=COLS;x++){ ctx.beginPath(); ctx.moveTo(WX+x*CELL,WY); ctx.lineTo(WX+x*CELL,WY+WELL_H); ctx.stroke(); }
+  for(let y=0;y<=ROWS;y++){ ctx.beginPath(); ctx.moveTo(WX,WY+y*CELL); ctx.lineTo(WX+WELL_W,WY+y*CELL); ctx.stroke(); }
+
+  // Stack
+  for(let y=0;y<ROWS;y++) for(let x=0;x<COLS;x++){
+    if(grid[y][x]){
+      if(clearAnim.includes(y)){
+        const t=(clearAnimTimer||0)/200;
+        ctx.globalAlpha=Math.sin(t*Math.PI)*0.5+0.5;
+        drawCell(x,y,'#fff');
+        ctx.globalAlpha=1;
+      } else { drawCell(x,y,grid[y][x]); }
+    }
+  }
+
+  // Ghost
+  if(current&&clearAnim.length===0){
+    const gy=ghostY();
+    if(gy>0) drawPieceAt(current.shape,current.color,current.x,current.y+gy,true);
+    // Current piece
+    drawPieceAt(current.shape,current.color,current.x,current.y,false);
+  }
+
+  // Sidebar
+  const sx=WX+WELL_W+12;
+  ctx.fillStyle='#fff'; ctx.font='bold 13px monospace'; ctx.textAlign='left';
+
+  // Score
+  ctx.fillStyle='#888'; ctx.fillText('SCORE',sx,WY+20);
+  ctx.fillStyle='#fff'; ctx.font='bold 16px monospace';
+  ctx.fillText(score,sx,WY+40);
+
+  ctx.fillStyle='#888'; ctx.font='bold 13px monospace';
+  ctx.fillText('LEVEL',sx,WY+70);
+  ctx.fillStyle='#fff'; ctx.font='bold 16px monospace';
+  ctx.fillText(level,sx,WY+90);
+
+  ctx.fillStyle='#888'; ctx.font='bold 13px monospace';
+  ctx.fillText('LINES',sx,WY+120);
+  ctx.fillStyle='#fff'; ctx.font='bold 16px monospace';
+  ctx.fillText(lines,sx,WY+140);
+
+  ctx.fillStyle='#888'; ctx.font='bold 13px monospace';
+  ctx.fillText('BEST',sx,WY+170);
+  ctx.fillStyle='#ffff00'; ctx.font='bold 14px monospace';
+  ctx.fillText(hiScore,sx,WY+190);
+
+  // Next
+  ctx.fillStyle='#888'; ctx.font='bold 13px monospace';
+  ctx.fillText('NEXT',sx,WY+225);
+  if(next){
+    const np=PIECES[next];
+    ctx.fillStyle='#1a1a1a'; ctx.fillRect(sx-2,WY+232,SIDE-10,62);
+    drawMiniPiece(np.shape,np.color,sx+SIDE/2-14,WY+264);
+  }
+
+  // Hold
+  ctx.fillStyle='#888'; ctx.font='bold 13px monospace';
+  ctx.fillText('HOLD',sx,WY+315);
+  if(held){
+    const hp=PIECES[held];
+    ctx.fillStyle='#1a1a1a'; ctx.fillRect(sx-2,WY+322,SIDE-10,62);
+    ctx.globalAlpha=canHold?1:0.4;
+    drawMiniPiece(hp.shape,hp.color,sx+SIDE/2-14,WY+354);
+    ctx.globalAlpha=1;
+  }
+
+  // HUD top
+  ctx.fillStyle='#444'; ctx.font='13px monospace'; ctx.textAlign='center';
+  ctx.fillText('TETRIS',CW/2,20);
+
+  if(state===ST.PAUSED){
+    ctx.fillStyle='rgba(0,0,0,0.7)'; ctx.fillRect(0,0,CW,CH);
+    ctx.fillStyle='#fff'; ctx.font='bold 40px monospace'; ctx.textAlign='center';
+    ctx.fillText('PAUSED',CW/2,CH/2-20);
+    ctx.font='16px monospace'; ctx.fillStyle='#aaa';
+    ctx.fillText('P to resume  |  R to restart',CW/2,CH/2+25);
+  }
+
+  if(state===ST.GAMEOVER){
+    ctx.fillStyle='rgba(0,0,0,0.8)'; ctx.fillRect(0,0,CW,CH);
+    ctx.fillStyle='#FF4444'; ctx.font='bold 44px monospace'; ctx.textAlign='center';
+    ctx.fillText('GAME OVER',CW/2,CH/2-70);
+    ctx.fillStyle='#fff'; ctx.font='20px monospace';
+    ctx.fillText('Score: '+score,CW/2,CH/2-20);
+    ctx.fillText('Level: '+level+'  Lines: '+lines,CW/2,CH/2+15);
+    ctx.fillStyle='#aaa'; ctx.font='16px monospace';
+    ctx.fillText('R to play again  |  ESC for title',CW/2,CH/2+60);
+  }
+}
+
+// ---- Loop ----
+function loop(now){
+  requestAnimationFrame(loop);
+  update(now);
+  render();
+}
+requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,546 @@
+<!-- snake | spec:run8-gpt-mini-nano | built-by:gpt-5.4-nano -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+  <title>Snake</title>
+  <style>
+    html, body { margin: 0; padding: 0; background:#111; height:100%; overflow:hidden; }
+    canvas { display:block; margin:0 auto; background:#111111; image-rendering: pixelated; }
+  </style>
+</head>
+<body>
+  <canvas id="c" width="600" height="600" aria-label="Snake game"></canvas>
+
+  <script>
+    (() => {
+      const canvas = document.getElementById('c');
+      const ctx = canvas.getContext('2d');
+
+      const W = canvas.width, H = canvas.height;
+      const GRID = 20;
+      const cell = Math.floor(Math.min(W, H) / GRID); // 30px
+      const gridPx = cell * GRID; // 600
+
+      const COLORS = {
+        bg: '#111111',
+        grid: '#1A1A1A',
+        head: '#4CAF50',
+        body: '#2E7D32',
+        food: '#F44336',
+        ui: '#FFFFFF'
+      };
+
+      // Game constants from spec
+      const HEAD_INSET = (cell - 28) / 2; // 1px inset in 30x30 cell
+      const SEG_SIZE = 28;
+
+      const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+      const sameCell = (a, b) => a.x === b.x && a.y === b.y;
+
+      // Audio (optional/bonus) with WebAudio
+      let audioCtx = null;
+      function ensureAudio() {
+        if (!audioCtx) {
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (audioCtx.state === 'suspended') audioCtx.resume?.();
+      }
+      function beepEat() {
+        try {
+          ensureAudio();
+          const t0 = audioCtx.currentTime;
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(900, t0);
+          gain.gain.setValueAtTime(0.0001, t0);
+          gain.gain.exponentialRampToValueAtTime(0.25, t0 + 0.01);
+          gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.04);
+          osc.connect(gain).connect(audioCtx.destination);
+          osc.start(t0);
+          osc.stop(t0 + 0.05);
+        } catch {}
+      }
+      function beepDeath() {
+        try {
+          ensureAudio();
+          const t0 = audioCtx.currentTime;
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = 'sawtooth';
+          osc.frequency.setValueAtTime(440, t0);
+          osc.frequency.exponentialRampToValueAtTime(120, t0 + 0.28);
+          gain.gain.setValueAtTime(0.0001, t0);
+          gain.gain.exponentialRampToValueAtTime(0.22, t0 + 0.01);
+          gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.28);
+          osc.connect(gain).connect(audioCtx.destination);
+          osc.start(t0);
+          osc.stop(t0 + 0.29);
+        } catch {}
+      }
+
+      // State machine
+      const State = Object.freeze({
+        IDLE: 'IDLE',
+        PLAYING: 'PLAYING',
+        PAUSED: 'PAUSED',
+        GAME_OVER: 'GAME_OVER'
+      });
+
+      const stateLog = true;
+
+      let gameState = State.IDLE;
+      function setState(s) {
+        if (gameState !== s) {
+          gameState = s;
+          if (stateLog) console.log('[snake] state ->', s);
+        }
+      }
+
+      // Direction handling
+      const Dir = Object.freeze({ Up:0, Right:1, Down:2, Left:3 });
+      const dirVec = (d) => {
+        switch(d) {
+          case Dir.Up: return {x:0,y:-1};
+          case Dir.Right: return {x:1,y:0};
+          case Dir.Down: return {x:0,y:1};
+          case Dir.Left: return {x:-1,y:0};
+        }
+      };
+      function opposite(a,b) {
+        return (a === Dir.Up && b === Dir.Down) ||
+               (a === Dir.Down && b === Dir.Up) ||
+               (a === Dir.Left && b === Dir.Right) ||
+               (a === Dir.Right && b === Dir.Left);
+      }
+
+      // Game variables
+      let snake = [];
+      let head = {x:10, y:10};
+      let dir = Dir.Right;
+      let nextDirBuffered = null;     // queued direction (one per tick)
+      let hasQueuedTurn = false;
+
+      let food = {x:0, y:0};
+
+      let score = 0;
+      let highScore = 0;
+      let lives = 1; // Spec says not applicable, but checklist says decrement; we implement single life.
+      let speedTicksPerSec = 8;
+
+      // Movement tick scheduler
+      let lastTs = 0;
+      let accMs = 0;
+      let tickIntervalMs = 1000 / speedTicksPerSec;
+
+      // Freeze on full board completion
+      let frozenWin = false;
+
+      const STORAGE_KEY = 'snake_highscore_v1';
+
+      function loadHighScore() {
+        const v = parseInt(localStorage.getItem(STORAGE_KEY) || '0', 10);
+        highScore = Number.isFinite(v) ? v : 0;
+      }
+      function saveHighScore() {
+        localStorage.setItem(STORAGE_KEY, String(highScore));
+      }
+
+      function resetGame() {
+        loadHighScore();
+        score = 0;
+        lives = 1;
+        speedTicksPerSec = 8;
+        tickIntervalMs = 1000 / speedTicksPerSec;
+        frozenWin = false;
+
+        dir = Dir.Right;
+        nextDirBuffered = null;
+        hasQueuedTurn = false;
+
+        head = {x:10, y:10};
+        snake = [
+          {x:10, y:10}, // head at index 0 for easier collision; we will keep invariant: snake[0] head
+          {x:9, y:10},
+          {x:8, y:10}
+        ];
+        // As per spec: segments at (9,10) and (8,10); head at (10,10)
+        // We include only those 3 segments (length 3), matching the spec.
+
+        // Spawn food not on snake
+        spawnFood();
+      }
+
+      function isFreeCell(x,y) {
+        for (let i=0; i<snake.length; i++) {
+          if (snake[i].x === x && snake[i].y === y) return false;
+        }
+        return true;
+      }
+
+      function spawnFood() {
+        // If board full, freeze completion
+        if (snake.length >= GRID*GRID) {
+          food = {x:-1,y:-1};
+          frozenWin = true;
+          return;
+        }
+        // Try random attempts with fallback scan to avoid infinite loop
+        for (let tries=0; tries<2000; tries++) {
+          const x = (Math.random()*GRID)|0;
+          const y = (Math.random()*GRID)|0;
+          if (isFreeCell(x,y)) {
+            food = {x,y};
+            return;
+          }
+        }
+        // Fallback scan
+        for (let y=0; y<GRID; y++) {
+          for (let x=0; x<GRID; x++) {
+            if (isFreeCell(x,y)) {
+              food = {x,y};
+              return;
+            }
+          }
+        }
+        food = {x:-1,y:-1};
+      }
+
+      function queueDirection(d) {
+        if (gameState !== State.PLAYING) return;
+        // Only one queued direction change per tick window:
+        // - If already queued, ignore further inputs until a tick consumes it.
+        if (hasQueuedTurn) return;
+        // Prevent direct reversal into the neck segment
+        if (opposite(dir, d)) return;
+        nextDirBuffered = d;
+        hasQueuedTurn = true;
+      }
+
+      function applyQueuedTurnIfAny() {
+        if (hasQueuedTurn && nextDirBuffered != null) {
+          dir = nextDirBuffered;
+          nextDirBuffered = null;
+          hasQueuedTurn = false;
+        }
+      }
+
+      function endRun(reason) {
+        // Collisions end run; board full ends by freezing
+        if (gameState === State.GAME_OVER) return;
+        if (frozenWin) return;
+
+        lives = Math.max(0, lives - 1);
+        if (lives <= 0) {
+          setState(State.GAME_OVER);
+          if (score > highScore) {
+            highScore = score;
+            saveHighScore();
+          }
+          beepDeath();
+        } else {
+          // Not really used (single life), but keep behavior robust.
+          setState(State.GAME_OVER);
+          if (score > highScore) {
+            highScore = score;
+            saveHighScore();
+          }
+          beepDeath();
+        }
+
+        console.log('[snake] game over:', reason, 'score=', score);
+      }
+
+      function tickMove() {
+        if (gameState !== State.PLAYING) return;
+        if (frozenWin) return;
+
+        // Apply turn once per tick window
+        applyQueuedTurnIfAny();
+
+        const v = dirVec(dir);
+        const newHead = { x: snake[0].x + v.x, y: snake[0].y + v.y };
+
+        // Wall collision using grid-cell comparisons
+        if (newHead.x < 0 || newHead.x >= GRID || newHead.y < 0 || newHead.y >= GRID) {
+          endRun('wall');
+          return;
+        }
+
+        // Self collision: check against current body including head? spec says head ↔ body triggers on same grid cell.
+        // Since newHead is not yet in snake, compare with existing segments excluding the head segment position.
+        for (let i=1; i<snake.length; i++) {
+          if (snake[i].x === newHead.x && snake[i].y === newHead.y) {
+            endRun('self');
+            return;
+          }
+        }
+
+        // Move forward: determine if eating
+        const willEat = (food && food.x === newHead.x && food.y === newHead.y);
+
+        snake.unshift(newHead); // new head at front
+        if (willEat) {
+          // Grow: keep tail (do not pop)
+          score += 10;
+          beepEat();
+
+          // Speed escalation by 0.5 ticks/s up to 15 ticks/s
+          speedTicksPerSec = clamp(speedTicksPerSec + 0.5, 0, 15);
+          tickIntervalMs = 1000 / speedTicksPerSec;
+
+          spawnFood();
+          // If board full freeze play as completed run
+          if (frozenWin) {
+            // Completed run: keep PLAYING state but stop movement by freezing through frozenWin
+            console.log('[snake] board completed. score=', score);
+            if (score > highScore) {
+              highScore = score;
+              saveHighScore();
+            }
+          }
+        } else {
+          // Normal move: remove tail
+          snake.pop();
+        }
+
+        // Consuming food should have ensured food isn't on snake; if frozenWin true, food may be {-1,-1}
+      }
+
+      function drawCellRect(x,y,size,color, insetPx=0) {
+        ctx.fillStyle = color;
+        ctx.fillRect(x*cell + insetPx, y*cell + insetPx, size, size);
+      }
+
+      function drawGrid() {
+        ctx.save();
+        ctx.strokeStyle = COLORS.grid;
+        ctx.lineWidth = 1;
+
+        // 20x20 cells => draw lattice lines at cell boundaries
+        // Use integer coordinates for crisp lines
+        for (let i=0; i<=GRID; i++) {
+          const p = i*cell;
+          ctx.beginPath();
+          ctx.moveTo(p, 0);
+          ctx.lineTo(p, gridPx);
+          ctx.stroke();
+
+          ctx.beginPath();
+          ctx.moveTo(0, p);
+          ctx.lineTo(gridPx, p);
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
+
+      function drawScore() {
+        ctx.save();
+        ctx.fillStyle = COLORS.ui;
+        ctx.font = '16px monospace';
+        ctx.textBaseline = 'top';
+        ctx.textAlign = 'left';
+        ctx.fillText(`SCORE ${score}`, 12, 8);
+
+        ctx.textAlign = 'right';
+        // Spec says lives/health not applicable, but checklist requires it; show lives anyway.
+        ctx.fillText(`HI ${highScore}  ❤ ${lives}`, W-12, 8);
+        ctx.restore();
+      }
+
+      function drawSnake() {
+        // Body segments
+        for (let i=1; i<snake.length; i++) {
+          drawCellRect(snake[i].x, snake[i].y, cell, COLORS.body, HEAD_INSET);
+          // If insetPx uses 1, size should be 28 and cell 30.
+          // We passed size=cell which would draw 30; fix below.
+        }
+        // Correct: draw body with 28 size inset
+        for (let i=1; i<snake.length; i++) {
+          ctx.fillStyle = COLORS.body;
+          ctx.fillRect(snake[i].x*cell + HEAD_INSET, snake[i].y*cell + HEAD_INSET, SEG_SIZE, SEG_SIZE);
+        }
+
+        // Head with different color and exact 28 inset
+        ctx.fillStyle = COLORS.head;
+        ctx.fillRect(snake[0].x*cell + HEAD_INSET, snake[0].y*cell + HEAD_INSET, SEG_SIZE, SEG_SIZE);
+      }
+
+      function drawFood() {
+        if (!food || frozenWin) return;
+        ctx.fillStyle = COLORS.food;
+        ctx.fillRect(food.x*cell + HEAD_INSET, food.y*cell + HEAD_INSET, SEG_SIZE, SEG_SIZE);
+      }
+
+      function drawCenteredText(lines, topY, fontSize, color='#4CAF50') {
+        ctx.save();
+        ctx.fillStyle = color;
+        ctx.font = `${fontSize}px monospace`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        let y = topY;
+        for (const line of lines) {
+          ctx.fillText(line, W/2, y);
+          y += fontSize + 8;
+        }
+        ctx.restore();
+      }
+
+      function drawStartScreen() {
+        // Spec: title at y=236 in 56px #4CAF50 monospace, "Press Enter to Start" at y=320
+        ctx.save();
+        ctx.fillStyle = '#4CAF50';
+        ctx.font = '56px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        ctx.fillText('SNAKE', W/2, 236);
+
+        ctx.font = '24px monospace';
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillText('Press Enter to Start', W/2, 320);
+        ctx.restore();
+      }
+
+      function drawPauseOverlay() {
+        ctx.save();
+        ctx.fillStyle = 'rgba(0,0,0,0.45)';
+        ctx.fillRect(0,0,W,H);
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '28px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('PAUSED', W/2, H/2 - 10);
+        ctx.font = '16px monospace';
+        ctx.fillText('Press P to unpause', W/2, H/2 + 22);
+        ctx.restore();
+      }
+
+      function drawGameOverScreen() {
+        // Center overlay with “GAME OVER”, score, “Press Enter to restart”
+        ctx.save();
+        ctx.fillStyle = 'rgba(0,0,0,0.55)';
+        ctx.fillRect(0,0,W,H);
+
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '56px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('GAME OVER', W/2, H/2 - 54);
+
+        ctx.font = '20px monospace';
+        ctx.fillText(`Score: ${score}`, W/2, H/2 - 10);
+
+        ctx.font = '16px monospace';
+        ctx.fillText('Press Enter to restart', W/2, H/2 + 24);
+        ctx.restore();
+      }
+
+      function drawFrame(ts) {
+        // Clear background
+        ctx.fillStyle = COLORS.bg;
+        ctx.fillRect(0,0,W,H);
+
+        // Always draw lattice for clarity
+        drawGrid();
+        drawScore();
+
+        if (gameState === State.IDLE) {
+          // Show snake/food faintly? Spec says start screen only; keep minimal.
+          drawStartScreen();
+          return;
+        }
+
+        // draw active play elements
+        drawFood();
+        drawSnake();
+
+        if (gameState === State.PAUSED) {
+          drawPauseOverlay();
+        } else if (gameState === State.GAME_OVER) {
+          drawGameOverScreen();
+        } else {
+          // Completed board: freeze play as completed run (still render snake/food none).
+          if (frozenWin) {
+            ctx.save();
+            ctx.fillStyle = 'rgba(0,0,0,0.55)';
+            ctx.fillRect(0,0,W,H);
+            ctx.fillStyle = '#FFFFFF';
+            ctx.font = '30px monospace';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText('COMPLETED!', W/2, H/2 - 8);
+            ctx.font = '16px monospace';
+            ctx.fillText('Press Enter to restart', W/2, H/2 + 24);
+            ctx.restore();
+          }
+        }
+      }
+
+      // Input
+      window.addEventListener('keydown', (e) => {
+        const k = e.key;
+        // Prevent scrolling on arrows/space
+        if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(k)) e.preventDefault();
+
+        if (k === 'Enter') {
+          // Start/Restart
+          if (gameState === State.IDLE || gameState === State.GAME_OVER || frozenWin) {
+            resetGame();
+            setState(State.PLAYING);
+            // Reset movement accumulator to avoid immediate double-step
+            accMs = 0;
+            lastTs = performance.now();
+          }
+          return;
+        }
+        if (k === 'p' || k === 'P') {
+          if (gameState === State.PLAYING) setState(State.PAUSED);
+          else if (gameState === State.PAUSED) setState(State.PLAYING);
+          return;
+        }
+
+        // Direction keys
+        if (gameState === State.PLAYING) {
+          if (k === 'ArrowUp' || k === 'w' || k === 'W') queueDirection(Dir.Up);
+          else if (k === 'ArrowDown' || k === 's' || k === 'S') queueDirection(Dir.Down);
+          else if (k === 'ArrowLeft' || k === 'a' || k === 'A') queueDirection(Dir.Left);
+          else if (k === 'ArrowRight' || k === 'd' || k === 'D') queueDirection(Dir.Right);
+        }
+      }, { passive: false });
+
+      // Main loop with tick timer
+      function loop(ts) {
+        if (!lastTs) lastTs = ts;
+        const dtMs = ts - lastTs;
+        lastTs = ts;
+
+        if (gameState === State.PLAYING && !frozenWin) {
+          accMs += dtMs;
+
+          // Move at fixed tick interval; allow multiple ticks if frame stalls
+          while (accMs >= tickIntervalMs) {
+            accMs -= tickIntervalMs;
+            tickMove();
+            // After tick, queued direction should be allowed again.
+          }
+        }
+
+        drawFrame(ts);
+        requestAnimationFrame(loop);
+      }
+
+      // Init
+      loadHighScore();
+      resetGame(); // Prepare underlying state; but stay IDLE for start screen
+      setState(State.IDLE);
+      // Ensure queued input doesn't carry into play
+      hasQueuedTurn = false;
+      nextDirBuffered = null;
+
+      requestAnimationFrame(loop);
+    })();
+  </script>
+</body>
+</html>

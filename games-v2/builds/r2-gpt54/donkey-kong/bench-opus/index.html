@@ -1,0 +1,527 @@
+<!--
+  GAME:      Donkey Kong
+  RUN:       r2-gpt54
+  BUILDER:   anthropic/claude-opus-4.6
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Donkey Kong</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;display:flex;justify-content:center;align-items:center;height:100vh;overflow:hidden}
+canvas{display:block}
+</style>
+</head>
+<body>
+<canvas id="c" width="700" height="800"></canvas>
+<script>
+(function(){
+'use strict';
+const cv=document.getElementById('c'),cx=cv.getContext('2d');
+const W=700,H=800;
+function resize(){const s=Math.min(innerWidth/W,innerHeight/H)*0.95;cv.style.width=(W*s)+'px';cv.style.height=(H*s)+'px';}
+addEventListener('resize',resize);resize();
+
+let ac=null;
+function ia(){if(ac)return;try{ac=new(AudioContext||webkitAudioContext)();}catch(e){}}
+function beep(f,d,v,t){if(!ac)return;try{const o=ac.createOscillator(),g=ac.createGain();o.type=t||'square';o.frequency.value=f;g.gain.value=v||0.06;g.gain.linearRampToValueAtTime(0,ac.currentTime+d);o.connect(g);g.connect(ac.destination);o.start();o.stop(ac.currentTime+d);}catch(e){}}
+function sndJump(){beep(400,0.08,0.07,'sine');}
+function sndHammer(){beep(600,0.05,0.05);}
+function sndSmash(){beep(200,0.12,0.1);}
+function sndDie(){beep(150,0.3,0.1,'sawtooth');}
+function sndClear(){beep(660,0.1,0.1,'sine');setTimeout(()=>beep(880,0.12,0.1,'sine'),120);}
+function sndScore(){beep(800,0.06,0.05,'sine');}
+
+const ST_TITLE=0,ST_PLAY=1,ST_PAUSE=2,ST_OVER=3,ST_DEAD=4,ST_CLEAR=5;
+let state=ST_TITLE,stateTimer=0;
+
+// Platforms: each is {x1,y1,x2,y2} left-to-right endpoints of top surface
+const PLATS=[
+  // P0: bottom - slopes right-up slightly
+  {x1:30,y1:740,x2:670,y2:728},
+  // P1: slopes left-up
+  {x1:60,y1:635,x2:650,y2:650},
+  // P2: slopes right-up
+  {x1:50,y1:545,x2:640,y2:530},
+  // P3: slopes left-up
+  {x1:60,y1:440,x2:650,y2:455},
+  // P4: slopes right-up
+  {x1:50,y1:350,x2:640,y2:335},
+  // P5: top platform - flat
+  {x1:40,y1:200,x2:450,y2:200}
+];
+const PLAT_THICK=12;
+
+// Ladders: {x,y1,y2,broken}
+const LADDERS=[
+  // P0->P1
+  {x:600,y1:650,y2:728,broken:false},
+  {x:160,y1:650,y2:740,broken:false},
+  // P1->P2
+  {x:120,y1:530,y2:635,broken:false},
+  {x:500,y1:540,y2:650,broken:false},
+  {x:350,y1:545,y2:640,broken:true}, // broken
+  // P2->P3
+  {x:580,y1:455,y2:530,broken:false},
+  {x:250,y1:445,y2:545,broken:false},
+  // P3->P4
+  {x:120,y1:335,y2:440,broken:false},
+  {x:480,y1:345,y2:455,broken:false},
+  {x:300,y1:340,y2:450,broken:true}, // broken
+  // P4->P5
+  {x:200,y1:200,y2:335,broken:false},
+  {x:400,y1:200,y2:350,broken:false}
+];
+
+// Hammer pickups
+let hammers;
+const HAMMER_DEFS=[{x:520,y:520},{x:140,y:325}];
+
+function platY(p,x){
+  if(x<=p.x1)return p.y1;if(x>=p.x2)return p.y2;
+  const t=(x-p.x1)/(p.x2-p.x1);
+  return p.y1+(p.y2-p.y1)*t;
+}
+
+function platDir(p){return p.y1>p.y2?1:-1;} // 1=slopes down-left (rolls right to left), -1=slopes down-right
+
+let player,barrels,score,hiScore,lives,level,bonus,barrelTimer,globalTime;
+
+hiScore=0;
+try{const v=localStorage.getItem('dk_best');if(v)hiScore=parseInt(v)||0;}catch(e){}
+function saveHi(){if(score>hiScore){hiScore=score;try{localStorage.setItem('dk_best',String(hiScore));}catch(e){}}}
+
+function resetPlayer(){
+  player={x:80,y:740,w:24,h:32,vx:0,vy:0,
+    onGround:true,climbing:false,currentPlat:0,
+    facing:1,hammerTime:0,jumpId:0,alive:true,
+    animTimer:0};
+}
+
+function startGame(){
+  score=0;lives=3;level=1;globalTime=0;
+  resetStage();state=ST_PLAY;
+}
+
+function resetStage(){
+  resetPlayer();barrels=[];barrelTimer=2;bonus=5000;
+  hammers=HAMMER_DEFS.map(h=>({x:h.x,y:h.y,active:true}));
+}
+
+function nextStage(){
+  level++;resetStage();
+  state=ST_CLEAR;stateTimer=2;
+}
+
+function killPlayer(){
+  player.alive=false;sndDie();lives--;
+  if(lives<=0){state=ST_OVER;saveHi();return;}
+  state=ST_DEAD;stateTimer=1.5;
+}
+
+// Input
+const keys={};
+addEventListener('keydown',e=>{keys[e.code]=true;ia();e.preventDefault();
+  if(e.code==='Enter'){if(state===ST_TITLE||state===ST_OVER)startGame();}
+  if(e.code==='KeyP'){if(state===ST_PLAY)state=ST_PAUSE;else if(state===ST_PAUSE)state=ST_PLAY;}
+});
+addEventListener('keyup',e=>{keys[e.code]=false;});
+
+function findPlatformAt(x,y,tolerance){
+  for(let i=0;i<PLATS.length;i++){
+    const p=PLATS[i];
+    if(x>=p.x1-5&&x<=p.x2+5){
+      const sy=platY(p,x);
+      if(y>=sy-tolerance&&y<=sy+PLAT_THICK+tolerance)return i;
+    }
+  }
+  return-1;
+}
+
+function findLadderAt(x,y){
+  for(let i=0;i<LADDERS.length;i++){
+    const l=LADDERS[i];
+    if(l.broken)continue;
+    if(Math.abs(x-l.x)<16&&y>=l.y1-4&&y<=l.y2+4)return i;
+  }
+  return-1;
+}
+
+function update(dt){
+  globalTime+=dt;
+
+  if(state===ST_DEAD){stateTimer-=dt;if(stateTimer<=0){resetPlayer();barrels=[];barrelTimer=1;state=ST_PLAY;}return;}
+  if(state===ST_CLEAR){stateTimer-=dt;if(stateTimer<=0)state=ST_PLAY;return;}
+  if(state!==ST_PLAY)return;
+
+  const p=player;
+
+  // Bonus timer
+  bonus-=dt*60;if(bonus<0)bonus=0;
+
+  // Hammer
+  if(p.hammerTime>0){
+    p.hammerTime-=dt;
+    p.animTimer+=dt;
+  }
+
+  // Movement
+  if(p.climbing){
+    p.vx=0;p.vy=0;
+    const li=findLadderAt(p.x,p.y);
+    if(li<0){p.climbing=false;}
+    else{
+      const l=LADDERS[li];
+      p.x=l.x;
+      if(keys['ArrowUp']||keys['KeyW']){p.y-=120*dt;}
+      if(keys['ArrowDown']||keys['KeyS']){p.y+=120*dt;}
+      // Check if exited ladder top/bottom
+      if(p.y<l.y1){p.y=l.y1;p.climbing=false;p.onGround=true;}
+      if(p.y>l.y2){p.y=l.y2;p.climbing=false;}
+    }
+  }else{
+    // Horizontal
+    let moveX=0;
+    if(keys['ArrowLeft']||keys['KeyA']){moveX=-1;p.facing=-1;}
+    if(keys['ArrowRight']||keys['KeyD']){moveX=1;p.facing=1;}
+    p.x+=moveX*150*dt;
+
+    // Clamp to screen
+    p.x=Math.max(20,Math.min(W-20,p.x));
+
+    // Jump
+    if((keys['Space'])&&p.onGround&&p.hammerTime<=0){
+      p.vy=-340;p.onGround=false;p.jumpId++;sndJump();
+    }
+
+    // Gravity
+    if(!p.onGround){
+      p.vy+=900*dt;
+      p.y+=p.vy*dt;
+    }
+
+    // Ground check
+    if(p.onGround&&p.currentPlat>=0){
+      const pl=PLATS[p.currentPlat];
+      if(p.x<pl.x1-10||p.x>pl.x2+10){
+        p.onGround=false;p.currentPlat=-1;
+      }else{
+        p.y=platY(pl,p.x);
+      }
+    }
+
+    // Landing
+    if(!p.onGround&&p.vy>0){
+      for(let i=0;i<PLATS.length;i++){
+        const pl=PLATS[i];
+        if(p.x>=pl.x1-5&&p.x<=pl.x2+5){
+          const sy=platY(pl,p.x);
+          if(p.y>=sy-2&&p.y<=sy+PLAT_THICK+8){
+            p.y=sy;p.vy=0;p.onGround=true;p.currentPlat=i;
+            break;
+          }
+        }
+      }
+    }
+
+    // Try climbing
+    if((keys['ArrowUp']||keys['KeyW'])&&p.onGround){
+      const li=findLadderAt(p.x,p.y);
+      if(li>=0){p.climbing=true;p.x=LADDERS[li].x;p.onGround=false;p.currentPlat=-1;}
+    }
+    if((keys['ArrowDown']||keys['KeyS'])&&p.onGround){
+      // Check ladder below
+      const li=findLadderAt(p.x,p.y+20);
+      if(li>=0){p.climbing=true;p.x=LADDERS[li].x;p.onGround=false;p.currentPlat=-1;}
+    }
+  }
+
+  // Hammer pickups
+  for(const h of hammers){
+    if(!h.active)continue;
+    if(Math.abs(p.x-h.x)<20&&Math.abs(p.y-h.y)<24){
+      h.active=false;p.hammerTime=8;sndHammer();
+    }
+  }
+
+  // Goal check
+  if(p.y<220&&p.x>240&&p.x<380){
+    score+=1000+Math.floor(bonus);saveHi();sndClear();
+    nextStage();return;
+  }
+
+  // Barrel spawning
+  barrelTimer-=dt;
+  if(barrelTimer<=0){
+    barrelTimer=Math.max(1.2,3-level*0.3)+Math.random()*1;
+    const sp=PLATS[5];
+    barrels.push({
+      x:140,y:sp.y1-18,w:18,h:18,
+      vx:0,vy:0,plat:5,rolling:true,falling:false,
+      speed:120+level*10,scored:{}
+    });
+  }
+
+  // Barrel update
+  for(let i=barrels.length-1;i>=0;i--){
+    const b=barrels[i];
+
+    if(b.falling){
+      b.vy+=1200*dt;
+      b.y+=b.vy*dt;
+      // Land on platform
+      let landed=false;
+      for(let pi=0;pi<PLATS.length;pi++){
+        const pl=PLATS[pi];
+        if(b.x>=pl.x1-5&&b.x<=pl.x2+5){
+          const sy=platY(pl,b.x);
+          if(b.y>=sy-2&&b.y<=sy+PLAT_THICK){
+            b.y=sy;b.vy=0;b.falling=false;b.rolling=true;b.plat=pi;
+            landed=true;break;
+          }
+        }
+      }
+      if(b.y>H+20){barrels.splice(i,1);continue;}
+    }else if(b.rolling&&b.plat>=0){
+      const pl=PLATS[b.plat];
+      // Roll direction: downhill
+      const slope=(pl.y2-pl.y1)/(pl.x2-pl.x1);
+      const dir=slope>0?-1:1; // roll toward lower end
+      b.x+=dir*b.speed*dt;
+      b.y=platY(pl,b.x);
+
+      // Check ladder descent
+      for(const l of LADDERS){
+        if(!l.broken&&Math.abs(b.x-l.x)<12){
+          const ly1=l.y1,ly2=l.y2;
+          if(b.y>=ly1-6&&b.y<=ly1+10&&Math.random()<0.15){
+            b.rolling=false;b.falling=true;b.vy=80;
+            break;
+          }
+        }
+      }
+
+      // Fell off edge
+      if(b.x<pl.x1-10||b.x>pl.x2+10){
+        b.rolling=false;b.falling=true;b.vy=0;
+      }
+    }
+
+    // Collision with player
+    if(p.alive&&Math.abs(p.x-b.x)<18&&Math.abs(p.y-b.y)<24){
+      if(p.hammerTime>0){
+        barrels.splice(i,1);score+=300;saveHi();sndSmash();continue;
+      }else{
+        killPlayer();return;
+      }
+    }
+
+    // Jump score
+    if(p.alive&&!p.onGround&&p.vy>0&&!b.scored[p.jumpId]){
+      if(Math.abs(p.x-b.x)<24&&p.y<b.y-10&&p.y>b.y-50){
+        b.scored[p.jumpId]=true;score+=100;saveHi();sndScore();
+      }
+    }
+
+    // Remove old barrels
+    if(b.y>760){barrels.splice(i,1);}
+  }
+}
+
+function render(){
+  cx.fillStyle='#000';cx.fillRect(0,0,W,H);
+
+  if(state===ST_TITLE){
+    cx.fillStyle='#f44';cx.font='bold 48px monospace';cx.textAlign='center';
+    cx.fillText('DONKEY KONG',W/2,200);
+    cx.fillStyle='#ccc';cx.font='15px monospace';
+    cx.fillText('Climb the girders to rescue Pauline!',W/2,300);
+    cx.fillText('Donkey Kong throws barrels from above.',W/2,326);
+    cx.fillText('Jump over barrels or smash them with hammers.',W/2,352);
+    cx.fillText('Race the bonus timer to the top!',W/2,378);
+    cx.fillText('← → / A D : Run   ↑ ↓ / W S : Climb   Space : Jump',W/2,426);
+    cx.fillText('P : Pause   Enter : Start',W/2,452);
+    cx.fillStyle='#fff';cx.font='22px monospace';
+    if(Math.floor(Date.now()/600)%2)cx.fillText('Press Enter to Start',W/2,540);
+    if(hiScore>0){cx.fillStyle='#888';cx.font='14px monospace';cx.fillText('Best: '+hiScore,W/2,600);}
+    return;
+  }
+
+  // Ladders (behind platforms)
+  for(const l of LADDERS){
+    cx.strokeStyle=l.broken?'#246':'#4cf';cx.lineWidth=2;
+    const rungs=Math.floor((l.y2-l.y1)/12);
+    for(let r=0;r<=rungs;r++){
+      const ry=l.y1+r*12;
+      if(l.broken&&ry>l.y1+(l.y2-l.y1)*0.4&&ry<l.y1+(l.y2-l.y1)*0.7)continue;
+      cx.beginPath();cx.moveTo(l.x-8,ry);cx.lineTo(l.x+8,ry);cx.stroke();
+    }
+    cx.beginPath();cx.moveTo(l.x-8,l.y1);cx.lineTo(l.x-8,l.y2);cx.stroke();
+    cx.beginPath();cx.moveTo(l.x+8,l.y1);cx.lineTo(l.x+8,l.y2);cx.stroke();
+  }
+
+  // Platforms
+  for(const p of PLATS){
+    cx.fillStyle='#d35';
+    cx.beginPath();
+    cx.moveTo(p.x1,p.y1);cx.lineTo(p.x2,p.y2);
+    cx.lineTo(p.x2,p.y2+PLAT_THICK);cx.lineTo(p.x1,p.y1+PLAT_THICK);
+    cx.closePath();cx.fill();
+    // Rivets
+    cx.fillStyle='#f88';
+    const segs=Math.floor((p.x2-p.x1)/40);
+    for(let i=0;i<=segs;i++){
+      const rx=p.x1+i*40;
+      const ry=platY(p,rx)+PLAT_THICK/2;
+      cx.fillRect(rx-2,ry-2,4,4);
+    }
+  }
+
+  // Oil drum
+  cx.fillStyle='#444';cx.fillRect(30,736,30,32);
+  cx.fillStyle='#f80';cx.font='10px monospace';cx.textAlign='center';cx.fillText('OIL',45,755);
+  // Flame
+  if(Math.floor(globalTime*6)%2){
+    cx.fillStyle='#f80';cx.beginPath();cx.moveTo(45,736);cx.lineTo(38,720);cx.lineTo(52,720);cx.closePath();cx.fill();
+  }
+
+  // DK
+  const dkx=100,dky=148;
+  cx.fillStyle='#830';
+  cx.fillRect(dkx-28,dky-24,56,48);
+  cx.fillStyle='#a50';
+  cx.fillRect(dkx-20,dky-16,40,32);
+  // Face
+  cx.fillStyle='#da8';cx.fillRect(dkx-10,dky-20,20,14);
+  cx.fillStyle='#000';cx.fillRect(dkx-6,dky-16,4,4);cx.fillRect(dkx+2,dky-16,4,4);
+  // Arms
+  cx.fillStyle='#830';
+  cx.fillRect(dkx-32,dky-8,8,20);cx.fillRect(dkx+24,dky-8,8,20);
+  // Barrel being held
+  if(barrelTimer<0.5){
+    cx.fillStyle='#c80';cx.beginPath();cx.arc(dkx+30,dky,10,0,Math.PI*2);cx.fill();
+    cx.strokeStyle='#840';cx.lineWidth=1;cx.stroke();
+  }
+
+  // Pauline
+  const px2=310,py2=162;
+  cx.fillStyle='#f6f';cx.fillRect(px2-8,py2-16,16,32);
+  cx.fillStyle='#fca';cx.fillRect(px2-5,py2-24,10,10); // head
+  cx.fillStyle='#f6f';cx.fillRect(px2-6,py2-4,12,16); // dress
+  if(Math.floor(globalTime*2)%3===0){
+    cx.fillStyle='#ff0';cx.font='bold 12px monospace';cx.textAlign='center';
+    cx.fillText('HELP!',px2,py2-30);
+  }
+
+  // Hammers
+  for(const h of hammers){
+    if(!h.active)continue;
+    cx.fillStyle='#880';cx.fillRect(h.x-4,h.y-16,8,20);
+    cx.fillStyle='#ff0';cx.fillRect(h.x-8,h.y-20,16,8);
+  }
+
+  // Barrels
+  for(const b of barrels){
+    cx.fillStyle='#c80';
+    cx.beginPath();cx.arc(b.x,b.y,9,0,Math.PI*2);cx.fill();
+    cx.strokeStyle='#840';cx.lineWidth=1.5;cx.stroke();
+    cx.strokeStyle='#a60';cx.beginPath();
+    cx.moveTo(b.x-6,b.y);cx.lineTo(b.x+6,b.y);cx.stroke();
+  }
+
+  // Player
+  if(player.alive){
+    drawPlayer();
+  }
+
+  // HUD
+  cx.fillStyle='#fff';cx.font='16px monospace';cx.textAlign='left';
+  cx.fillText('SCORE: '+score,10,22);
+  cx.textAlign='right';
+  cx.fillText('BEST: '+hiScore,W-10,22);
+  cx.textAlign='center';
+  cx.fillText('L'+level+'  BONUS: '+Math.floor(bonus),W/2,22);
+  // Lives
+  cx.textAlign='left';
+  for(let i=0;i<lives;i++){
+    cx.fillStyle='#f44';cx.fillRect(10+i*22,H-22,12,16);
+    cx.fillStyle='#48f';cx.fillRect(10+i*22,H-14,12,8);
+  }
+
+  // Overlays
+  if(state===ST_PAUSE){
+    cx.fillStyle='rgba(0,0,0,0.6)';cx.fillRect(0,0,W,H);
+    cx.fillStyle='#fff';cx.font='bold 48px monospace';cx.textAlign='center';
+    cx.fillText('PAUSED',W/2,H/2);
+    cx.font='16px monospace';cx.fillStyle='#aaa';cx.fillText('Press P to Resume',W/2,H/2+35);
+  }
+  if(state===ST_DEAD){
+    cx.fillStyle='#f44';cx.font='bold 24px monospace';cx.textAlign='center';
+    cx.fillText('OH NO!',W/2,H/2);
+  }
+  if(state===ST_CLEAR){
+    cx.fillStyle='rgba(0,0,0,0.4)';cx.fillRect(0,0,W,H);
+    cx.fillStyle='#ff0';cx.font='bold 36px monospace';cx.textAlign='center';
+    cx.fillText('STAGE CLEAR!',W/2,H/2-20);
+    cx.fillStyle='#fff';cx.font='20px monospace';
+    cx.fillText('Bonus: +'+Math.floor(bonus),W/2,H/2+20);
+  }
+  if(state===ST_OVER){
+    cx.fillStyle='rgba(0,0,0,0.65)';cx.fillRect(0,0,W,H);
+    cx.fillStyle='#f44';cx.font='bold 48px monospace';cx.textAlign='center';
+    cx.fillText('GAME OVER',W/2,H/2-40);
+    cx.fillStyle='#fff';cx.font='24px monospace';
+    cx.fillText('Score: '+score,W/2,H/2+10);
+    if(score>=hiScore&&score>0){cx.fillStyle='#fd0';cx.font='16px monospace';cx.fillText('NEW HIGH SCORE!',W/2,H/2+40);}
+    cx.fillStyle='#aaa';cx.font='18px monospace';
+    if(Math.floor(Date.now()/600)%2)cx.fillText('Press Enter to Restart',W/2,H/2+80);
+  }
+}
+
+function drawPlayer(){
+  const p=player,px=p.x,py=p.y;
+  cx.save();cx.translate(px,py);
+
+  if(p.hammerTime>0){
+    // Hammer swing
+    const swing=Math.floor(p.animTimer*8)%2;
+    cx.fillStyle='#880';
+    if(swing){cx.fillRect(p.facing*8,-40,4,20);cx.fillStyle='#ff0';cx.fillRect(p.facing*4,-44,12,8);}
+    else{cx.fillRect(p.facing*14,-20,20,4);cx.fillStyle='#ff0';cx.fillRect(p.facing*30,-24,8,12);}
+  }
+
+  // Head
+  cx.fillStyle='#fca';cx.fillRect(-6,-32,12,10);
+  // Hat
+  cx.fillStyle='#f44';cx.fillRect(-8,-34,16,6);
+  // Body
+  cx.fillStyle='#f44';cx.fillRect(-8,-22,16,12);
+  // Overalls
+  cx.fillStyle='#48f';cx.fillRect(-8,-10,16,12);
+  // Legs
+  cx.fillStyle='#48f';
+  if(p.climbing){
+    const cl=Math.floor(globalTime*6)%2;
+    cx.fillRect(-7,2,6,8);cx.fillRect(1,2+(cl?-4:4),6,8);
+  }else{
+    cx.fillRect(-7,2,6,8);cx.fillRect(1,2,6,8);
+  }
+
+  cx.restore();
+}
+
+let lastTime=0;
+function loop(now){
+  requestAnimationFrame(loop);
+  if(!lastTime){lastTime=now;return;}
+  let dt=(now-lastTime)/1000;lastTime=now;
+  if(dt>0.05)dt=0.05;
+  update(dt);render();
+}
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,342 @@
+<!--
+  GAME:      Donkey Kong
+  RUN:       r1-opus
+  BUILDER:   google/gemini-3-flash-preview
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Donkey Kong - Vintage Arcade</title>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; display: flex; justify-content: center; align-items: center; height: 100vh; font-family: 'Courier New', Courier, monospace; }
+        canvas { background: #000; display: block; box-shadow: 0 0 20px rgba(204, 68, 0, 0.2); image-rendering: pixelated; }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas" width="672" height="768"></canvas>
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        // State Machine
+        const STATE_TITLE = 'TITLE', STATE_INTRO = 'INTRO', STATE_PLAYING = 'PLAYING', STATE_PAUSED = 'PAUSED', STATE_DEATH = 'DEATH', STATE_CLEAR = 'LEVEL_CLEAR', STATE_GAMEOVER = 'GAME_OVER';
+        let currentState = STATE_TITLE;
+
+        // Constants
+        const WIDTH = 672, HEIGHT = 768, GRAVITY = 700;
+        let score = 0, high_score = localStorage.getItem('donkeykong_best') || 0, level = 1, lives = 3, bonus = 5000;
+        let lastTime = 0, dt = 0, timerDelta = 0;
+        
+        // Girders
+        const girders = [
+            { id: 1, lx: 56, rx: 616, ly: 640, ry: 628 }, // Bottom
+            { id: 2, lx: 56, rx: 616, ly: 544, ry: 556 },
+            { id: 3, lx: 56, rx: 616, ly: 460, ry: 448 },
+            { id: 4, lx: 56, rx: 616, ly: 364, ry: 376 },
+            { id: 5, lx: 56, rx: 616, ly: 280, ry: 268 },
+            { id: 6, lx: 56, rx: 456, ly: 188, ry: 180 }, // DK
+            { id: 7, lx: 220, rx: 452, ly: 98, ry: 98 }   // Pauline
+        ];
+
+        // Ladders
+        const ladders = [
+            { x: 120, b: 1, t: 2, type: 'full' },
+            { x: 540, b: 2, t: 3, type: 'full' },
+            { x: 120, b: 3, t: 4, type: 'full' },
+            { x: 420, b: 3, t: 4, type: 'full' },
+            { x: 540, b: 4, t: 5, type: 'full' },
+            { x: 120, b: 5, t: 6, type: 'full' },
+            { x: 400, b: 6, t: 7, type: 'full' }
+        ];
+
+        // Entities
+        let mario, barrels = [], fireballs = [], hammers = [], bonusItems = [], popups = [];
+        let dk = { x: 80, y: 124, state: 'idle', frame: 0, throwTimer: 3 };
+        let hammerActive = 0, introTimer = 0, deathTimer = 0, clearTimer = 0;
+        let keys = {}, keyHold = {};
+        let audioCtx = null;
+
+        function playSound(freq, dur, vol = 0.1, type = 'square', sweep = 0) {
+            if (!audioCtx) return;
+            try {
+                const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+                o.type = type; o.frequency.setValueAtTime(freq, audioCtx.currentTime);
+                if (sweep) o.frequency.exponentialRampToValueAtTime(sweep, audioCtx.currentTime + dur);
+                g.gain.setValueAtTime(vol, audioCtx.currentTime);
+                g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+                o.connect(g); g.connect(audioCtx.destination);
+                o.start(); o.stop(audioCtx.currentTime + dur);
+            } catch(e) {}
+        }
+
+        function getGirderY(g, x) {
+            if (x < g.lx || x > g.rx) return null;
+            const t = (x - g.lx) / (g.rx - g.lx);
+            return g.ly + t * (g.ry - g.ly);
+        }
+
+        function findGirder(x, y) {
+            for (let g of girders) {
+                const gy = getGirderY(g, x);
+                if (gy !== null && y >= gy - 10 && y <= gy + 10) return g;
+            }
+            return null;
+        }
+
+        function spawnMario() {
+            mario = { x: 560, y: 620, vx: 0, vy: 0, airborne: false, climbing: null, dir: -1, frame: 0, animTimer: 0, jumpedBarrels: new Set() };
+            hammerActive = 0;
+        }
+
+        function resetLevel() {
+            barrels = []; fireballs = []; hammers = []; bonusItems = []; popups = [];
+            bonus = 4000 + level * 1000;
+            dk.throwTimer = 3;
+            hammers = [
+                { x: 130, y: getGirderY(girders[2], 130) - 20, collected: false },
+                { x: 560, y: getGirderY(girders[4], 560) - 20, collected: false }
+            ];
+            spawnMario();
+        }
+
+        function startIntro() {
+            currentState = STATE_INTRO; introTimer = 2;
+        }
+
+        window.addEventListener('keydown', e => {
+            if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            keys[e.code] = true;
+            if (e.code === 'Enter' && (currentState === STATE_TITLE || currentState === STATE_GAMEOVER)) {
+                score = 0; level = 1; lives = 3; resetLevel(); startIntro();
+            }
+            if ((e.code === 'KeyP' || e.code === 'Escape') && currentState === STATE_PLAYING) currentState = STATE_PAUSED;
+            else if ((e.code === 'KeyP' || e.code === 'Escape') && currentState === STATE_PAUSED) currentState = STATE_PLAYING;
+        });
+        window.addEventListener('keyup', e => keys[e.code] = false);
+
+        function update(t) {
+            dt = Math.min((t - lastTime) / 1000, 0.05); lastTime = t;
+            
+            if (currentState === STATE_PLAYING) {
+                updateMario(dt);
+                updateDK(dt);
+                updateHazards(dt);
+                updateBonus(dt);
+            } else if (currentState === STATE_INTRO) {
+                introTimer -= dt; if (introTimer <= 0) currentState = STATE_PLAYING;
+            } else if (currentState === STATE_DEATH) {
+                deathTimer -= dt;
+                if (deathTimer <= 0) {
+                    lives--;
+                    if (lives <= 0) currentState = STATE_GAMEOVER;
+                    else { resetLevel(); startIntro(); }
+                }
+            } else if (currentState === STATE_CLEAR) {
+                clearTimer -= dt;
+                if (clearTimer <= 0) { level++; resetLevel(); startIntro(); }
+            }
+            
+            popups.forEach((p, i) => { p.y -= 40 * dt; p.life -= dt; if (p.life <= 0) popups.splice(i, 1); });
+            draw();
+            requestAnimationFrame(update);
+        }
+
+        function updateMario(dt) {
+            if (mario.climbing) {
+                if (keys['ArrowUp'] || keys['KeyW']) { mario.y -= 80 * dt; mario.animTimer += dt; }
+                else if (keys['ArrowDown'] || keys['KeyS']) { mario.y += 80 * dt; mario.animTimer += dt; }
+                
+                const gB = girders.find(g => g.id === mario.climbing.b);
+                const gT = girders.find(g => g.id === mario.climbing.t);
+                const yB = getGirderY(gB, mario.x), yT = getGirderY(gT, mario.x);
+                
+                if (mario.y <= yT) { mario.y = yT; mario.climbing = null; mario.airborne = false; }
+                else if (mario.y >= yB) { mario.y = yB; mario.climbing = null; mario.airborne = false; }
+                return;
+            }
+
+            // Input
+            if (keys['ArrowLeft'] || keys['KeyA']) { mario.vx = -100; mario.dir = -1; mario.animTimer += dt; }
+            else if (keys['ArrowRight'] || keys['KeyD']) { mario.vx = 100; mario.dir = 1; mario.animTimer += dt; }
+            else { mario.vx = 0; }
+
+            if (keys['Space'] && !mario.airborne) {
+                mario.vy = -300; mario.airborne = true;
+                playSound(300, 0.1, 0.1, 'sine', 500);
+            }
+
+            if ((keys['ArrowUp'] || keys['KeyW']) && !mario.airborne && !hammerActive) {
+                const lad = ladders.find(l => Math.abs(mario.x - l.x) < 10 && findGirder(mario.x, mario.y)?.id === l.b);
+                if (lad) { mario.climbing = lad; mario.x = lad.x; return; }
+            }
+            if ((keys['ArrowDown'] || keys['KeyS']) && !mario.airborne && !hammerActive) {
+                const lad = ladders.find(l => Math.abs(mario.x - l.x) < 10 && findGirder(mario.x, mario.y - 15)?.id === l.t);
+                if (lad) { mario.climbing = lad; mario.x = lad.x; return; }
+            }
+
+            // Physics
+            if (mario.airborne) {
+                mario.vy += GRAVITY * dt;
+                mario.y += mario.vy * dt;
+                mario.x += mario.vx * dt;
+                
+                // Jump scoring
+                barrels.forEach(b => {
+                    if (Math.abs(mario.x - b.x) < 20 && mario.y + 32 < b.y && !mario.jumpedBarrels.has(b)) {
+                        mario.jumpedBarrels.add(b);
+                    }
+                });
+
+                const g = findGirder(mario.x, mario.y);
+                if (g && mario.vy >= 0) {
+                    const gy = getGirderY(g, mario.x);
+                    if (mario.y >= gy - 5) {
+                        mario.y = gy; mario.vy = 0; mario.airborne = false;
+                        if (mario.jumpedBarrels.size > 0) {
+                            const pts = mario.jumpedBarrels.size === 1 ? 100 : 300;
+                            score += pts; popups.push({ x: mario.x, y: mario.y - 40, text: pts, life: 0.8 });
+                            playSound(660, 0.06, 0.15, 'sine');
+                            mario.jumpedBarrels.clear();
+                        }
+                        if (g.id === 7) { currentState = STATE_CLEAR; clearTimer = 2; score += Math.floor(bonus); playSound(523, 0.4, 0.2, 'sine', 1047); }
+                    }
+                }
+            } else {
+                mario.x += mario.vx * dt;
+                const g = findGirder(mario.x, mario.y);
+                if (!g) { mario.airborne = true; }
+                else { mario.y = getGirderY(g, mario.x); }
+            }
+
+            // Bounds
+            if (mario.x < 56) mario.x = 56; if (mario.x > 616) mario.x = 616;
+
+            // Hammers
+            if (hammerActive > 0) {
+                hammerActive -= dt;
+                const hx = mario.x + (mario.dir * 20), hy = mario.y - 20;
+                barrels.forEach((b, i) => {
+                    if (Math.hypot(b.x - hx, b.y - hy) < 30) { barrels.splice(i, 1); score += 300; popups.push({ x: b.x, y: b.y, text: 300, life: 0.6 }); playSound(200, 0.06, 0.2); }
+                });
+            } else {
+                hammers.forEach(h => {
+                    if (!h.collected && Math.hypot(mario.x - h.x, mario.y - h.y) < 25) { h.collected = true; hammerActive = 10; playSound(440, 0.1, 0.2, 'square', 660); }
+                });
+            }
+        }
+
+        function updateDK(dt) {
+            dk.throwTimer -= dt;
+            if (dk.throwTimer <= 0) {
+                dk.state = 'throwing';
+                setTimeout(() => {
+                    barrels.push({ x: 120, y: 180, speed: (80 + Math.random() * 40) * (1 + level * 0.1), dir: 1, girder: girders[5] });
+                    dk.state = 'idle';
+                    dk.throwTimer = 3 - (level * 0.3);
+                    playSound(80, 0.1, 0.2);
+                }, 500);
+            }
+        }
+
+        function updateHazards(dt) {
+            barrels.forEach((b, i) => {
+                b.x += b.speed * b.dir * dt;
+                const gy = getGirderY(b.girder, b.x);
+                if (gy === null) {
+                    const nextG = girders.find(g => g.id === b.girder.id - 1);
+                    if (nextG) { b.girder = nextG; b.dir *= -1; }
+                    else { barrels.splice(i, 1); return; }
+                } else {
+                    b.y = gy;
+                }
+                
+                // Collision
+                if (Math.hypot(mario.x - b.x, (mario.y - 16) - (b.y - 8)) < 20) {
+                    currentState = STATE_DEATH; deathTimer = 1.5; playSound(400, 0.6, 0.2, 'sine', 100);
+                }
+            });
+        }
+
+        function updateBonus(dt) {
+            bonus -= 50 * dt;
+            if (bonus <= 0) { bonus = 0; currentState = STATE_DEATH; deathTimer = 1.5; }
+        }
+
+        function draw() {
+            ctx.fillStyle = '#000'; ctx.fillRect(0, 0, WIDTH, HEIGHT);
+            
+            // HUD
+            ctx.fillStyle = '#F00'; ctx.font = '12px Courier'; ctx.fillText('SCORE', 20, 14);
+            ctx.fillStyle = '#FFF'; ctx.font = '16px Courier'; ctx.fillText(score.toString().padStart(6, '0'), 20, 30);
+            ctx.fillStyle = '#0CF'; ctx.fillText('BONUS', 520, 14);
+            ctx.fillStyle = bonus < 1000 ? '#F44' : '#FFF'; ctx.fillText(Math.floor(bonus).toString(), 520, 30);
+
+            // Girders
+            girders.forEach(g => {
+                ctx.strokeStyle = '#CC4400'; ctx.lineWidth = 10;
+                ctx.beginPath(); ctx.moveTo(g.lx, g.ly + 5); ctx.lineTo(g.rx, g.ry + 5); ctx.stroke();
+                ctx.strokeStyle = '#FF6600'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(g.lx, g.ly); ctx.lineTo(g.rx, g.ry); ctx.stroke();
+            });
+
+            // Ladders
+            ladders.forEach(l => {
+                const gB = girders.find(g => g.id === l.b);
+                const gT = girders.find(g => g.id === l.t);
+                const yB = getGirderY(gB, l.x), yT = getGirderY(gT, l.x);
+                ctx.strokeStyle = '#6CF'; ctx.lineWidth = 2;
+                ctx.beginPath(); ctx.moveTo(l.x - 6, yB); ctx.lineTo(l.x - 6, yT); ctx.moveTo(l.x + 6, yB); ctx.lineTo(l.x + 6, yT); ctx.stroke();
+                for (let r = yT; r <= yB; r += 10) { ctx.beginPath(); ctx.moveTo(l.x-6, r); ctx.lineTo(l.x+6, r); ctx.stroke(); }
+            });
+
+            // Hammers
+            hammers.forEach(h => {
+                if (!h.collected) { ctx.fillStyle = '#AAA'; ctx.fillRect(h.x-7, h.y-5, 14, 10); ctx.fillStyle = '#8B4513'; ctx.fillRect(h.x-2, h.y+5, 4, 8); }
+            });
+
+            // Characters
+            if (mario) {
+                ctx.save(); ctx.translate(mario.x, mario.y);
+                if (mario.dir === -1) ctx.scale(-1, 1);
+                ctx.fillStyle = '#00A'; ctx.fillRect(-8, -22, 16, 22); // body
+                ctx.fillStyle = '#F7 skin'; ctx.fillRect(-5, -32, 10, 10); // head
+                ctx.fillStyle = '#C00'; ctx.fillRect(-8, -28, 16, 4); // hat
+                if (hammerActive > 0) {
+                    ctx.fillStyle = '#AAA';
+                    const hammerUp = Math.floor(Date.now() / 100) % 2 === 0;
+                    if (hammerUp) ctx.fillRect(-4, -45, 24, 12); else ctx.fillRect(10, -15, 24, 12);
+                }
+                ctx.restore();
+            }
+
+            // DK & Pauline
+            ctx.fillStyle = '#8B4513'; ctx.fillRect(dk.x, dk.y, 64, 64);
+            ctx.fillStyle = '#FF69B4'; ctx.fillRect(330, 66, 20, 32); // Pauline
+            ctx.fillStyle = '#0CF'; ctx.font = '12px Courier'; ctx.fillText('HELP!', 320, 50);
+
+            // Barrels
+            barrels.forEach(b => {
+                ctx.fillStyle = '#CD853F'; ctx.fillRect(b.x-10, b.y-16, 20, 16);
+                ctx.fillStyle = '#8B4513'; ctx.fillRect(b.x-10, b.y-14, 20, 2); ctx.fillRect(b.x-10, b.y-4, 20, 2);
+            });
+
+            popups.forEach(p => { ctx.fillStyle = '#FFF'; ctx.font = '12px Courier'; ctx.fillText(p.text, p.x, p.y); });
+
+            if (currentState === STATE_TITLE) {
+                ctx.fillStyle = 'rgba(0,0,0,0.85)'; ctx.fillRect(0,0,WIDTH,HEIGHT);
+                ctx.fillStyle = '#F40'; ctx.font = 'bold 42px Courier'; ctx.textAlign = 'center';
+                ctx.fillText('DONKEY KONG', WIDTH/2, 350);
+                ctx.fillStyle = '#AAA'; ctx.font = '18px Courier'; ctx.fillText('Press Enter to Start', WIDTH/2, 500);
+                ctx.textAlign = 'left';
+            } else if (currentState === STATE_PAUSED) {
+                ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0,0,WIDTH,HEIGHT);
+                ctx.fillStyle = '#FFF'; ctx.textAlign = 'center'; ctx.font = '36px Courier'; ctx.fillText('PAUSED', WIDTH/2, 350);
+                ctx.textAlign = 'left';
+            }
+        }
+
+        requestAnimationFrame(update);
+    </script>
+</body>
+</html>

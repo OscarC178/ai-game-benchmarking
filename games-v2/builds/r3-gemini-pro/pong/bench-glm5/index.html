@@ -1,0 +1,458 @@
+<!--
+  GAME:      Pong
+  RUN:       r3-gemini-pro
+  BUILDER:   z-ai/glm-5
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pong</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      background: #000;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      overflow: hidden;
+    }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <script>
+    // ==================== CONSTANTS ====================
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    
+    const W = 800;
+    const H = 600;
+    canvas.width = W;
+    canvas.height = H;
+    
+    // Game states
+    const STATE_START = 0;
+    const STATE_SERVE = 1;
+    const STATE_PLAYING = 2;
+    const STATE_GAMEOVER = 3;
+    
+    // Colors
+    const COLOR_BG = '#000000';
+    const COLOR_FG = '#FFFFFF';
+    
+    // Paddle settings
+    const PADDLE_W = 15;
+    const PADDLE_H = 100;
+    const PADDLE_SPEED = 400;
+    const PADDLE_MARGIN = 30;
+    
+    // Ball settings
+    const BALL_SIZE = 15;
+    const BALL_BASE_SPEED = 400;
+    const BALL_MAX_SPEED = 1000;
+    const MAX_BOUNCE_ANGLE = Math.PI / 4; // 45 degrees
+    
+    // Score
+    const WIN_SCORE = 10;
+    
+    // ==================== GAME STATE ====================
+    let state = STATE_START;
+    let playerScore = 0;
+    let aiScore = 0;
+    let serveDir = 1; // 1 = toward player, -1 = toward AI
+    
+    // Player paddle (left)
+    let player = {
+      x: PADDLE_MARGIN,
+      y: H / 2 - PADDLE_H / 2,
+      w: PADDLE_W,
+      h: PADDLE_H
+    };
+    
+    // AI paddle (right)
+    let ai = {
+      x: W - PADDLE_MARGIN - PADDLE_W,
+      y: H / 2 - PADDLE_H / 2,
+      w: PADDLE_W,
+      h: PADDLE_H,
+      speed: 350
+    };
+    
+    // Ball
+    let ball = {
+      x: W / 2 - BALL_SIZE / 2,
+      y: H / 2 - BALL_SIZE / 2,
+      w: BALL_SIZE,
+      h: BALL_SIZE,
+      vx: 0,
+      vy: 0,
+      speed: BALL_BASE_SPEED
+    };
+    
+    // Input
+    const keys = {};
+    
+    // Audio
+    let audioCtx = null;
+    
+    // ==================== AUDIO ====================
+    function initAudio() {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+      }
+    }
+    
+    function playBeep(freq, duration, type = 'square') {
+      if (!audioCtx) return;
+      try {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = type;
+        osc.frequency.value = freq;
+        gain.gain.value = 0.15;
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + duration);
+      } catch (e) {}
+    }
+    
+    function playPaddleHit() { playBeep(600, 0.1, 'square'); }
+    function playWallHit() { playBeep(300, 0.1, 'square'); }
+    function playScore() { playBeep(150, 0.5, 'sawtooth'); }
+    
+    // ==================== GAME LOGIC ====================
+    function resetBall() {
+      ball.x = W / 2 - BALL_SIZE / 2;
+      ball.y = H / 2 - BALL_SIZE / 2;
+      ball.speed = BALL_BASE_SPEED;
+      ball.vx = 0;
+      ball.vy = 0;
+    }
+    
+    function serveBall() {
+      const angle = (Math.random() - 0.5) * Math.PI / 4;
+      ball.vx = Math.cos(angle) * ball.speed * serveDir;
+      ball.vy = -Math.sin(angle) * ball.speed;
+    }
+    
+    function resetGame() {
+      playerScore = 0;
+      aiScore = 0;
+      serveDir = Math.random() > 0.5 ? 1 : -1;
+      player.y = H / 2 - PADDLE_H / 2;
+      ai.y = H / 2 - PADDLE_H / 2;
+      resetBall();
+      state = STATE_SERVE;
+    }
+    
+    function startGame() {
+      initAudio();
+      resetGame();
+    }
+    
+    // ==================== UPDATE ====================
+    function update(dt) {
+      // Handle input for state transitions
+      if (state === STATE_START) {
+        if (keys['Space'] || keys['Enter']) {
+          startGame();
+          keys['Space'] = false;
+          keys['Enter'] = false;
+        }
+        return;
+      }
+      
+      if (state === STATE_SERVE) {
+        if (keys['Space'] || keys['Enter']) {
+          serveBall();
+          state = STATE_PLAYING;
+          keys['Space'] = false;
+          keys['Enter'] = false;
+        }
+        // Still allow paddle movement during serve
+        updatePlayer(dt);
+        updateAI(dt);
+        return;
+      }
+      
+      if (state === STATE_GAMEOVER) {
+        if (keys['Space'] || keys['Enter']) {
+          resetGame();
+          keys['Space'] = false;
+          keys['Enter'] = false;
+        }
+        return;
+      }
+      
+      // Playing state
+      updatePlayer(dt);
+      updateAI(dt);
+      updateBall(dt);
+      checkCollisions();
+      checkScore();
+    }
+    
+    function updatePlayer(dt) {
+      const moveUp = keys['KeyW'] || keys['ArrowUp'];
+      const moveDown = keys['KeyS'] || keys['ArrowDown'];
+      
+      if (moveUp) {
+        player.y -= PADDLE_SPEED * dt;
+      }
+      if (moveDown) {
+        player.y += PADDLE_SPEED * dt;
+      }
+      
+      // Clamp to screen
+      player.y = Math.max(0, Math.min(H - PADDLE_H, player.y));
+    }
+    
+    function updateAI(dt) {
+      const aiCenter = ai.y + PADDLE_H / 2;
+      const ballCenter = ball.y + BALL_SIZE / 2;
+      
+      // Only track when ball is moving toward AI
+      if (ball.vx > 0) {
+        if (aiCenter < ballCenter - 10) {
+          ai.y += ai.speed * dt;
+        } else if (aiCenter > ballCenter + 10) {
+          ai.y -= ai.speed * dt;
+        }
+      } else {
+        // Return to center when ball moving away
+        const screenCenter = H / 2;
+        if (aiCenter < screenCenter - 10) {
+          ai.y += ai.speed * 0.5 * dt;
+        } else if (aiCenter > screenCenter + 10) {
+          ai.y -= ai.speed * 0.5 * dt;
+        }
+      }
+      
+      // Clamp to screen
+      ai.y = Math.max(0, Math.min(H - PADDLE_H, ai.y));
+    }
+    
+    function updateBall(dt) {
+      ball.x += ball.vx * dt;
+      ball.y += ball.vy * dt;
+      
+      // Wall collisions (top/bottom)
+      if (ball.y <= 0) {
+        ball.y = 0;
+        ball.vy = -ball.vy;
+        playWallHit();
+      }
+      if (ball.y + BALL_SIZE >= H) {
+        ball.y = H - BALL_SIZE;
+        ball.vy = -ball.vy;
+        playWallHit();
+      }
+    }
+    
+    function checkCollisions() {
+      // Player paddle collision
+      if (rectCollision(ball, player) && ball.vx < 0) {
+        handlePaddleHit(player, 1);
+      }
+      
+      // AI paddle collision
+      if (rectCollision(ball, ai) && ball.vx > 0) {
+        handlePaddleHit(ai, -1);
+      }
+    }
+    
+    function rectCollision(a, b) {
+      return a.x < b.x + b.w &&
+             a.x + a.w > b.x &&
+             a.y < b.y + b.h &&
+             a.y + a.h > b.y;
+    }
+    
+    function handlePaddleHit(paddle, direction) {
+      // Calculate intersection point
+      const ballCenter = ball.y + BALL_SIZE / 2;
+      const paddleCenter = paddle.y + PADDLE_H / 2;
+      const intersectY = paddleCenter - ballCenter;
+      
+      // Normalize (-1 to 1)
+      const normalizedIntersectY = intersectY / (PADDLE_H / 2);
+      
+      // Calculate bounce angle
+      const bounceAngle = normalizedIntersectY * MAX_BOUNCE_ANGLE;
+      
+      // Increase speed
+      ball.speed = Math.min(BALL_MAX_SPEED, ball.speed * 1.05);
+      
+      // Apply new velocity
+      ball.vx = ball.speed * Math.cos(bounceAngle) * direction;
+      ball.vy = ball.speed * -Math.sin(bounceAngle);
+      
+      // Move ball out of paddle to prevent sticking
+      if (direction === 1) {
+        ball.x = paddle.x + paddle.w + 1;
+      } else {
+        ball.x = paddle.x - BALL_SIZE - 1;
+      }
+      
+      playPaddleHit();
+    }
+    
+    function checkScore() {
+      // Ball passed left edge - AI scores
+      if (ball.x + BALL_SIZE < 0) {
+        aiScore++;
+        serveDir = 1; // Next serve toward player
+        playScore();
+        checkWin();
+      }
+      
+      // Ball passed right edge - Player scores
+      if (ball.x > W) {
+        playerScore++;
+        serveDir = -1; // Next serve toward AI
+        playScore();
+        checkWin();
+      }
+    }
+    
+    function checkWin() {
+      if (playerScore >= WIN_SCORE || aiScore >= WIN_SCORE) {
+        state = STATE_GAMEOVER;
+      } else {
+        resetBall();
+        state = STATE_SERVE;
+      }
+    }
+    
+    // ==================== RENDER ====================
+    function render() {
+      // Clear
+      ctx.fillStyle = COLOR_BG;
+      ctx.fillRect(0, 0, W, H);
+      
+      ctx.fillStyle = COLOR_FG;
+      ctx.strokeStyle = COLOR_FG;
+      
+      if (state === STATE_START) {
+        drawStartScreen();
+        return;
+      }
+      
+      // Draw center line (dashed)
+      drawNet();
+      
+      // Draw scores
+      drawScores();
+      
+      // Draw paddles
+      ctx.fillRect(player.x, player.y, player.w, player.h);
+      ctx.fillRect(ai.x, ai.y, ai.w, ai.h);
+      
+      // Draw ball
+      ctx.fillRect(ball.x, ball.y, ball.w, ball.h);
+      
+      // State overlays
+      if (state === STATE_SERVE) {
+        drawServePrompt();
+      } else if (state === STATE_GAMEOVER) {
+        drawGameOver();
+      }
+    }
+    
+    function drawNet() {
+      ctx.setLineDash([10, 10]);
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(W / 2, 0);
+      ctx.lineTo(W / 2, H);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    
+    function drawScores() {
+      ctx.font = 'bold 48px Courier New, monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(playerScore.toString(), W / 4, 60);
+      ctx.fillText(aiScore.toString(), W * 3 / 4, 60);
+    }
+    
+    function drawStartScreen() {
+      ctx.font = 'bold 72px Courier New, monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('PONG', W / 2, H / 2 - 60);
+      
+      ctx.font = '24px Courier New, monospace';
+      ctx.fillText('First to 10 wins', W / 2, H / 2);
+      
+      if (Math.floor(Date.now() / 500) % 2 === 0) {
+        ctx.fillText('Press Space to Start', W / 2, H / 2 + 80);
+      }
+      
+      ctx.font = '16px Courier New, monospace';
+      ctx.fillText('W/S or Up/Down to move', W / 2, H / 2 + 140);
+    }
+    
+    function drawServePrompt() {
+      ctx.font = '24px Courier New, monospace';
+      ctx.textAlign = 'center';
+      if (Math.floor(Date.now() / 500) % 2 === 0) {
+        ctx.fillText('Press Space to Serve', W / 2, H / 2 + 200);
+      }
+    }
+    
+    function drawGameOver() {
+      ctx.font = 'bold 48px Courier New, monospace';
+      ctx.textAlign = 'center';
+      
+      const winner = playerScore >= WIN_SCORE ? 'PLAYER WINS!' : 'COMPUTER WINS!';
+      ctx.fillText(winner, W / 2, H / 2 - 40);
+      
+      ctx.font = '24px Courier New, monospace';
+      ctx.fillText(`Final Score: ${playerScore} - ${aiScore}`, W / 2, H / 2 + 20);
+      
+      if (Math.floor(Date.now() / 500) % 2 === 0) {
+        ctx.fillText('Press Space to Restart', W / 2, H / 2 + 80);
+      }
+    }
+    
+    // ==================== GAME LOOP ====================
+    let lastTime = 0;
+    
+    function gameLoop(timestamp) {
+      const dt = Math.min((timestamp - lastTime) / 1000, 0.1);
+      lastTime = timestamp;
+      
+      update(dt);
+      render();
+      
+      requestAnimationFrame(gameLoop);
+    }
+    
+    // ==================== INPUT ====================
+    document.addEventListener('keydown', (e) => {
+      keys[e.code] = true;
+      if (['Space', 'Enter', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) {
+        e.preventDefault();
+      }
+    });
+    
+    document.addEventListener('keyup', (e) => {
+      keys[e.code] = false;
+    });
+    
+    // Start
+    lastTime = performance.now();
+    requestAnimationFrame(gameLoop);
+  </script>
+</body>
+</html>

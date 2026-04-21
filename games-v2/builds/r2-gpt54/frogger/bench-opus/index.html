@@ -1,0 +1,436 @@
+<!--
+  GAME:      Frogger
+  RUN:       r2-gpt54
+  BUILDER:   anthropic/claude-opus-4.6
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Frogger</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;display:flex;justify-content:center;align-items:center;height:100vh;overflow:hidden}
+canvas{display:block}
+</style>
+</head>
+<body>
+<canvas id="c" width="600" height="700"></canvas>
+<script>
+(function(){
+'use strict';
+const cv=document.getElementById('c'),cx=cv.getContext('2d');
+const W=600,H=700,RH=50,COLS=12,CW=50;
+function resize(){const s=Math.min(innerWidth/W,innerHeight/H)*0.95;cv.style.width=(W*s)+'px';cv.style.height=(H*s)+'px';}
+addEventListener('resize',resize);resize();
+
+// Row layout bottom-to-top (index 0 = bottom row at y=650):
+// Row 0: start safe (y=650)
+// Row 1-5: road lanes (y=600..400)
+// Row 6: middle safe (y=350)
+// Row 7-11: river lanes (y=300..100)
+// Row 12: home row (y=50)
+// HUD at y=0..50
+
+const ROW_Y=r=>H-RH-r*RH; // top-left y of row r
+
+let ac=null;
+function ia(){if(ac)return;try{ac=new(AudioContext||webkitAudioContext)();}catch(e){}}
+function beep(f,d,v,t){if(!ac)return;try{const o=ac.createOscillator(),g=ac.createGain();o.type=t||'square';o.frequency.value=f;g.gain.value=v||0.06;g.gain.linearRampToValueAtTime(0,ac.currentTime+d);o.connect(g);g.connect(ac.destination);o.start();o.stop(ac.currentTime+d);}catch(e){}}
+function sndHop(){beep(500,0.04,0.05,'sine');}
+function sndDie(){beep(120,0.25,0.1,'sawtooth');}
+function sndSplash(){beep(200,0.15,0.08,'sine');}
+function sndHome(){beep(660,0.08,0.1,'sine');setTimeout(()=>beep(880,0.1,0.1,'sine'),100);}
+function sndClear(){beep(880,0.1,0.12,'sine');setTimeout(()=>beep(1100,0.12,0.12,'sine'),120);}
+
+const ST_TITLE=0,ST_PLAY=1,ST_PAUSE=2,ST_OVER=3,ST_DEAD=4,ST_LEVEL=5;
+let state=ST_TITLE,stateTimer=0;
+
+let frog,vehicles,riverObjs,homes,score,hiScore,lives,level,timer,maxRow,deathType;
+
+hiScore=0;
+try{const v=localStorage.getItem('frog_best');if(v)hiScore=parseInt(v)||0;}catch(e){}
+function saveHi(){if(score>hiScore){hiScore=score;try{localStorage.setItem('frog_best',String(hiScore));}catch(e){}}}
+
+// Lane definitions
+function laneSpeed(base,lvl){return base*(1+lvl*0.08);}
+
+function createVehicles(){
+  vehicles=[];
+  const defs=[
+    // road rows 1-5: {row, dir, speed, vehicles:[{w,color,gap}]}
+    {row:1,dir:1,spd:70,items:[{w:50,c:'#e44',gap:160},{w:50,c:'#e44',gap:160},{w:50,c:'#e44',gap:160}]},
+    {row:2,dir:-1,spd:100,items:[{w:90,c:'#88f',gap:220},{w:90,c:'#88f',gap:220}]},
+    {row:3,dir:1,spd:60,items:[{w:60,c:'#ff0',gap:200},{w:60,c:'#ff0',gap:200},{w:60,c:'#ff0',gap:200}]},
+    {row:4,dir:-1,spd:130,items:[{w:50,c:'#f80',gap:180},{w:50,c:'#f80',gap:180},{w:50,c:'#f80',gap:180}]},
+    {row:5,dir:1,spd:55,items:[{w:90,c:'#aaa',gap:280},{w:90,c:'#aaa',gap:280}]}
+  ];
+  for(const d of defs){
+    const sp=laneSpeed(d.spd,level);
+    let offset=0;
+    for(const it of d.items){
+      vehicles.push({row:d.row,x:offset,y:ROW_Y(d.row)+RH/2-16,w:it.w,h:32,color:it.c,dir:d.dir,spd:sp});
+      offset+=it.w+it.gap;
+    }
+  }
+}
+
+function createRiver(){
+  riverObjs=[];
+  const defs=[
+    // river rows 7-11
+    {row:7,dir:-1,spd:55,items:[{w:130,type:'log'},{w:130,type:'log'},{w:130,type:'log'}],gap:170},
+    {row:8,dir:1,spd:80,items:[{w:80,type:'turtle'},{w:80,type:'turtle'},{w:80,type:'turtle'}],gap:150,dive:true},
+    {row:9,dir:-1,spd:90,items:[{w:170,type:'log'},{w:170,type:'log'}],gap:200},
+    {row:10,dir:1,spd:65,items:[{w:80,type:'turtle'},{w:80,type:'turtle'},{w:80,type:'turtle'},{w:80,type:'turtle'}],gap:140,dive:false},
+    {row:11,dir:-1,spd:75,items:[{w:90,type:'log'},{w:90,type:'log'},{w:90,type:'log'}],gap:180}
+  ];
+  for(const d of defs){
+    const sp=laneSpeed(d.spd,level);
+    let offset=Math.random()*100;
+    for(let i=0;i<d.items.length;i++){
+      const it=d.items[i];
+      riverObjs.push({
+        row:d.row,x:offset,y:ROW_Y(d.row),w:it.w,h:RH,
+        type:it.type,dir:d.dir,spd:sp,
+        canDive:!!d.dive,diveTimer:d.dive?(4+i*1.5):999,divePhase:0, // 0=up,1=warning,2=submerged,3=rising
+        diveCycle:d.dive?8:999
+      });
+      offset+=it.w+d.gap;
+    }
+  }
+}
+
+function createHomes(){
+  homes=[];
+  // 5 homes evenly spaced
+  const hw=50,gap=(W-5*hw)/6;
+  for(let i=0;i<5;i++){
+    homes.push({x:gap+i*(hw+gap),y:ROW_Y(12),w:hw,h:RH,filled:false});
+  }
+}
+
+function resetFrog(){
+  frog={x:W/2-CW/2,y:ROW_Y(0)+10,row:0,alive:true,hopCd:0,carrying:null};
+  maxRow=0;timer=50;
+}
+
+function startGame(){
+  score=0;lives=3;level=0;
+  createVehicles();createRiver();createHomes();
+  resetFrog();state=ST_PLAY;
+}
+
+function nextLevel(){
+  level++;
+  createVehicles();createRiver();
+  for(const h of homes)h.filled=false;
+  resetFrog();
+  state=ST_LEVEL;stateTimer=1.5;
+  sndClear();
+}
+
+function frogDie(type){
+  frog.alive=false;deathType=type||'hit';
+  if(type==='splash')sndSplash();else sndDie();
+  lives--;
+  if(lives<=0){state=ST_OVER;saveHi();return;}
+  state=ST_DEAD;stateTimer=1;
+}
+
+function frogHome(h){
+  h.filled=true;sndHome();
+  const timeBonus=Math.floor(timer)*5;
+  score+=100+timeBonus;saveHi();
+  if(homes.every(h=>h.filled)){
+    score+=500;saveHi();
+    nextLevel();return;
+  }
+  resetFrog();
+}
+
+// Input
+const keys={},justPressed={};
+addEventListener('keydown',e=>{
+  if(!keys[e.code])justPressed[e.code]=true;
+  keys[e.code]=true;ia();e.preventDefault();
+  if(e.code==='Enter'){if(state===ST_TITLE||state===ST_OVER)startGame();}
+  if(e.code==='KeyP'){if(state===ST_PLAY)state=ST_PAUSE;else if(state===ST_PAUSE)state=ST_PLAY;}
+});
+addEventListener('keyup',e=>{keys[e.code]=false;});
+
+function tryHop(dr,dc){
+  if(!frog.alive||frog.hopCd>0)return;
+  let nx=frog.x+dc*CW;
+  let nr=frog.row+dr;
+  if(nr<0||nr>12)return;
+  if(nx<0||nx+30>W)return;
+  frog.x=nx;frog.row=nr;frog.y=ROW_Y(nr)+(RH-30)/2;
+  frog.hopCd=0.1;frog.carrying=null;
+  sndHop();
+  // Score for forward progress
+  if(nr>maxRow){score+=(nr-maxRow)*10;maxRow=nr;saveHi();}
+}
+
+function update(dt){
+  if(state===ST_DEAD||state===ST_LEVEL){stateTimer-=dt;if(stateTimer<=0){if(state===ST_DEAD){resetFrog();state=ST_PLAY;}else state=ST_PLAY;}return;}
+  if(state!==ST_PLAY)return;
+
+  // Input
+  if(frog.hopCd>0)frog.hopCd-=dt;
+  if(justPressed['ArrowUp']||justPressed['KeyW'])tryHop(1,0);
+  else if(justPressed['ArrowDown']||justPressed['KeyS'])tryHop(-1,0);
+  else if(justPressed['ArrowLeft']||justPressed['KeyA'])tryHop(0,-1);
+  else if(justPressed['ArrowRight']||justPressed['KeyD'])tryHop(0,1);
+  // Clear justPressed
+  for(const k in justPressed)delete justPressed[k];
+
+  // Timer
+  timer-=dt;
+  if(timer<=0){frogDie('time');return;}
+
+  // Vehicles
+  for(const v of vehicles){
+    v.x+=v.dir*v.spd*dt;
+    if(v.dir>0&&v.x>W+20)v.x=-v.w-20;
+    if(v.dir<0&&v.x+v.w<-20)v.x=W+20;
+  }
+
+  // River objects
+  for(const r of riverObjs){
+    r.x+=r.dir*r.spd*dt;
+    if(r.dir>0&&r.x>W+20)r.x=-r.w-20;
+    if(r.dir<0&&r.x+r.w<-20)r.x=W+20;
+    // Dive cycle
+    if(r.canDive){
+      r.diveTimer-=dt;
+      if(r.diveTimer<=0){
+        r.divePhase=(r.divePhase+1)%4;
+        const durations=[4,0.5,2,0.5];
+        r.diveTimer=durations[r.divePhase];
+      }
+    }
+  }
+
+  if(!frog.alive)return;
+
+  // Collision: road (rows 1-5)
+  if(frog.row>=1&&frog.row<=5){
+    const fy=ROW_Y(frog.row),fx=frog.x;
+    for(const v of vehicles){
+      if(v.row!==frog.row)continue;
+      if(fx+28>v.x&&fx+2<v.x+v.w){
+        frogDie('hit');return;
+      }
+    }
+  }
+
+  // River (rows 7-11)
+  if(frog.row>=7&&frog.row<=11){
+    let onPlatform=false;
+    for(const r of riverObjs){
+      if(r.row!==frog.row)continue;
+      if(frog.x+28>r.x&&frog.x+2<r.x+r.w){
+        // Check if submerged
+        if(r.canDive&&r.divePhase===2){continue;} // submerged, not valid
+        onPlatform=true;
+        // Carry frog
+        frog.x+=r.dir*r.spd*dt;
+        break;
+      }
+    }
+    if(!onPlatform){frogDie('splash');return;}
+    // Off-screen check
+    if(frog.x+30<0||frog.x>W){frogDie('splash');return;}
+  }
+
+  // Home row (row 12)
+  if(frog.row>=12){
+    let landed=false;
+    for(const h of homes){
+      if(frog.x+15>h.x&&frog.x+15<h.x+h.w){
+        if(h.filled){frogDie('hit');return;}
+        frogHome(h);landed=true;break;
+      }
+    }
+    if(!landed){frogDie('hit');return;}
+  }
+}
+
+function render(){
+  cx.fillStyle='#111';cx.fillRect(0,0,W,H);
+
+  if(state===ST_TITLE){
+    cx.fillStyle='#0d0';cx.font='bold 52px monospace';cx.textAlign='center';
+    cx.fillText('FROGGER',W/2,180);
+    cx.fillStyle='#ccc';cx.font='15px monospace';
+    cx.fillText('Cross the road — avoid traffic!',W/2,270);
+    cx.fillText('Cross the river on logs and turtles.',W/2,296);
+    cx.fillText('Reach all 5 homes at the top.',W/2,322);
+    cx.fillText('You drown in water without a platform!',W/2,348);
+    cx.fillText('Arrow Keys or WASD to hop. P to pause.',W/2,396);
+    cx.fillStyle='#fff';cx.font='22px monospace';
+    if(Math.floor(Date.now()/600)%2)cx.fillText('Press Enter to Start',W/2,480);
+    if(hiScore>0){cx.fillStyle='#888';cx.font='14px monospace';cx.fillText('Best: '+hiScore,W/2,540);}
+    return;
+  }
+
+  // Draw zones
+  // Water background (rows 7-11)
+  cx.fillStyle='#003';
+  cx.fillRect(0,ROW_Y(11),W,5*RH);
+
+  // Road background (rows 1-5)
+  cx.fillStyle='#222';
+  cx.fillRect(0,ROW_Y(5),W,5*RH);
+  // Road markings
+  cx.strokeStyle='#444';cx.lineWidth=1;cx.setLineDash([12,12]);
+  for(let r=1;r<5;r++){
+    const y=ROW_Y(r);
+    cx.beginPath();cx.moveTo(0,y);cx.lineTo(W,y);cx.stroke();
+  }
+  cx.setLineDash([]);
+
+  // Safe zones
+  cx.fillStyle='#141';
+  cx.fillRect(0,ROW_Y(0),W,RH); // start
+  cx.fillRect(0,ROW_Y(6),W,RH); // middle
+
+  // Home row background
+  cx.fillStyle='#141';
+  cx.fillRect(0,ROW_Y(12),W,RH);
+
+  // Home bays
+  for(const h of homes){
+    cx.fillStyle=h.filled?'#0a0':'#005';
+    cx.fillRect(h.x,h.y+5,h.w,RH-10);
+    if(h.filled){
+      cx.fillStyle='#0f0';
+      cx.fillRect(h.x+15,h.y+12,20,26);
+    }
+  }
+
+  // River objects
+  for(const r of riverObjs){
+    if(r.canDive&&r.divePhase===2)continue; // fully submerged
+    let alpha=1;
+    if(r.canDive&&(r.divePhase===1||r.divePhase===3))alpha=0.4;
+    cx.globalAlpha=alpha;
+    if(r.type==='log'){
+      cx.fillStyle='#843';
+      cx.fillRect(r.x,r.y+8,r.w,RH-16);
+      cx.fillStyle='#965';
+      cx.fillRect(r.x+4,r.y+12,r.w-8,RH-24);
+    }else{
+      // Turtles
+      cx.fillStyle='#0a6';
+      const tw=22,count=Math.floor(r.w/26);
+      for(let i=0;i<count;i++){
+        cx.beginPath();
+        cx.ellipse(r.x+13+i*26,r.y+RH/2,tw/2,16,0,0,Math.PI*2);
+        cx.fill();
+      }
+    }
+    cx.globalAlpha=1;
+  }
+
+  // Vehicles
+  for(const v of vehicles){
+    cx.fillStyle=v.color;
+    const rx=4,ry=v.y;
+    cx.beginPath();
+    cx.moveTo(v.x+rx,ry);cx.lineTo(v.x+v.w-rx,ry);
+    cx.quadraticCurveTo(v.x+v.w,ry,v.x+v.w,ry+rx);
+    cx.lineTo(v.x+v.w,ry+v.h-rx);
+    cx.quadraticCurveTo(v.x+v.w,ry+v.h,v.x+v.w-rx,ry+v.h);
+    cx.lineTo(v.x+rx,ry+v.h);
+    cx.quadraticCurveTo(v.x,ry+v.h,v.x,ry+v.h-rx);
+    cx.lineTo(v.x,ry+rx);
+    cx.quadraticCurveTo(v.x,ry,v.x+rx,ry);
+    cx.fill();
+    // Windshield
+    cx.fillStyle='rgba(150,200,255,0.4)';
+    if(v.dir>0)cx.fillRect(v.x+v.w-14,ry+4,10,v.h-8);
+    else cx.fillRect(v.x+4,ry+4,10,v.h-8);
+  }
+
+  // Frog
+  if(frog.alive&&(state===ST_PLAY||state===ST_PAUSE)){
+    drawFrog(frog.x,frog.y);
+  }
+  if(state===ST_DEAD&&stateTimer>0.5){
+    // Death flash
+    cx.fillStyle='#f44';cx.font='bold 20px monospace';cx.textAlign='center';
+    cx.fillText(deathType==='splash'?'SPLASH!':'SPLAT!',frog.x+15,frog.y);
+  }
+
+  // HUD
+  cx.fillStyle='#000';cx.fillRect(0,0,W,45);
+  cx.fillStyle='#fff';cx.font='14px monospace';cx.textAlign='left';
+  cx.fillText('SCORE: '+score,10,18);
+  cx.fillText('LIVES: '+lives,10,36);
+  cx.textAlign='right';
+  cx.fillText('BEST: '+hiScore,W-10,18);
+  cx.fillText('LEVEL: '+(level+1),W-10,36);
+  cx.textAlign='center';
+  cx.fillText('TIME',W/2,15);
+  // Timer bar
+  const barW=140,barH=10,barX=W/2-barW/2,barY=22;
+  cx.strokeStyle='#666';cx.lineWidth=1;cx.strokeRect(barX,barY,barW,barH);
+  const pct=Math.max(0,timer/50);
+  cx.fillStyle=pct>0.3?'#0f0':pct>0.15?'#ff0':'#f00';
+  cx.fillRect(barX+1,barY+1,(barW-2)*pct,barH-2);
+
+  // Overlays
+  if(state===ST_PAUSE){
+    cx.fillStyle='rgba(0,0,0,0.6)';cx.fillRect(0,0,W,H);
+    cx.fillStyle='#fff';cx.font='bold 48px monospace';cx.textAlign='center';
+    cx.fillText('PAUSED',W/2,H/2);
+    cx.font='16px monospace';cx.fillStyle='#aaa';cx.fillText('Press P to Resume',W/2,H/2+35);
+  }
+  if(state===ST_LEVEL){
+    cx.fillStyle='rgba(0,0,0,0.5)';cx.fillRect(0,0,W,H);
+    cx.fillStyle='#0f0';cx.font='bold 36px monospace';cx.textAlign='center';
+    cx.fillText('LEVEL '+(level+1),W/2,H/2);
+  }
+  if(state===ST_OVER){
+    cx.fillStyle='rgba(0,0,0,0.65)';cx.fillRect(0,0,W,H);
+    cx.fillStyle='#f44';cx.font='bold 48px monospace';cx.textAlign='center';
+    cx.fillText('GAME OVER',W/2,H/2-40);
+    cx.fillStyle='#fff';cx.font='24px monospace';
+    cx.fillText('Score: '+score,W/2,H/2+10);
+    if(score>=hiScore&&score>0){cx.fillStyle='#fd0';cx.font='16px monospace';cx.fillText('NEW HIGH SCORE!',W/2,H/2+40);}
+    cx.fillStyle='#aaa';cx.font='18px monospace';
+    if(Math.floor(Date.now()/600)%2)cx.fillText('Press Enter to Restart',W/2,H/2+80);
+  }
+}
+
+function drawFrog(fx,fy){
+  cx.fillStyle='#0d0';
+  // Body
+  cx.beginPath();cx.ellipse(fx+15,fy+17,12,13,0,0,Math.PI*2);cx.fill();
+  // Eyes
+  cx.fillStyle='#ff0';
+  cx.beginPath();cx.arc(fx+8,fy+6,4,0,Math.PI*2);cx.fill();
+  cx.beginPath();cx.arc(fx+22,fy+6,4,0,Math.PI*2);cx.fill();
+  cx.fillStyle='#000';
+  cx.beginPath();cx.arc(fx+8,fy+6,2,0,Math.PI*2);cx.fill();
+  cx.beginPath();cx.arc(fx+22,fy+6,2,0,Math.PI*2);cx.fill();
+  // Legs
+  cx.fillStyle='#0b0';
+  cx.fillRect(fx,fy+22,8,6);cx.fillRect(fx+22,fy+22,8,6);
+}
+
+let lastTime=0;
+function loop(now){
+  requestAnimationFrame(loop);
+  if(!lastTime){lastTime=now;return;}
+  let dt=(now-lastTime)/1000;lastTime=now;
+  if(dt>0.05)dt=0.05;
+  update(dt);render();
+}
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

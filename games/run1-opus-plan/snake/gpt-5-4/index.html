@@ -1,0 +1,448 @@
+<!--
+  GAME:           Snake
+  RUN:            run1-opus-plan
+  BUILDER:        openai/gpt-5.4
+  PLANNER:        anthropic/claude-opus-4.6
+  BUILD TIME:     1 seconds
+  TOKENS IN:      0
+  TOKENS OUT:     0
+  ESTIMATED COST: $0.00
+  ITERATIONS:     1
+  TOOLS USED:     write, read
+  STATUS:         complete
+  TIMESTAMP:      2026-03-30T23:22:34Z
+  TASKS DONE:     T01,T02,T03,T04,T05,T06,T07,T08,T09,T10,T11,T12
+  FIRST FAILURE:  none
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Snake</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background: #111111;
+      overflow: hidden;
+      font-family: monospace;
+    }
+
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    canvas {
+      display: block;
+      width: 600px;
+      height: 600px;
+      background: #111111;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="game" width="600" height="600" aria-label="Snake game canvas"></canvas>
+  <script>
+    (() => {
+      const canvas = document.getElementById('game');
+      const ctx = canvas.getContext('2d');
+
+      const WIDTH = 600;
+      const HEIGHT = 600;
+      const GRID_SIZE = 20;
+      const CELL_SIZE = 30;
+      const INSET = 2;
+      const START_TICK_RATE = 8;
+      const MAX_TICK_RATE = 15;
+      const TICK_INCREASE = 0.5;
+      const DIRECTIONS = {
+        up: { x: 0, y: -1 },
+        down: { x: 0, y: 1 },
+        left: { x: -1, y: 0 },
+        right: { x: 1, y: 0 }
+      };
+      const OPPOSITES = {
+        up: 'down',
+        down: 'up',
+        left: 'right',
+        right: 'left'
+      };
+      const STATES = {
+        IDLE: 'IDLE',
+        PLAYING: 'PLAYING',
+        PAUSED: 'PAUSED',
+        GAME_OVER: 'GAME_OVER'
+      };
+
+      let state = STATES.IDLE;
+      let score = 0;
+      let highScore = loadHighScore();
+      let tickRate = START_TICK_RATE;
+      let tickAccumulator = 0;
+      let lastTime = 0;
+      let food = null;
+      let queuedDirection = null;
+      let winner = false;
+      let audioCtx = null;
+
+      let snake = [];
+      let direction = 'right';
+
+      function loadHighScore() {
+        try {
+          const value = localStorage.getItem('snakeHighScore');
+          return value ? Number(value) || 0 : 0;
+        } catch (_) {
+          return 0;
+        }
+      }
+
+      function saveHighScore() {
+        try {
+          localStorage.setItem('snakeHighScore', String(highScore));
+        } catch (_) {}
+      }
+
+      function ensureAudio() {
+        if (!audioCtx) {
+          const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+          if (AudioContextClass) {
+            audioCtx = new AudioContextClass();
+          }
+        }
+        if (audioCtx && audioCtx.state === 'suspended') {
+          audioCtx.resume().catch(() => {});
+        }
+      }
+
+      function playTone(type, frequency, duration, rampTo) {
+        if (!audioCtx) return;
+        const now = audioCtx.currentTime;
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = type;
+        osc.frequency.setValueAtTime(frequency, now);
+        if (typeof rampTo === 'number') {
+          osc.frequency.linearRampToValueAtTime(rampTo, now + duration);
+        }
+        gain.gain.setValueAtTime(0.05, now);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(now);
+        osc.stop(now + duration);
+      }
+
+      function playEatSound() {
+        playTone('sine', 880, 0.04);
+      }
+
+      function playDieSound() {
+        playTone('sawtooth', 440, 0.3, 110);
+      }
+
+      function resetSnake() {
+        snake = [
+          { x: 10, y: 10 },
+          { x: 9, y: 10 },
+          { x: 8, y: 10 }
+        ];
+        direction = 'right';
+        queuedDirection = null;
+      }
+
+      function resetGame() {
+        score = 0;
+        tickRate = START_TICK_RATE;
+        tickAccumulator = 0;
+        winner = false;
+        resetSnake();
+        food = spawnFood();
+      }
+
+      function startGame() {
+        ensureAudio();
+        resetGame();
+        state = STATES.PLAYING;
+      }
+
+      function restartToIdle() {
+        resetSnake();
+        food = null;
+        score = 0;
+        tickRate = START_TICK_RATE;
+        tickAccumulator = 0;
+        queuedDirection = null;
+        winner = false;
+        state = STATES.IDLE;
+      }
+
+      function updateHighScore() {
+        if (score > highScore) {
+          highScore = score;
+          saveHighScore();
+        }
+      }
+
+      function randomInt(max) {
+        return Math.floor(Math.random() * max);
+      }
+
+      function isOccupied(x, y) {
+        return snake.some(segment => segment.x === x && segment.y === y);
+      }
+
+      function spawnFood() {
+        const freeCells = [];
+        for (let y = 0; y < GRID_SIZE; y++) {
+          for (let x = 0; x < GRID_SIZE; x++) {
+            if (!isOccupied(x, y)) {
+              freeCells.push({ x, y });
+            }
+          }
+        }
+        if (freeCells.length === 0) {
+          winner = true;
+          state = STATES.GAME_OVER;
+          updateHighScore();
+          return null;
+        }
+        return freeCells[randomInt(freeCells.length)];
+      }
+
+      function queueDirection(nextDirection) {
+        if (state !== STATES.PLAYING) return;
+        if (queuedDirection) return;
+        const activeDirection = queuedDirection || direction;
+        if (nextDirection === activeDirection) return;
+        if (OPPOSITES[direction] === nextDirection) return;
+        queuedDirection = nextDirection;
+      }
+
+      function setGameOver() {
+        state = STATES.GAME_OVER;
+        updateHighScore();
+        playDieSound();
+      }
+
+      function tick() {
+        if (queuedDirection && OPPOSITES[direction] !== queuedDirection) {
+          direction = queuedDirection;
+        }
+        queuedDirection = null;
+
+        const move = DIRECTIONS[direction];
+        const newHead = {
+          x: snake[0].x + move.x,
+          y: snake[0].y + move.y
+        };
+
+        if (newHead.x < 0 || newHead.x >= GRID_SIZE || newHead.y < 0 || newHead.y >= GRID_SIZE) {
+          setGameOver();
+          return;
+        }
+
+        const ateFood = food && newHead.x === food.x && newHead.y === food.y;
+        const bodyToCheck = ateFood ? snake : snake.slice(0, -1);
+
+        if (bodyToCheck.some(segment => segment.x === newHead.x && segment.y === newHead.y)) {
+          setGameOver();
+          return;
+        }
+
+        snake.unshift(newHead);
+
+        if (ateFood) {
+          score += 10;
+          tickRate = Math.min(MAX_TICK_RATE, tickRate + TICK_INCREASE);
+          updateHighScore();
+          playEatSound();
+          food = spawnFood();
+        } else {
+          snake.pop();
+        }
+      }
+
+      function update(dt) {
+        if (state !== STATES.PLAYING) return;
+        tickAccumulator += dt;
+        const tickInterval = 1 / tickRate;
+
+        while (tickAccumulator >= tickInterval && state === STATES.PLAYING) {
+          tickAccumulator -= tickInterval;
+          tick();
+        }
+      }
+
+      function drawCell(x, y, color) {
+        ctx.fillStyle = color;
+        ctx.fillRect(
+          x * CELL_SIZE + INSET,
+          y * CELL_SIZE + INSET,
+          CELL_SIZE - INSET * 2,
+          CELL_SIZE - INSET * 2
+        );
+      }
+
+      function drawGrid() {
+        ctx.strokeStyle = '#1A1A1A';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (let i = 0; i <= GRID_SIZE; i++) {
+          const pos = i * CELL_SIZE + 0.5;
+          ctx.moveTo(pos, 0);
+          ctx.lineTo(pos, HEIGHT);
+          ctx.moveTo(0, pos);
+          ctx.lineTo(WIDTH, pos);
+        }
+        ctx.stroke();
+      }
+
+      function drawSnake() {
+        for (let i = snake.length - 1; i >= 0; i--) {
+          const segment = snake[i];
+          drawCell(segment.x, segment.y, i === 0 ? '#4CAF50' : '#388E3C');
+        }
+      }
+
+      function drawFood() {
+        if (!food) return;
+        drawCell(food.x, food.y, '#F44336');
+      }
+
+      function drawHud() {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '16px monospace';
+        ctx.textBaseline = 'alphabetic';
+        ctx.textAlign = 'left';
+        ctx.fillText('Score: ' + score, 10, 24);
+        ctx.textAlign = 'right';
+        ctx.fillText('Best: ' + highScore, 590, 24);
+      }
+
+      function drawStartScreen() {
+        ctx.fillStyle = '#4CAF50';
+        ctx.font = '56px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('SNAKE', WIDTH / 2, 240);
+
+        ctx.fillStyle = '#AAAAAA';
+        ctx.font = '20px monospace';
+        ctx.fillText('Press Enter to Start', WIDTH / 2, 320);
+      }
+
+      function drawOverlayTitle(title, subline, prompt) {
+        ctx.fillStyle = '#000000CC';
+        ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '40px monospace';
+        ctx.fillText(title, WIDTH / 2, 260);
+
+        ctx.font = '24px monospace';
+        ctx.fillText(subline, WIDTH / 2, 310);
+
+        ctx.fillStyle = '#AAAAAA';
+        ctx.font = '18px monospace';
+        ctx.fillText(prompt, WIDTH / 2, 360);
+      }
+
+      function drawPauseOverlay() {
+        ctx.fillStyle = '#000000CC';
+        ctx.fillRect(0, 0, WIDTH, HEIGHT);
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '36px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('PAUSED', WIDTH / 2, HEIGHT / 2);
+      }
+
+      function render() {
+        ctx.clearRect(0, 0, WIDTH, HEIGHT);
+        ctx.fillStyle = '#111111';
+        ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+        if (state === STATES.IDLE) {
+          drawStartScreen();
+          return;
+        }
+
+        drawGrid();
+        drawFood();
+        drawSnake();
+        drawHud();
+
+        if (state === STATES.PAUSED) {
+          drawPauseOverlay();
+        } else if (state === STATES.GAME_OVER) {
+          const title = winner ? 'YOU WIN' : 'GAME OVER';
+          drawOverlayTitle(title, 'Score: ' + score, 'Press Enter to Restart');
+        }
+      }
+
+      function loop(timestamp) {
+        if (!lastTime) lastTime = timestamp;
+        let dt = (timestamp - lastTime) / 1000;
+        lastTime = timestamp;
+        dt = Math.min(dt, 0.1);
+
+        update(dt);
+        render();
+        requestAnimationFrame(loop);
+      }
+
+      window.addEventListener('keydown', (event) => {
+        const handledCodes = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'KeyW', 'KeyA', 'KeyS', 'KeyD', 'Enter', 'KeyP'];
+        if (handledCodes.includes(event.code)) {
+          event.preventDefault();
+        }
+
+        switch (event.code) {
+          case 'ArrowUp':
+          case 'KeyW':
+            queueDirection('up');
+            break;
+          case 'ArrowDown':
+          case 'KeyS':
+            queueDirection('down');
+            break;
+          case 'ArrowLeft':
+          case 'KeyA':
+            queueDirection('left');
+            break;
+          case 'ArrowRight':
+          case 'KeyD':
+            queueDirection('right');
+            break;
+          case 'Enter':
+            ensureAudio();
+            if (state === STATES.IDLE || state === STATES.GAME_OVER) {
+              startGame();
+            }
+            break;
+          case 'KeyP':
+            if (state === STATES.PLAYING) {
+              state = STATES.PAUSED;
+            } else if (state === STATES.PAUSED) {
+              state = STATES.PLAYING;
+            }
+            break;
+        }
+      });
+
+      restartToIdle();
+      requestAnimationFrame(loop);
+    })();
+  </script>
+</body>
+</html>

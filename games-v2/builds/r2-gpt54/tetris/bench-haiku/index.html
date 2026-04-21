@@ -1,0 +1,441 @@
+<!--
+  GAME:      Tetris
+  RUN:       r2-gpt54
+  BUILDER:   anthropic/claude-haiku-4.5
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tetris</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #000;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      font-family: "Courier New", monospace;
+    }
+    canvas {
+      background: #1a1a1a;
+      display: block;
+      border: 2px solid #333;
+      image-rendering: pixelated;
+      max-width: 100vw;
+      max-height: 100vh;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="tetrisCanvas" width="800" height="600"></canvas>
+  <script>
+    'use strict';
+
+    const canvas = document.getElementById('tetrisCanvas');
+    const ctx = canvas.getContext('2d');
+
+    const WIDTH = 800;
+    const HEIGHT = 600;
+    const PLAYFIELD_X = 240;
+    const PLAYFIELD_Y = 20;
+    const CELL_SIZE = 28;
+    const COLS = 10;
+    const VISIBLE_ROWS = 20;
+    const TOTAL_ROWS = 24;
+
+    const STATES = { TITLE: 'title', PLAYING: 'playing', PAUSED: 'paused', GAME_OVER: 'game_over' };
+
+    const TETROMINOES = {
+      I: { blocks: [[0,0], [1,0], [2,0], [3,0]], color: '#00FFFF' },
+      O: { blocks: [[0,0], [1,0], [0,1], [1,1]], color: '#FFFF00' },
+      T: { blocks: [[1,0], [0,1], [1,1], [2,1]], color: '#FF00FF' },
+      S: { blocks: [[1,0], [2,0], [0,1], [1,1]], color: '#00FF00' },
+      Z: { blocks: [[0,0], [1,0], [1,1], [2,1]], color: '#FF0000' },
+      J: { blocks: [[0,0], [0,1], [1,1], [2,1]], color: '#0000FF' },
+      L: { blocks: [[2,0], [0,1], [1,1], [2,1]], color: '#FF7700' }
+    };
+
+    // Game state
+    let gameState = STATES.TITLE;
+    let board = [];
+    let activePiece = null;
+    let nextPiece = null;
+    let bag = [];
+    let score = 0;
+    let bestScore = parseInt(localStorage.getItem('tetris_best') || '0');
+    let lines = 0;
+    let level = 1;
+    let keys = {};
+    let gravityTimer = 0;
+    let lockTimer = 0;
+    let lockResets = 0;
+    let lastHardDrop = false;
+    let audioCtx = null;
+
+    function initBoard() {
+      board = [];
+      for (let y = 0; y < TOTAL_ROWS; y++) {
+        board[y] = [];
+        for (let x = 0; x < COLS; x++) {
+          board[y][x] = null;
+        }
+      }
+    }
+
+    function getGravityDelay() {
+      const delays = [1000, 850, 700, 550, 420, 300, 200];
+      return delays[Math.min(level - 1, delays.length - 1)];
+    }
+
+    function drawBlock(x, y, color) {
+      const px = PLAYFIELD_X + x * CELL_SIZE;
+      const py = PLAYFIELD_Y + y * CELL_SIZE;
+      if (y >= 4) { // Only draw visible rows
+        ctx.fillStyle = color;
+        ctx.fillRect(px + 2, py + 2, CELL_SIZE - 4, CELL_SIZE - 4);
+        ctx.strokeStyle = '#000';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(px + 2, py + 2, CELL_SIZE - 4, CELL_SIZE - 4);
+      }
+    }
+
+    function generateBag() {
+      bag = Object.keys(TETROMINOES).sort(() => Math.random() - 0.5);
+    }
+
+    function getNextPiece() {
+      if (bag.length === 0) generateBag();
+      const type = bag.shift();
+      return { type: type, rotation: 0, x: 3, y: 0 };
+    }
+
+    function spawnPiece() {
+      if (!nextPiece) nextPiece = getNextPiece();
+      activePiece = nextPiece;
+      nextPiece = getNextPiece();
+      lockTimer = 0;
+      lockResets = 0;
+
+      // Check if spawn position is valid
+      if (!isValidPosition(activePiece)) {
+        gameState = STATES.GAME_OVER;
+        playSound(100, 0.3);
+      }
+    }
+
+    function getRotationBlocks(piece, rot) {
+      let blocks = TETROMINOES[piece.type].blocks.map(b => [...b]);
+      for (let r = 0; r < rot; r++) {
+        blocks = blocks.map(b => [-b[1], b[0]]);
+        const minX = Math.min(...blocks.map(b => b[0]));
+        const minY = Math.min(...blocks.map(b => b[1]));
+        blocks = blocks.map(b => [b[0] - minX, b[1] - minY]);
+      }
+      return blocks;
+    }
+
+    function isValidPosition(piece) {
+      const blocks = getRotationBlocks(piece, piece.rotation);
+      for (let b of blocks) {
+        const x = piece.x + b[0];
+        const y = piece.y + b[1];
+        if (x < 0 || x >= COLS || y >= TOTAL_ROWS) return false;
+        if (y >= 0 && board[y][x]) return false;
+      }
+      return true;
+    }
+
+    function rotatePiece() {
+      const oldRotation = activePiece.rotation;
+      activePiece.rotation = (activePiece.rotation + 1) % 4;
+
+      if (!isValidPosition(activePiece)) {
+        // Wall kick attempts
+        for (let offset of [0, -1, 1, -2, 2]) {
+          activePiece.x += offset;
+          if (isValidPosition(activePiece)) {
+            playSound(600, 0.05);
+            return;
+          }
+          activePiece.x -= offset;
+        }
+        activePiece.rotation = oldRotation;
+      } else {
+        playSound(600, 0.05);
+      }
+    }
+
+    function lockPiece() {
+      const blocks = getRotationBlocks(activePiece, activePiece.rotation);
+      const color = TETROMINOES[activePiece.type].color;
+      for (let b of blocks) {
+        const x = activePiece.x + b[0];
+        const y = activePiece.y + b[1];
+        if (y >= 0 && y < TOTAL_ROWS) board[y][x] = color;
+      }
+      playSound(200, 0.1);
+      checkLineClears();
+      spawnPiece();
+    }
+
+    function checkLineClears() {
+      let clearedCount = 0;
+      for (let y = TOTAL_ROWS - 1; y >= 0; y--) {
+        let full = true;
+        for (let x = 0; x < COLS; x++) {
+          if (!board[y][x]) { full = false; break; }
+        }
+        if (full) {
+          board.splice(y, 1);
+          board.unshift(Array(COLS).fill(null));
+          clearedCount++;
+          y++;
+        }
+      }
+
+      if (clearedCount > 0) {
+        lines += clearedCount;
+        level = Math.floor(lines / 10) + 1;
+        const multipliers = [100, 300, 500, 800];
+        score += (multipliers[clearedCount - 1] || 800) * level;
+        playSound(800, clearedCount === 4 ? 0.2 : 0.1);
+        if (score > bestScore) {
+          bestScore = score;
+          localStorage.setItem('tetris_best', bestScore);
+        }
+      }
+    }
+
+    function getGhostY() {
+      let testPiece = { ...activePiece };
+      while (testPiece.y < TOTAL_ROWS) {
+        testPiece.y++;
+        if (!isValidPosition(testPiece)) {
+          testPiece.y--;
+          break;
+        }
+      }
+      return testPiece.y;
+    }
+
+    document.addEventListener('keydown', (e) => {
+      if (e.code in { ArrowLeft: 1, ArrowRight: 1, ArrowUp: 1, ArrowDown: 1, Space: 1 }) e.preventDefault();
+      keys[e.code] = true;
+
+      if (e.code === 'Enter') {
+        if (gameState === STATES.TITLE || gameState === STATES.GAME_OVER) {
+          initBoard();
+          score = 0;
+          lines = 0;
+          level = 1;
+          generateBag();
+          spawnPiece();
+          gameState = STATES.PLAYING;
+        }
+      }
+      if (e.code === 'KeyP') gameState = gameState === STATES.PLAYING ? STATES.PAUSED : STATES.PLAYING;
+
+      if (gameState === STATES.PLAYING && activePiece) {
+        if (e.code === 'ArrowLeft' || e.code === 'KeyA') {
+          activePiece.x--;
+          if (!isValidPosition(activePiece)) activePiece.x++;
+          else playSound(400, 0.03);
+        }
+        if (e.code === 'ArrowRight' || e.code === 'KeyD') {
+          activePiece.x++;
+          if (!isValidPosition(activePiece)) activePiece.x--;
+          else playSound(400, 0.03);
+        }
+        if (e.code === 'ArrowUp' || e.code === 'KeyW') rotatePiece();
+        if (e.code === 'Space') {
+          let dropDist = 0;
+          let testY = activePiece.y;
+          while (testY < TOTAL_ROWS) {
+            activePiece.y++;
+            dropDist++;
+            if (!isValidPosition(activePiece)) {
+              activePiece.y = testY + dropDist - 1;
+              break;
+            }
+          }
+          score += dropDist * 2;
+          lockTimer = 0;
+          lastHardDrop = true;
+        }
+      }
+    });
+
+    document.addEventListener('keyup', (e) => {
+      keys[e.code] = false;
+    });
+
+    function update(dt) {
+      if (gameState !== STATES.PLAYING || !activePiece) return;
+
+      // Soft drop
+      if (keys['ArrowDown'] || keys['KeyS']) {
+        gravityTimer += dt * 2;
+      } else {
+        gravityTimer += dt;
+      }
+
+      const gravityDelay = getGravityDelay() / 1000;
+      if (gravityTimer >= gravityDelay) {
+        gravityTimer -= gravityDelay;
+        activePiece.y++;
+        if (!isValidPosition(activePiece)) {
+          activePiece.y--;
+          lockTimer += dt;
+        } else {
+          lockTimer = 0;
+          lockResets = 0;
+        }
+      }
+
+      lockTimer += dt;
+      if (lockTimer > 0.5) lockPiece();
+    }
+
+    function render() {
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+      if (gameState === STATES.TITLE) {
+        ctx.fillStyle = '#FFF';
+        ctx.font = 'bold 72px "Courier New"';
+        ctx.textAlign = 'center';
+        ctx.fillText('TETRIS', WIDTH / 2, 100);
+        ctx.font = '16px "Courier New"';
+        ctx.fillStyle = '#AAA';
+        ctx.fillText('Arrange falling blocks into complete rows', WIDTH / 2, 200);
+        ctx.fillText('Arrow keys to move/rotate, Space to drop', WIDTH / 2, 230);
+        ctx.fillStyle = '#FF0';
+        ctx.font = 'bold 24px "Courier New"';
+        ctx.fillText('Press ENTER to Start', WIDTH / 2, 400);
+      } else {
+        // Playfield border
+        ctx.strokeStyle = '#444';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(PLAYFIELD_X, PLAYFIELD_Y, COLS * CELL_SIZE, VISIBLE_ROWS * CELL_SIZE);
+
+        // Board
+        for (let y = 4; y < TOTAL_ROWS; y++) {
+          for (let x = 0; x < COLS; x++) {
+            if (board[y][x]) drawBlock(x, y, board[y][x]);
+          }
+        }
+
+        // Ghost piece
+        if (activePiece) {
+          const ghostY = getGhostY();
+          const blocks = getRotationBlocks(activePiece, activePiece.rotation);
+          const color = TETROMINOES[activePiece.type].color;
+          for (let b of blocks) {
+            const x = activePiece.x + b[0];
+            const y = ghostY + b[1];
+            if (y >= 4 && y < TOTAL_ROWS) {
+              ctx.fillStyle = color + '40';
+              ctx.fillRect(PLAYFIELD_X + x * CELL_SIZE + 2, PLAYFIELD_Y + y * CELL_SIZE + 2, CELL_SIZE - 4, CELL_SIZE - 4);
+            }
+          }
+
+          // Active piece
+          for (let b of blocks) {
+            const x = activePiece.x + b[0];
+            const y = activePiece.y + b[1];
+            drawBlock(x, y, color);
+          }
+        }
+
+        // HUD
+        ctx.fillStyle = '#FFF';
+        ctx.font = '16px "Courier New"';
+        ctx.textAlign = 'left';
+        ctx.fillText('Score: ' + score, 20, 40);
+        ctx.fillText('Best: ' + bestScore, 20, 70);
+        ctx.fillText('Level: ' + level, 20, 100);
+        ctx.fillText('Lines: ' + lines, 20, 130);
+
+        // Next preview
+        ctx.strokeStyle = '#444';
+        ctx.strokeRect(560, 60, 112, 112);
+        ctx.fillStyle = '#AAA';
+        ctx.font = '12px "Courier New"';
+        ctx.fillText('NEXT', 575, 50);
+        if (nextPiece) {
+          const blocks = getRotationBlocks(nextPiece.type, 0);
+          const minX = Math.min(...blocks.map(b => b[0]));
+          const minY = Math.min(...blocks.map(b => b[1]));
+          const offsetX = 560 + 56 - (Math.max(...blocks.map(b => b[0])) * 14);
+          const offsetY = 60 + 56 - (Math.max(...blocks.map(b => b[1])) * 14);
+          for (let b of blocks) {
+            ctx.fillStyle = TETROMINOES[nextPiece.type].color;
+            ctx.fillRect(offsetX + (b[0] - minX) * 14 + 2, offsetY + (b[1] - minY) * 14 + 2, 10, 10);
+          }
+        }
+
+        if (gameState === STATES.PAUSED) {
+          ctx.fillStyle = 'rgba(0,0,0,0.7)';
+          ctx.fillRect(0, 0, WIDTH, HEIGHT);
+          ctx.fillStyle = '#FFF';
+          ctx.font = 'bold 48px "Courier New"';
+          ctx.textAlign = 'center';
+          ctx.fillText('PAUSED', WIDTH / 2, HEIGHT / 2);
+        } else if (gameState === STATES.GAME_OVER) {
+          ctx.fillStyle = 'rgba(0,0,0,0.8)';
+          ctx.fillRect(0, 0, WIDTH, HEIGHT);
+          ctx.fillStyle = '#FF0';
+          ctx.font = 'bold 48px "Courier New"';
+          ctx.textAlign = 'center';
+          ctx.fillText('GAME OVER', WIDTH / 2, 200);
+          ctx.fillStyle = '#FFF';
+          ctx.font = '32px "Courier New"';
+          ctx.fillText('Score: ' + score, WIDTH / 2, 280);
+          ctx.font = 'bold 20px "Courier New"';
+          ctx.fillText('Press ENTER to Restart', WIDTH / 2, 400);
+        }
+      }
+    }
+
+    function playSound(freq, dur) {
+      if (!audioCtx) {
+        try {
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        } catch (e) {
+          return;
+        }
+      }
+      try {
+        const now = audioCtx.currentTime;
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.frequency.value = freq;
+        osc.type = 'square';
+        gain.gain.setValueAtTime(0.1, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + dur);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(now);
+        osc.stop(now + dur);
+      } catch (e) {}
+    }
+
+    let lastTime = performance.now();
+    function gameLoop(now) {
+      const dt = Math.min((now - lastTime) / 1000, 0.016);
+      lastTime = now;
+      update(dt);
+      render();
+      requestAnimationFrame(gameLoop);
+    }
+
+    initBoard();
+    generateBag();
+    requestAnimationFrame(gameLoop);
+  </script>
+</body>
+</html>

@@ -1,0 +1,309 @@
+<!--
+  GAME:      Galaga
+  RUN:       r3-gemini-pro
+  BUILDER:   google/gemini-3-flash-preview
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Galaga - Arcade Classic</title>
+    <style>
+        body { margin: 0; background-color: #000; display: flex; justify-content: center; align-items: center; height: 100vh; overflow: hidden; font-family: 'Courier New', Courier, monospace; }
+        canvas { background-color: #000; border: 2px solid #333; display: block; image-rendering: pixelated; }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas" width="600" height="800"></canvas>
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        // --- Constants & Config ---
+        const WIDTH = 600, HEIGHT = 800;
+        const PLAYER_SPEED = 350;
+        const BULLET_SPEED = 800;
+        const GRID_ROWS = 5, GRID_COLS = 10;
+        const GRID_SPACING_X = 50, GRID_SPACING_Y = 40;
+
+        // --- Game State ---
+        let gameState = 'START'; // START, PLAYING, CAPTURE, STAGE_CLEAR, GAMEOVER
+        let score = 0, highScore = parseInt(localStorage.getItem('galaga_hi')) || 0;
+        let lives = 3, stage = 1;
+        let lastTime = 0, dt = 0;
+        let keys = {};
+
+        // --- Entities ---
+        let player = { x: WIDTH/2 - 15, y: HEIGHT - 60, w: 30, h: 30, bullets: [], dual: false, capturing: false };
+        let enemies = [];
+        let enemyBullets = [];
+        let stars = [];
+        let diveTimer = 0;
+
+        // --- Audio Context ---
+        let audioCtx = null;
+        function initAudio() { if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+        function playSound(freq, dur, type = 'square', sweep = null) {
+            if (!audioCtx) return;
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.type = type;
+            osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+            if (sweep) osc.frequency.exponentialRampToValueAtTime(sweep, audioCtx.currentTime + dur);
+            gain.gain.setValueAtTime(0.05, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + dur);
+            osc.connect(gain); gain.connect(audioCtx.destination);
+            osc.start(); osc.stop(audioCtx.currentTime + dur);
+        }
+
+        // --- Initialization ---
+        function initStars() {
+            for (let i = 0; i < 100; i++) {
+                stars.push({ x: Math.random() * WIDTH, y: Math.random() * HEIGHT, s: Math.random() * 2 + 1, c: ['#fff', '#aaf', '#faa'][Math.floor(Math.random()*3)] });
+            }
+        }
+
+        function initStage() {
+            enemies = [];
+            enemyBullets = [];
+            const offsetX = (WIDTH - (GRID_COLS * GRID_SPACING_X)) / 2;
+            const offsetY = 100;
+
+            for (let r = 0; r < GRID_ROWS; r++) {
+                for (let c = 0; c < GRID_COLS; c++) {
+                    let type = 'blue';
+                    let pts = 50;
+                    if (r === 0) { type = 'boss'; pts = 150; }
+                    else if (r < 3) { type = 'red'; pts = 80; }
+                    
+                    enemies.push({
+                        gridX: offsetX + c * GRID_SPACING_X,
+                        gridY: offsetY + r * GRID_SPACING_Y,
+                        x: WIDTH/2, y: -50, // Start offscreen for entrance
+                        w: 30, h: 30,
+                        type, pts, hp: (type === 'boss' ? 2 : 1),
+                        state: 'ENTRANCE',
+                        path: 0, pathProgress: 0,
+                        diveX: 0, diveY: 0,
+                        capturedShip: false
+                    });
+                }
+            }
+            diveTimer = 2; // Wait a few seconds before diving
+        }
+
+        // --- Graphics ---
+        function drawShip(x, y, color = '#fff', captured = false) {
+            ctx.fillStyle = captured ? '#f55' : color;
+            ctx.beginPath();
+            ctx.moveTo(x + 15, y);
+            ctx.lineTo(x, y + 30);
+            ctx.lineTo(x + 5, y + 30);
+            ctx.lineTo(x + 5, y + 25);
+            ctx.lineTo(x + 25, y + 25);
+            ctx.lineTo(x + 25, y + 30);
+            ctx.lineTo(x + 30, y + 30);
+            ctx.closePath();
+            ctx.fill();
+            // Accents
+            ctx.fillStyle = captured ? '#822' : '#f44';
+            ctx.fillRect(x + 12, y + 10, 6, 10);
+        }
+
+        function drawEnemy(e) {
+            ctx.fillStyle = e.type === 'boss' ? (e.hp > 1 ? '#0f0' : '#f0f') : (e.type === 'red' ? '#f00' : '#0cf');
+            ctx.fillRect(e.x + 5, e.y + 10, 20, 10);
+            ctx.fillRect(e.x + 12, e.y + 2, 6, 26);
+            // Wings/Antennae
+            ctx.beginPath();
+            ctx.moveTo(e.x + 5, e.y + 10); ctx.lineTo(e.x, e.y + 5); ctx.lineTo(e.x, e.y + 15); ctx.fill();
+            ctx.beginPath();
+            ctx.moveTo(e.x + 25, e.y + 10); ctx.lineTo(e.x + 30, e.y + 5); ctx.lineTo(e.x + 30, e.y + 15); ctx.fill();
+        }
+
+        // --- Logic ---
+        function update(time) {
+            dt = Math.min((time - lastTime) / 1000, 0.1);
+            lastTime = time;
+
+            // Starfield
+            stars.forEach(s => {
+                s.y += s.s * 50 * dt;
+                if (s.y > HEIGHT) s.y = 0;
+            });
+
+            if (gameState === 'START') {
+                if (keys['Enter'] || keys[' ']) { initAudio(); initStage(); gameState = 'PLAYING'; }
+                return;
+            }
+
+            if (gameState === 'PLAYING') {
+                // Player Move
+                if (keys['ArrowLeft'] && player.x > 0) player.x -= PLAYER_SPEED * dt;
+                if (keys['ArrowRight'] && player.x < WIDTH - (player.dual ? 60 : 30)) player.x += PLAYER_SPEED * dt;
+
+                // Player Fire
+                if (keys[' '] && player.bullets.length < (player.dual ? 4 : 2)) {
+                    if (time - (player.lastFire || 0) > 150) {
+                        playSound(1200, 0.05, 'square', 400);
+                        player.bullets.push({ x: player.x + 13, y: player.y });
+                        if (player.dual) player.bullets.push({ x: player.x + 43, y: player.y });
+                        player.lastFire = time;
+                    }
+                }
+
+                updateBullets();
+                updateEnemies();
+                checkCollisions();
+
+                if (enemies.length === 0) {
+                    gameState = 'STAGE_CLEAR';
+                    setTimeout(() => { stage++; initStage(); gameState = 'PLAYING'; }, 2000);
+                }
+            }
+        }
+
+        function updateBullets() {
+            player.bullets.forEach((b, i) => {
+                b.y -= BULLET_SPEED * dt;
+                if (b.y < -20) player.bullets.splice(i, 1);
+            });
+            enemyBullets.forEach((b, i) => {
+                b.y += 300 * dt;
+                if (b.y > HEIGHT) enemyBullets.splice(i, 1);
+            });
+        }
+
+        function updateEnemies() {
+            const gridPulse = Math.sin(Date.now() / 1000) * 30;
+            
+            enemies.forEach(e => {
+                if (e.state === 'ENTRANCE') {
+                    // Fly to grid
+                    const dx = e.gridX + gridPulse - e.x;
+                    const dy = e.gridY - e.y;
+                    const dist = Math.sqrt(dx*dx + dy*dy);
+                    if (dist < 5) { e.x = e.gridX + gridPulse; e.y = e.gridY; e.state = 'GRID'; }
+                    else { e.x += dx/dist * 200 * dt; e.y += dy/dist * 200 * dt; }
+                } else if (e.state === 'GRID') {
+                    e.x = e.gridX + gridPulse;
+                    e.y = e.gridY;
+                } else if (e.state === 'DIVE') {
+                    e.y += 250 * dt;
+                    e.x += Math.sin(e.y / 50) * 100 * dt; // Simple wavy dive
+                    if (e.y > HEIGHT) { e.y = -50; e.state = 'ENTRANCE'; }
+                    
+                    if (Math.random() < 0.01) enemyBullets.push({ x: e.x + 15, y: e.y + 30 });
+                }
+            });
+
+            // Random dive
+            diveTimer -= dt;
+            if (diveTimer <= 0 && enemies.length > 0) {
+                let available = enemies.filter(e => e.state === 'GRID');
+                if (available.length > 0) {
+                    let diver = available[Math.floor(Math.random() * available.length)];
+                    diver.state = 'DIVE';
+                }
+                diveTimer = 1 + Math.random() * 2;
+            }
+        }
+
+        function checkCollisions() {
+            player.bullets.forEach((b, bi) => {
+                enemies.forEach((e, ei) => {
+                    if (b.x > e.x && b.x < e.x + e.w && b.y > e.y && b.y < e.y + e.h) {
+                        player.bullets.splice(bi, 1);
+                        e.hp--;
+                        if (e.hp <= 0) {
+                            score += (e.state === 'DIVE' ? e.pts * 2 : e.pts);
+                            playSound(400, 0.1, 'sawtooth', 100);
+                            enemies.splice(ei, 1);
+                        } else {
+                            playSound(600, 0.05);
+                        }
+                    }
+                });
+            });
+
+            enemyBullets.forEach((b, bi) => {
+                if (b.x > player.x && b.x < player.x + (player.dual ? 60 : 30) && b.y > player.y && b.y < player.y + 30) {
+                    die();
+                }
+            });
+
+            enemies.forEach(e => {
+                if (e.x > player.x && e.x < player.x + (player.dual ? 60 : 30) && e.y > player.y && e.y < player.y + 30) {
+                    die();
+                }
+            });
+
+            if (score > highScore) { highScore = score; localStorage.setItem('galaga_hi', highScore); }
+        }
+
+        function die() {
+            lives--;
+            playSound(100, 0.5, 'sawtooth', 20);
+            if (lives <= 0) { gameState = 'GAMEOVER'; }
+            else { 
+                player.x = WIDTH/2 - 15; player.dual = false;
+                initStage();
+            }
+        }
+
+        // --- Render ---
+        function draw() {
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+            stars.forEach(s => { ctx.fillStyle = s.c; ctx.fillRect(s.x, s.y, s.s, s.s); });
+
+            if (gameState === 'START') {
+                ctx.fillStyle = '#f00'; ctx.font = 'bold 60px Courier New'; ctx.textAlign = 'center';
+                ctx.fillText('GALAGA', WIDTH/2, HEIGHT/2 - 50);
+                ctx.fillStyle = '#fff'; ctx.font = '20px Courier New';
+                ctx.fillText('PRESS SPACE TO START', WIDTH/2, HEIGHT/2 + 50);
+                return;
+            }
+
+            drawShip(player.x, player.y);
+            if (player.dual) drawShip(player.x + 32, player.y);
+
+            enemies.forEach(drawEnemy);
+
+            ctx.fillStyle = '#ff0';
+            player.bullets.forEach(b => ctx.fillRect(b.x, b.y, 4, 15));
+            ctx.fillStyle = '#f00';
+            enemyBullets.forEach(b => ctx.fillRect(b.x, b.y, 6, 12));
+
+            // HUD
+            ctx.fillStyle = '#f00'; ctx.font = '20px Courier New'; ctx.textAlign = 'left';
+            ctx.fillText(`SCORE: ${score}`, 20, 30);
+            ctx.textAlign = 'right';
+            ctx.fillText(`HIGH: ${highScore}`, WIDTH - 20, 30);
+            ctx.textAlign = 'center';
+            ctx.fillText(`STAGE ${stage}`, WIDTH/2, HEIGHT - 20);
+            
+            for(let i=0; i<lives-1; i++) drawShip(20 + i*40, HEIGHT - 40, '#f44');
+
+            if (gameState === 'GAMEOVER') {
+                ctx.fillStyle = '#f00'; ctx.font = 'bold 50px Courier New'; ctx.textAlign = 'center';
+                ctx.fillText('GAME OVER', WIDTH/2, HEIGHT/2);
+            }
+        }
+
+        function run(time) {
+            update(time);
+            draw();
+            requestAnimationFrame(run);
+        }
+
+        initStars();
+        window.addEventListener('keydown', e => keys[e.key] = true);
+        window.addEventListener('keyup', e => keys[e.key] = false);
+        requestAnimationFrame(run);
+
+    </script>
+</body>
+</html>

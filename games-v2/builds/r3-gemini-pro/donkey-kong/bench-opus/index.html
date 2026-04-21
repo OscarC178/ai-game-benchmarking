@@ -1,0 +1,548 @@
+<!--
+  GAME:      Donkey Kong
+  RUN:       r3-gemini-pro
+  BUILDER:   anthropic/claude-opus-4.6
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Donkey Kong</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;display:flex;justify-content:center;align-items:center;height:100vh;overflow:hidden}
+canvas{display:block}
+</style>
+</head>
+<body>
+<canvas id="c" width="600" height="750"></canvas>
+<script>
+(function(){
+'use strict';
+const cv=document.getElementById('c'),cx=cv.getContext('2d');
+const W=600,H=750;
+
+let ac=null;
+function ia(){if(ac)return;try{ac=new(AudioContext||webkitAudioContext)();}catch(e){}}
+function tone(f,d,v,t){if(!ac)return;try{const o=ac.createOscillator(),g=ac.createGain();o.type=t||'square';o.frequency.value=f;g.gain.value=v||0.04;g.gain.linearRampToValueAtTime(0,ac.currentTime+d);o.connect(g);g.connect(ac.destination);o.start();o.stop(ac.currentTime+d);}catch(e){}}
+function sndJump(){if(!ac)return;try{const o=ac.createOscillator(),g=ac.createGain();o.type='sine';o.frequency.setValueAtTime(250,ac.currentTime);o.frequency.linearRampToValueAtTime(500,ac.currentTime+0.12);g.gain.value=0.06;g.gain.linearRampToValueAtTime(0,ac.currentTime+0.12);o.connect(g);g.connect(ac.destination);o.start();o.stop(ac.currentTime+0.12);}catch(e){}}
+function sndSmash(){tone(100,0.08,0.1,'sawtooth');}
+function sndDie(){tone(400,0.2,0.06);setTimeout(()=>tone(300,0.2,0.06),200);setTimeout(()=>tone(200,0.3,0.06),400);}
+function sndWin(){tone(523,0.1,0.06,'sine');setTimeout(()=>tone(659,0.1,0.06,'sine'),120);setTimeout(()=>tone(784,0.15,0.06,'sine'),240);}
+function sndStep(){tone(800+(Math.random()*200),0.02,0.02);}
+
+// Girders: each is {x1,y1,x2,y2} - line segments, left to right
+// 6 levels: L1(bottom) to L6(top platform)
+const GIRDERS=[];
+const LADDERS=[];
+const HAMMERS_DEF=[];
+
+function buildLevel(){
+  GIRDERS.length=0;LADDERS.length=0;HAMMERS_DEF.length=0;
+  const gw=W-40,gx=20;
+  // L1: bottom, slopes up-right
+  GIRDERS.push({x1:gx,y1:660,x2:gx+gw,y2:640,level:1});
+  // L2: slopes up-left
+  GIRDERS.push({x1:gx,y1:550,x2:gx+gw,y2:570,level:2});
+  // L3: slopes up-right
+  GIRDERS.push({x1:gx,y1:470,x2:gx+gw,y2:450,level:3});
+  // L4: slopes up-left
+  GIRDERS.push({x1:gx,y1:360,x2:gx+gw,y2:380,level:4});
+  // L5: slopes up-right
+  GIRDERS.push({x1:gx,y1:280,x2:gx+gw,y2:260,level:5});
+  // L6: top platform (short, center-left)
+  GIRDERS.push({x1:120,y1:180,x2:380,y2:180,level:6});
+
+  // Ladders: {x, topG, botG, broken}
+  // Between L1-L2
+  LADDERS.push({x:530,topLevel:2,botLevel:1,broken:false});
+  LADDERS.push({x:300,topLevel:2,botLevel:1,broken:true});
+  LADDERS.push({x:120,topLevel:2,botLevel:1,broken:false});
+  // Between L2-L3
+  LADDERS.push({x:80,topLevel:3,botLevel:2,broken:false});
+  LADDERS.push({x:350,topLevel:3,botLevel:2,broken:true});
+  LADDERS.push({x:500,topLevel:3,botLevel:2,broken:false});
+  // Between L3-L4
+  LADDERS.push({x:530,topLevel:4,botLevel:3,broken:false});
+  LADDERS.push({x:200,topLevel:4,botLevel:3,broken:false});
+  LADDERS.push({x:100,topLevel:4,botLevel:3,broken:true});
+  // Between L4-L5
+  LADDERS.push({x:80,topLevel:5,botLevel:4,broken:false});
+  LADDERS.push({x:400,topLevel:5,botLevel:4,broken:true});
+  LADDERS.push({x:520,topLevel:5,botLevel:4,broken:false});
+  // Between L5-L6
+  LADDERS.push({x:200,topLevel:6,botLevel:5,broken:false});
+
+  // Hammers
+  HAMMERS_DEF.push({x:100,level:3});
+  HAMMERS_DEF.push({x:480,level:4});
+}
+buildLevel();
+
+function girderYAt(g,x){
+  const t=Math.max(0,Math.min(1,(x-g.x1)/(g.x2-g.x1)));
+  return g.y1+(g.y2-g.y1)*t;
+}
+
+function ladderYRange(lad){
+  const topG=GIRDERS.find(g=>g.level===lad.topLevel);
+  const botG=GIRDERS.find(g=>g.level===lad.botLevel);
+  if(!topG||!botG)return{top:0,bot:0};
+  return{top:girderYAt(topG,lad.x),bot:girderYAt(botG,lad.x)};
+}
+
+const ST_TITLE=0,ST_PLAY=1,ST_DEAD=2,ST_OVER=3,ST_WIN=4,ST_READY=5;
+let state=ST_TITLE,stateTimer=0;
+
+let mario,barrels,particles,hammers;
+let score,hiScore,lives,level,bonus,barrelTimer,barrelInterval;
+let dkAnim,dkAnimTimer;
+
+hiScore=0;
+try{const v=localStorage.getItem('dk3_best');if(v)hiScore=parseInt(v)||0;}catch(e){}
+function saveHi(){if(score>hiScore){hiScore=score;try{localStorage.setItem('dk3_best',String(hiScore));}catch(e){}}}
+
+function resetMario(){
+  mario={x:50,y:0,w:24,h:28,vx:0,vy:0,grounded:false,onLadder:false,
+    dir:1,jumping:false,climbing:false,hammer:null,hammerTimer:0,hammerSwing:0,
+    walkFrame:0,alive:true,currentGirder:null,stepTimer:0};
+  // Place on L1
+  const g=GIRDERS[0];
+  mario.y=girderYAt(g,mario.x)-mario.h;
+  mario.currentGirder=g;
+}
+
+function startGame(){
+  score=0;lives=3;level=1;bonus=5000;
+  barrels=[];particles=[];
+  barrelTimer=0;barrelInterval=2.5;
+  dkAnim=0;dkAnimTimer=0;
+  initHammers();resetMario();
+  state=ST_READY;stateTimer=2;
+}
+
+function initHammers(){
+  hammers=HAMMERS_DEF.map(h=>{
+    const g=GIRDERS.find(g2=>g2.level===h.level);
+    return{x:h.x,y:girderYAt(g,h.x)-40,w:16,h:16,active:true};
+  });
+}
+
+function nextLevelStart(){
+  level++;bonus=Math.max(1000,5000-level*500);
+  barrelInterval=Math.max(0.8,2.5-level*0.2);
+  barrels=[];particles=[];barrelTimer=0;
+  initHammers();resetMario();
+  state=ST_READY;stateTimer=2;
+}
+
+function killMario(){
+  if(!mario.alive)return;
+  mario.alive=false;sndDie();
+  state=ST_DEAD;stateTimer=1.5;
+}
+
+function findGirderBelow(x,y){
+  let best=null,bestY=Infinity;
+  for(const g of GIRDERS){
+    if(x<g.x1-5||x>g.x2+5)continue;
+    const gy=girderYAt(g,x);
+    if(gy>=y-2&&gy<bestY){bestY=gy;best=g;}
+  }
+  return best;
+}
+
+const keys={};
+addEventListener('keydown',e=>{keys[e.code]=true;ia();e.preventDefault();});
+addEventListener('keyup',e=>{keys[e.code]=false;});
+
+function update(dt){
+  if(state===ST_TITLE){if(keys['Enter']||keys['Space'])startGame();return;}
+  if(state===ST_OVER){if(keys['Enter']||keys['Space']){state=ST_TITLE;}return;}
+  if(state===ST_READY){stateTimer-=dt;if(stateTimer<=0)state=ST_PLAY;return;}
+  if(state===ST_WIN){stateTimer-=dt;if(stateTimer<=0)nextLevelStart();return;}
+  if(state===ST_DEAD){
+    stateTimer-=dt;
+    if(stateTimer<=0){lives--;if(lives<=0){state=ST_OVER;saveHi();return;}barrels=[];resetMario();state=ST_READY;stateTimer=1.5;}
+    return;
+  }
+
+  // DK animation
+  dkAnimTimer+=dt;
+  if(dkAnimTimer>0.5){dkAnimTimer=0;dkAnim=1-dkAnim;}
+
+  // Bonus timer
+  bonus-=dt*50;
+  if(bonus<=0){bonus=0;killMario();return;}
+
+  // Barrel spawning
+  barrelTimer+=dt;
+  if(barrelTimer>=barrelInterval){
+    barrelTimer=0;
+    const g6=GIRDERS[5];
+    const spawnX=160,spawnY=girderYAt(g6,160);
+    barrels.push({x:spawnX,y:spawnY,w:18,h:18,vx:80+level*10,vy:0,
+      rolling:true,onGirder:GIRDERS[5],falling:false,scored:false});
+  }
+
+  // Mario movement
+  if(mario.alive){
+    const speed=120;
+    const hasHammer=mario.hammer!==null;
+
+    if(mario.climbing){
+      mario.vx=0;
+      let cy=0;
+      if(keys['ArrowUp']||keys['KeyW'])cy=-80;
+      if(keys['ArrowDown']||keys['KeyS'])cy=80;
+      mario.y+=cy*dt;
+
+      // Check if reached top or bottom of ladder
+      const lad=mario.currentLadder;
+      if(lad){
+        const yr=ladderYRange(lad);
+        if(mario.y+mario.h<=yr.top){
+          mario.climbing=false;mario.y=yr.top-mario.h;
+          mario.currentGirder=GIRDERS.find(g=>g.level===lad.topLevel);
+        }
+        if(mario.y+mario.h>=yr.bot){
+          mario.climbing=false;mario.y=yr.bot-mario.h;
+          mario.currentGirder=GIRDERS.find(g=>g.level===lad.botLevel);
+        }
+      }
+    }else{
+      // Horizontal
+      let dx=0;
+      if(keys['ArrowLeft']||keys['KeyA']){dx=-speed;mario.dir=-1;}
+      if(keys['ArrowRight']||keys['KeyD']){dx=speed;mario.dir=1;}
+
+      if(!mario.jumping){
+        mario.x+=dx*dt;
+        mario.stepTimer+=Math.abs(dx)*dt;
+        if(mario.stepTimer>30){mario.stepTimer=0;if(dx!==0)sndStep();}
+      }else{
+        mario.x+=mario.vx*dt;
+      }
+
+      // Clamp
+      mario.x=Math.max(20,Math.min(W-20-mario.w,mario.x));
+
+      // Jump
+      if((keys['Space'])&&mario.grounded&&!mario.jumping&&!hasHammer){
+        mario.vy=-280;mario.jumping=true;mario.grounded=false;
+        mario.vx=dx;sndJump();
+        keys['Space']=false;
+      }
+
+      // Gravity
+      mario.vy+=700*dt;
+      mario.y+=mario.vy*dt;
+
+      // Ground check
+      const g=findGirderBelow(mario.x+mario.w/2,mario.y+mario.h-5);
+      if(g){
+        const gy=girderYAt(g,mario.x+mario.w/2);
+        if(mario.y+mario.h>=gy&&mario.vy>=0){
+          mario.y=gy-mario.h;mario.vy=0;mario.grounded=true;mario.jumping=false;mario.vx=0;
+          mario.currentGirder=g;
+        }
+      }else{
+        mario.grounded=false;
+      }
+
+      // Fall off screen
+      if(mario.y>H+50){killMario();return;}
+
+      // Ladder entry
+      if(!hasHammer&&(keys['ArrowUp']||keys['KeyW']||keys['ArrowDown']||keys['KeyS'])){
+        for(const lad of LADDERS){
+          if(lad.broken)continue;
+          const yr=ladderYRange(lad);
+          if(Math.abs(mario.x+mario.w/2-lad.x)<14){
+            const my=mario.y+mario.h;
+            if(my>=yr.top-5&&my<=yr.bot+5){
+              if((keys['ArrowUp']||keys['KeyW'])&&my>yr.top+2){
+                mario.climbing=true;mario.currentLadder=lad;mario.x=lad.x-mario.w/2;mario.vy=0;mario.jumping=false;break;
+              }
+              if((keys['ArrowDown']||keys['KeyS'])&&my<yr.bot-2){
+                mario.climbing=true;mario.currentLadder=lad;mario.x=lad.x-mario.w/2;mario.vy=0;mario.jumping=false;break;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Hammer
+    if(hasHammer){
+      mario.hammerTimer-=dt;
+      mario.hammerSwing+=dt*12;
+      if(mario.hammerTimer<=0){mario.hammer=null;}
+    }
+    for(const h of hammers){
+      if(!h.active)continue;
+      if(Math.abs(mario.x+mario.w/2-h.x)<20&&Math.abs(mario.y-h.y)<25){
+        h.active=false;mario.hammer=h;mario.hammerTimer=8;mario.hammerSwing=0;
+      }
+    }
+
+    // Reach Pauline
+    if(mario.y<200&&mario.x>200&&mario.x<340){
+      score+=bonus;saveHi();sndWin();
+      state=ST_WIN;stateTimer=2;return;
+    }
+  }
+
+  // Update barrels
+  for(let i=barrels.length-1;i>=0;i--){
+    const b=barrels[i];
+
+    if(b.falling){
+      b.vy+=500*dt;
+      b.y+=b.vy*dt;
+      const g=findGirderBelow(b.x+b.w/2,b.y+b.h-5);
+      if(g&&b.vy>0){
+        const gy=girderYAt(g,b.x+b.w/2);
+        if(b.y+b.h>=gy){
+          b.y=gy-b.h;b.vy=0;b.falling=false;b.onGirder=g;
+          b.rolling=true;
+          // Determine direction based on girder slope
+          const slope=(g.y2-g.y1)/(g.x2-g.x1);
+          b.vx=slope>0?(80+level*10):-(80+level*10);
+        }
+      }
+      if(b.y>H+20){barrels.splice(i,1);continue;}
+    }else if(b.rolling&&b.onGirder){
+      const g=b.onGirder;
+      const slope=(g.y2-g.y1)/(g.x2-g.x1);
+      // Roll direction: downhill
+      if(b.vx===0)b.vx=slope>0?(80+level*10):-(80+level*10);
+      b.x+=b.vx*dt;
+      const gy=girderYAt(g,b.x+b.w/2);
+      b.y=gy-b.h;
+
+      // Check ladder drop
+      for(const lad of LADDERS){
+        if(Math.abs(b.x+b.w/2-lad.x)<10){
+          const yr=ladderYRange(lad);
+          if(Math.abs(b.y+b.h-yr.top)<6&&Math.random()<0.2*dt*10){
+            b.falling=true;b.rolling=false;b.vy=0;b.vx=0;
+            break;
+          }
+        }
+      }
+
+      // Edge drop
+      if(b.x<g.x1-5||b.x+b.w>g.x2+5){
+        b.falling=true;b.rolling=false;b.vy=0;b.vx=0;
+      }
+    }
+
+    // Remove if off screen
+    if(b.y>H+30||b.x<-30||b.x>W+30){barrels.splice(i,1);continue;}
+
+    // Collision with mario
+    if(mario.alive&&!mario.climbing){
+      const mx=mario.x,my=mario.y,mw=mario.w,mh=mario.h;
+      if(b.x+b.w>mx+4&&b.x<mx+mw-4&&b.y+b.h>my+4&&b.y<my+mh-4){
+        if(mario.hammer&&mario.hammerTimer>0){
+          barrels.splice(i,1);score+=300;saveHi();sndSmash();
+          for(let k=0;k<5;k++){const a=Math.random()*Math.PI*2,sp=40+Math.random()*80;
+            particles.push({x:b.x+b.w/2,y:b.y+b.h/2,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,life:0.4,maxLife:0.4});}
+          continue;
+        }
+        killMario();return;
+      }
+    }
+
+    // Score for jumping over
+    if(!b.scored&&mario.alive&&mario.jumping){
+      if(Math.abs(b.x+b.w/2-mario.x-mario.w/2)<20&&mario.y+mario.h<b.y+4){
+        b.scored=true;score+=100;saveHi();
+      }
+    }
+  }
+
+  // Particles
+  for(let i=particles.length-1;i>=0;i--){
+    const p=particles[i];p.x+=p.vx*dt;p.y+=p.vy*dt;p.life-=dt;
+    if(p.life<=0)particles.splice(i,1);
+  }
+}
+
+function render(){
+  cx.fillStyle='#000';cx.fillRect(0,0,W,H);
+
+  if(state===ST_TITLE){
+    cx.fillStyle='#e22';cx.font='bold 44px monospace';cx.textAlign='center';
+    cx.fillText('DONKEY KONG',W/2,260);
+    cx.fillStyle='#fff';cx.font='16px monospace';
+    cx.fillText('Climb to rescue Pauline!',W/2,330);
+    cx.fillText('Jump over barrels. Grab hammers!',W/2,360);
+    cx.fillText('← → Move  ↑↓ Climb  Space Jump',W/2,410);
+    cx.font='22px monospace';
+    if(Math.floor(Date.now()/600)%2)cx.fillText('Press Enter / Space',W/2,490);
+    if(hiScore>0){cx.fillStyle='#666';cx.font='14px monospace';cx.fillText('Best: '+hiScore,W/2,550);}
+    return;
+  }
+
+  // Girders
+  for(const g of GIRDERS){
+    cx.strokeStyle='#e44';cx.lineWidth=6;
+    cx.beginPath();cx.moveTo(g.x1,g.y1);cx.lineTo(g.x2,g.y2);cx.stroke();
+    // Rivet pattern
+    cx.fillStyle='#c22';
+    const segs=Math.floor((g.x2-g.x1)/20);
+    for(let i=0;i<=segs;i++){
+      const t=i/segs;
+      const rx=g.x1+(g.x2-g.x1)*t;
+      const ry=g.y1+(g.y2-g.y1)*t;
+      cx.fillRect(rx-2,ry-1,4,4);
+    }
+  }
+
+  // Ladders
+  for(const lad of LADDERS){
+    const yr=ladderYRange(lad);
+    cx.strokeStyle='#0cc';cx.lineWidth=2;
+    // Rails
+    cx.beginPath();cx.moveTo(lad.x-6,yr.top);cx.lineTo(lad.x-6,yr.bot);cx.stroke();
+    cx.beginPath();cx.moveTo(lad.x+6,yr.top);cx.lineTo(lad.x+6,yr.bot);cx.stroke();
+    // Rungs
+    if(!lad.broken){
+      const rungs=Math.floor((yr.bot-yr.top)/12);
+      for(let i=0;i<=rungs;i++){
+        const ry=yr.top+i*12;
+        cx.beginPath();cx.moveTo(lad.x-6,ry);cx.lineTo(lad.x+6,ry);cx.stroke();
+      }
+    }else{
+      // Partial rungs
+      const ry1=yr.top+4,ry2=yr.bot-4;
+      cx.beginPath();cx.moveTo(lad.x-6,ry1);cx.lineTo(lad.x+6,ry1);cx.stroke();
+      cx.beginPath();cx.moveTo(lad.x-6,ry2);cx.lineTo(lad.x+6,ry2);cx.stroke();
+    }
+  }
+
+  // Oil drum
+  cx.fillStyle='#228';cx.fillRect(30,650,30,20);
+  cx.fillStyle='#f80';
+  if(Math.floor(Date.now()/200)%2)cx.fillRect(35,642,20,10);
+
+  // Hammers
+  for(const h of hammers){
+    if(!h.active)continue;
+    cx.fillStyle='#fa0';cx.fillRect(h.x-6,h.y,12,8);
+    cx.fillStyle='#a60';cx.fillRect(h.x-2,h.y+8,4,12);
+  }
+
+  // Donkey Kong
+  const dkX=130,dkY=GIRDERS[5]?girderYAt(GIRDERS[5],150)-60:120;
+  cx.fillStyle='#a52';
+  cx.fillRect(dkX-25,dkY,50,50);
+  cx.fillRect(dkX-15,dkY-15,30,20);
+  // Arms
+  if(dkAnim===0){
+    cx.fillRect(dkX-35,dkY+5,15,10);cx.fillRect(dkX+20,dkY+5,15,10);
+  }else{
+    cx.fillRect(dkX-30,dkY-10,12,15);cx.fillRect(dkX+18,dkY-10,12,15);
+  }
+  cx.fillStyle='#da8';cx.fillRect(dkX-8,dkY-10,16,12);
+  cx.fillStyle='#000';cx.fillRect(dkX-5,dkY-7,4,3);cx.fillRect(dkX+1,dkY-7,4,3);
+
+  // Pauline
+  const paulX=280,paulY=dkY-30;
+  cx.fillStyle='#f0a';cx.fillRect(paulX-6,paulY,12,20);
+  cx.fillStyle='#fda';cx.beginPath();cx.arc(paulX,paulY-4,6,0,Math.PI*2);cx.fill();
+  if(Math.floor(Date.now()/400)%2){
+    cx.fillStyle='#fff';cx.font='10px monospace';cx.textAlign='center';cx.fillText('HELP!',paulX,paulY-14);
+  }
+
+  // Barrels
+  for(const b of barrels){
+    cx.fillStyle='#a64';
+    cx.beginPath();cx.arc(b.x+b.w/2,b.y+b.h/2,b.w/2,0,Math.PI*2);cx.fill();
+    cx.fillStyle='#c86';
+    cx.beginPath();cx.arc(b.x+b.w/2,b.y+b.h/2,b.w/4,0,Math.PI*2);cx.fill();
+  }
+
+  // Mario
+  if(mario.alive){
+    const mx=mario.x,my=mario.y;
+    // Legs
+    cx.fillStyle='#00a';
+    cx.fillRect(mx+2,my+20,8,8);cx.fillRect(mx+14,my+20,8,8);
+    // Body
+    cx.fillStyle='#e22';cx.fillRect(mx+2,my+8,20,14);
+    // Head
+    cx.fillStyle='#fca';cx.fillRect(mx+5,my,14,10);
+    // Cap
+    cx.fillStyle='#e22';cx.fillRect(mx+3,my-2,18,5);
+    // Eyes
+    cx.fillStyle='#000';cx.fillRect(mx+8,my+3,3,2);cx.fillRect(mx+14,my+3,3,2);
+    // Hammer
+    if(mario.hammer&&mario.hammerTimer>0){
+      const swing=Math.sin(mario.hammerSwing);
+      const hx=mx+mario.dir*14,hy=my-10+swing*15;
+      cx.fillStyle='#fa0';cx.fillRect(hx-4,hy,10,8);
+      cx.fillStyle='#a60';cx.fillRect(hx,hy+8,3,12);
+    }
+  }
+
+  // Particles
+  for(const p of particles){
+    const a=Math.max(0,p.life/p.maxLife);
+    cx.globalAlpha=a;cx.fillStyle='#ff8';
+    cx.fillRect(p.x-2,p.y-2,4,4);
+    cx.globalAlpha=1;
+  }
+
+  // HUD
+  cx.fillStyle='#fff';cx.font='16px monospace';cx.textAlign='left';
+  cx.fillText('SCORE: '+score,10,22);
+  cx.textAlign='center';
+  cx.fillText('L='+String(level).padStart(2,'0'),W/2,22);
+  cx.textAlign='right';
+  cx.fillText('BEST: '+hiScore,W-10,22);
+  // Lives
+  for(let i=0;i<lives;i++){
+    cx.fillStyle='#e22';cx.fillRect(10+i*20,H-20,12,14);
+  }
+  // Bonus
+  cx.fillStyle='#0cf';cx.font='14px monospace';cx.textAlign='right';
+  cx.fillText('BONUS: '+Math.max(0,Math.floor(bonus)),W-10,H-8);
+
+  // Overlays
+  if(state===ST_READY){
+    cx.fillStyle='#ff0';cx.font='bold 28px monospace';cx.textAlign='center';
+    cx.fillText('HOW HIGH CAN YOU GET?',W/2,H/2-10);
+    cx.fillStyle='#fff';cx.font='18px monospace';
+    cx.fillText('LEVEL '+level,W/2,H/2+25);
+  }
+  if(state===ST_WIN){
+    cx.fillStyle='#0f0';cx.font='bold 30px monospace';cx.textAlign='center';
+    cx.fillText('LEVEL COMPLETE!',W/2,H/2);
+  }
+  if(state===ST_OVER){
+    cx.fillStyle='rgba(0,0,0,0.6)';cx.fillRect(0,0,W,H);
+    cx.fillStyle='#f44';cx.font='bold 40px monospace';cx.textAlign='center';
+    cx.fillText('GAME OVER',W/2,H/2-30);
+    cx.fillStyle='#fff';cx.font='22px monospace';
+    cx.fillText('Score: '+score,W/2,H/2+10);
+    cx.fillStyle='#aaa';cx.font='16px monospace';
+    if(Math.floor(Date.now()/600)%2)cx.fillText('Press Enter',W/2,H/2+50);
+  }
+}
+
+let lastTime=0;
+function loop(now){
+  requestAnimationFrame(loop);
+  if(!lastTime){lastTime=now;return;}
+  let dt=(now-lastTime)/1000;lastTime=now;
+  if(dt>0.05)dt=0.05;
+  update(dt);render();
+}
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

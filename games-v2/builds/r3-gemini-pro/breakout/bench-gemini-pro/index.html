@@ -1,0 +1,441 @@
+<!--
+  GAME:      Breakout
+  RUN:       r3-gemini-pro
+  BUILDER:   google/gemini-3-pro-preview
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Breakout</title>
+<style>
+    body {
+        background-color: #000;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        height: 100vh;
+        margin: 0;
+        color: #FFF;
+        font-family: monospace;
+        overflow: hidden;
+    }
+    canvas {
+        background-color: #000;
+        box-shadow: 0 0 20px rgba(255, 255, 255, 0.1);
+        display: block;
+    }
+</style>
+</head>
+<body>
+
+<canvas id="gameCanvas" width="800" height="600"></canvas>
+
+<script>
+// --- Audio System (Web Audio API) ---
+const audio = {
+    ctx: null,
+    init() {
+        if (!this.ctx) {
+            this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (this.ctx.state === 'suspended') {
+            this.ctx.resume();
+        }
+    },
+    playTone(freq, type, duration, vol = 0.1, freqEnd = null) {
+        if (!this.ctx) return;
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+        osc.type = type;
+        osc.frequency.setValueAtTime(freq, this.ctx.currentTime);
+        if (freqEnd !== null) {
+            osc.frequency.exponentialRampToValueAtTime(freqEnd, this.ctx.currentTime + duration);
+        }
+        gain.gain.setValueAtTime(vol, this.ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + duration);
+        osc.connect(gain);
+        gain.connect(this.ctx.destination);
+        osc.start();
+        osc.stop(this.ctx.currentTime + duration);
+    },
+    paddleHit() { this.playTone(400, 'square', 0.05, 0.1); },
+    wallHit() { this.playTone(300, 'square', 0.05, 0.1); },
+    brickHit(row) { 
+        // Higher pitch for higher rows (row 0 is highest)
+        const freq = 800 + (7 - row) * 100;
+        this.playTone(freq, 'square', 0.05, 0.1); 
+    },
+    lifeLost() { this.playTone(150, 'sawtooth', 0.5, 0.2, 50); },
+    win() {
+        [440, 554, 659, 880].forEach((f, i) => {
+            setTimeout(() => this.playTone(f, 'square', 0.15, 0.1), i * 150);
+        });
+    }
+};
+
+// --- Game Constants & Config ---
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const W = canvas.width;
+const H = canvas.height;
+
+const STATE_START = 0;
+const STATE_PLAYING = 1;
+const STATE_SERVE = 2;
+const STATE_GAMEOVER = 3;
+const STATE_VICTORY = 4;
+
+const PADDLE_W = 100;
+const PADDLE_H = 15;
+const PADDLE_SPEED = 500;
+const PADDLE_Y = 550;
+
+const BALL_R = 8;
+const BALL_BASE_SPEED = 400;
+const MAX_BOUNCE_ANGLE = Math.PI / 3; // 60 degrees
+
+const BRICK_ROWS = 8;
+const BRICK_COLS = 14;
+const BRICK_W = 50;
+const BRICK_H = 20;
+const BRICK_PADDING = 5;
+const BRICK_OFF_TOP = 50;
+const BRICK_OFF_LEFT = (W - (BRICK_COLS * (BRICK_W + BRICK_PADDING)) + BRICK_PADDING) / 2;
+
+// --- State Variables ---
+let state = STATE_START;
+let lastTime = 0;
+let score = 0;
+let lives = 3;
+
+const keys = { ArrowLeft: false, ArrowRight: false, KeyA: false, KeyD: false };
+
+let paddle = { x: W/2 - PADDLE_W/2, y: PADDLE_Y, w: PADDLE_W, h: PADDLE_H };
+let ball = { x: 0, y: 0, vx: 0, vy: 0, r: BALL_R, speed: BALL_BASE_SPEED };
+let bricks = [];
+
+// --- Initialization ---
+function initBricks() {
+    bricks = [];
+    for (let r = 0; r < BRICK_ROWS; r++) {
+        let color = '';
+        let points = 0;
+        if (r < 2)      { color = '#FF0000'; points = 7; } // Red
+        else if (r < 4) { color = '#FFA500'; points = 5; } // Orange
+        else if (r < 6) { color = '#FFFF00'; points = 3; } // Yellow
+        else            { color = '#00FF00'; points = 1; } // Green
+
+        for (let c = 0; c < BRICK_COLS; c++) {
+            let bx = BRICK_OFF_LEFT + c * (BRICK_W + BRICK_PADDING);
+            let by = BRICK_OFF_TOP + r * (BRICK_H + BRICK_PADDING);
+            bricks.push({ x: bx, y: by, w: BRICK_W, h: BRICK_H, color: color, points: points, status: 1, row: r });
+        }
+    }
+}
+
+function resetBall() {
+    ball.x = paddle.x + paddle.w / 2;
+    ball.y = paddle.y - ball.r;
+    ball.vx = 0;
+    ball.vy = 0;
+    ball.speed = BALL_BASE_SPEED;
+}
+
+function startGame() {
+    score = 0;
+    lives = 3;
+    initBricks();
+    paddle.x = W/2 - PADDLE_W/2;
+    resetBall();
+    state = STATE_SERVE;
+}
+
+function launchBall() {
+    // Launch straight up initially, or slightly angled
+    const startAngle = (Math.random() * 0.2 - 0.1); 
+    ball.vx = ball.speed * Math.sin(startAngle);
+    ball.vy = -ball.speed * Math.cos(startAngle);
+}
+
+// --- Input Handling ---
+window.addEventListener('keydown', e => {
+    if (['ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
+    if (e.code in keys) keys[e.code] = true;
+    
+    if (e.code === 'Space') {
+        audio.init();
+        if (state === STATE_START || state === STATE_GAMEOVER || state === STATE_VICTORY) {
+            startGame();
+        } else if (state === STATE_SERVE) {
+            launchBall();
+            state = STATE_PLAYING;
+        }
+    }
+});
+
+window.addEventListener('keyup', e => {
+    if (e.code in keys) keys[e.code] = false;
+});
+
+// Mouse control
+canvas.addEventListener('mousemove', e => {
+    if (state === STATE_PLAYING || state === STATE_SERVE) {
+        const rect = canvas.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left;
+        paddle.x = mouseX - paddle.w / 2;
+        
+        // Clamp
+        if (paddle.x < 0) paddle.x = 0;
+        if (paddle.x + paddle.w > W) paddle.x = W - paddle.w;
+    }
+});
+
+canvas.addEventListener('mousedown', e => {
+    audio.init();
+    if (state === STATE_START || state === STATE_GAMEOVER || state === STATE_VICTORY) {
+        startGame();
+    } else if (state === STATE_SERVE) {
+        launchBall();
+        state = STATE_PLAYING;
+    }
+});
+
+// --- Physics & Logic ---
+function update(dt) {
+    if (state === STATE_SERVE) {
+        // Keyboard paddle movement during serve
+        if (keys.ArrowLeft || keys.KeyA) paddle.x -= PADDLE_SPEED * dt;
+        if (keys.ArrowRight || keys.KeyD) paddle.x += PADDLE_SPEED * dt;
+        
+        if (paddle.x < 0) paddle.x = 0;
+        if (paddle.x + paddle.w > W) paddle.x = W - paddle.w;
+        
+        // Keep ball on paddle
+        ball.x = paddle.x + paddle.w / 2;
+        ball.y = paddle.y - ball.r;
+        return;
+    }
+
+    if (state !== STATE_PLAYING) return;
+
+    // --- Paddle Movement ---
+    if (keys.ArrowLeft || keys.KeyA) paddle.x -= PADDLE_SPEED * dt;
+    if (keys.ArrowRight || keys.KeyD) paddle.x += PADDLE_SPEED * dt;
+    
+    if (paddle.x < 0) paddle.x = 0;
+    if (paddle.x + paddle.w > W) paddle.x = W - paddle.w;
+
+    // --- Ball Movement ---
+    let prevX = ball.x;
+    let prevY = ball.y;
+    
+    ball.x += ball.vx * dt;
+    ball.y += ball.vy * dt;
+
+    // --- Wall Collisions ---
+    if (ball.x - ball.r <= 0) {
+        ball.x = ball.r;
+        ball.vx = -ball.vx;
+        audio.wallHit();
+    } else if (ball.x + ball.r >= W) {
+        ball.x = W - ball.r;
+        ball.vx = -ball.vx;
+        audio.wallHit();
+    }
+
+    if (ball.y - ball.r <= 0) {
+        ball.y = ball.r;
+        ball.vy = -ball.vy;
+        audio.wallHit();
+    }
+
+    // Bottom Wall (Death)
+    if (ball.y + ball.r >= H) {
+        lives--;
+        audio.lifeLost();
+        if (lives <= 0) {
+            state = STATE_GAMEOVER;
+        } else {
+            resetBall();
+            state = STATE_SERVE;
+        }
+        return;
+    }
+
+    // --- Paddle Collision ---
+    // AABB check
+    if (ball.y + ball.r >= paddle.y && 
+        ball.y - ball.r <= paddle.y + paddle.h &&
+        ball.x + ball.r >= paddle.x && 
+        ball.x - ball.r <= paddle.x + paddle.w) {
+        
+        // Only bounce if moving downwards (prevents internal trapping)
+        if (ball.vy > 0) {
+            audio.paddleHit();
+            
+            // Fix position so it doesn't get stuck
+            ball.y = paddle.y - ball.r;
+            
+            // Calculate relative hit point [-1.0, 1.0]
+            let hitPoint = ball.x - (paddle.x + paddle.w / 2);
+            let normalizedHit = hitPoint / (paddle.w / 2);
+            normalizedHit = Math.max(-1, Math.min(1, normalizedHit)); // Clamp
+            
+            // Calculate new angle
+            let angle = normalizedHit * MAX_BOUNCE_ANGLE;
+            
+            ball.vx = ball.speed * Math.sin(angle);
+            ball.vy = -ball.speed * Math.cos(angle); // Always go UP
+        }
+    }
+
+    // --- Brick Collisions ---
+    let hitBrick = false;
+    for (let i = 0; i < bricks.length; i++) {
+        let b = bricks[i];
+        if (b.status === 1) {
+            // AABB Overlap
+            if (ball.x + ball.r >= b.x && 
+                ball.x - ball.r <= b.x + b.w &&
+                ball.y + ball.r >= b.y && 
+                ball.y - ball.r <= b.y + b.h) {
+                
+                b.status = 0;
+                score += b.points;
+                ball.speed *= 1.02; // 2% speed increase
+                audio.brickHit(b.row);
+                hitBrick = true;
+                
+                // Determine bounce direction based on previous position
+                let fromTop = prevY + ball.r <= b.y;
+                let fromBottom = prevY - ball.r >= b.y + b.h;
+                let fromLeft = prevX + ball.r <= b.x;
+                let fromRight = prevX - ball.r >= b.x + b.w;
+
+                // Priority to top/bottom bounces
+                if (fromTop || fromBottom) {
+                    ball.vy = -ball.vy;
+                    ball.y = fromTop ? b.y - ball.r : b.y + b.h + ball.r;
+                } else if (fromLeft || fromRight) {
+                    ball.vx = -ball.vx;
+                    ball.x = fromLeft ? b.x - ball.r : b.x + b.w + ball.r;
+                } else {
+                    // Fallback if clipped in a weird way
+                    ball.vy = -ball.vy;
+                }
+                
+                break; // Only hit one brick per frame
+            }
+        }
+    }
+
+    // Check Victory
+    if (hitBrick) {
+        let allDestroyed = true;
+        for (let i = 0; i < bricks.length; i++) {
+            if (bricks[i].status === 1) {
+                allDestroyed = false;
+                break;
+            }
+        }
+        if (allDestroyed) {
+            state = STATE_VICTORY;
+            audio.win();
+        }
+    }
+}
+
+// --- Rendering ---
+function drawRect(x, y, w, h, color) {
+    ctx.fillStyle = color;
+    ctx.fillRect(Math.floor(x), Math.floor(y), w, h);
+}
+
+function drawCircle(x, y, r, color) {
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(Math.floor(x), Math.floor(y), r, 0, Math.PI * 2);
+    ctx.fill();
+}
+
+function drawText(text, x, y, size, align='center', color='#FFF') {
+    ctx.fillStyle = color;
+    ctx.font = `${size}px monospace`;
+    ctx.textAlign = align;
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, x, y);
+}
+
+function render() {
+    // Background
+    drawRect(0, 0, W, H, '#000');
+
+    if (state === STATE_START) {
+        drawText("BREAKOUT", W/2, H/2 - 60, 80);
+        let blink = Math.floor(performance.now() / 500) % 2 === 0;
+        if (blink) drawText("Press Space to Start", W/2, H/2 + 40, 24);
+        return;
+    }
+
+    // Draw Bricks
+    for (let i = 0; i < bricks.length; i++) {
+        let b = bricks[i];
+        if (b.status === 1) {
+            drawRect(b.x, b.y, b.w, b.h, b.color);
+        }
+    }
+
+    // Draw Paddle
+    drawRect(paddle.x, paddle.y, paddle.w, paddle.h, '#00FFFF');
+
+    // Draw Ball
+    drawCircle(ball.x, ball.y, ball.r, '#FFF');
+
+    // Draw UI
+    drawText(`SCORE: ${score}`, 20, 20, 20, 'left');
+    drawText(`LIVES: ${lives}`, W - 20, 20, 20, 'right');
+
+    // Overlays
+    if (state === STATE_SERVE) {
+        let blink = Math.floor(performance.now() / 500) % 2 === 0;
+        if (blink) drawText("Press Space to Serve", W/2, paddle.y - 40, 20);
+    } else if (state === STATE_GAMEOVER) {
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+        ctx.fillRect(0, 0, W, H);
+        drawText("GAME OVER", W/2, H/2 - 40, 60, 'center', '#FF0000');
+        drawText(`Final Score: ${score}`, W/2, H/2 + 20, 24);
+        let blink = Math.floor(performance.now() / 500) % 2 === 0;
+        if (blink) drawText("Press Space to Restart", W/2, H/2 + 80, 20);
+    } else if (state === STATE_VICTORY) {
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+        ctx.fillRect(0, 0, W, H);
+        drawText("YOU WIN!", W/2, H/2 - 40, 60, 'center', '#00FF00');
+        drawText(`Final Score: ${score}`, W/2, H/2 + 20, 24);
+        let blink = Math.floor(performance.now() / 500) % 2 === 0;
+        if (blink) drawText("Press Space to Play Again", W/2, H/2 + 80, 20);
+    }
+}
+
+// --- Main Game Loop ---
+function gameLoop(timestamp) {
+    if (!lastTime) lastTime = timestamp;
+    let dt = (timestamp - lastTime) / 1000;
+    lastTime = timestamp;
+    
+    // Clamp dt to prevent tunneling after tab switch
+    if (dt > 0.1) dt = 0.1;
+
+    update(dt);
+    render();
+
+    requestAnimationFrame(gameLoop);
+}
+
+// Start loop
+requestAnimationFrame(gameLoop);
+
+</script>
+</body>
+</html>

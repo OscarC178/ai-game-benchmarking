@@ -1,0 +1,737 @@
+<!--
+  GAME:      Space Invaders
+  RUN:       r3-gemini-pro
+  BUILDER:   openai/gpt-5.4
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Space Invaders</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background: #000;
+      overflow: hidden;
+      font-family: 'Courier New', monospace;
+    }
+    body {
+      display: grid;
+      place-items: center;
+    }
+    canvas {
+      display: block;
+      background: #000;
+      box-shadow: 0 0 32px rgba(255,255,255,0.08);
+      image-rendering: pixelated;
+    }
+  </style>
+</head>
+<body>
+<canvas id="game" width="800" height="600"></canvas>
+<script>
+(() => {
+  'use strict';
+
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  const W = 800;
+  const H = 600;
+  const DT_CAP = 0.05;
+
+  const STATES = {
+    STARTUP: 'STARTUP',
+    PLAYING: 'PLAYING',
+    RESPawning: 'RESPAWNING',
+    WAVE_CLEAR: 'WAVE_CLEAR',
+    GAME_OVER: 'GAME_OVER'
+  };
+
+  const ALIEN_TYPES = {
+    C: { color: '#FF00FF', points: 30 },
+    B: { color: '#00FFFF', points: 20 },
+    A: { color: '#FFFF00', points: 10 }
+  };
+
+  const ALIEN_SHAPES = {
+    A: [
+      '00111100',
+      '11111111',
+      '11011011',
+      '11111111',
+      '00111100',
+      '01011010',
+      '10000001',
+      '01000010'
+    ],
+    A2: [
+      '00111100',
+      '11111111',
+      '11011011',
+      '11111111',
+      '00111100',
+      '00111100',
+      '01000010',
+      '10000001'
+    ],
+    B: [
+      '00111100',
+      '01111110',
+      '11111111',
+      '11011011',
+      '11111111',
+      '00100100',
+      '01000010',
+      '10000001'
+    ],
+    B2: [
+      '00111100',
+      '01111110',
+      '11111111',
+      '11011011',
+      '11111111',
+      '01011010',
+      '10000001',
+      '01000010'
+    ],
+    C: [
+      '00011000',
+      '00111100',
+      '01111110',
+      '11011011',
+      '11111111',
+      '00100100',
+      '01000010',
+      '10100101'
+    ],
+    C2: [
+      '00011000',
+      '00111100',
+      '01111110',
+      '11011011',
+      '11111111',
+      '01011010',
+      '10000001',
+      '01000010'
+    ]
+  };
+
+  const keys = Object.create(null);
+  const prevKeys = Object.create(null);
+
+  let state = STATES.STARTUP;
+  let lastTime = 0;
+  let score = 0;
+  let best = loadBest();
+  let lives = 3;
+  let wave = 1;
+  let audioCtx = null;
+  let alienAnim = 0;
+  let alienDir = 1;
+  let alienStepTimer = 0;
+  let marchIndex = 0;
+  let respawnTimer = 0;
+  let waveClearTimer = 0;
+  let mysteryScoreTimer = 0;
+  let mysteryScoreText = '';
+
+  const player = {
+    x: W / 2 - 20,
+    y: 550,
+    w: 40,
+    h: 20,
+    speed: 300
+  };
+
+  let playerBullet = null;
+  let alienBullets = [];
+  let aliens = [];
+  let shields = [];
+  let mysteryShip = null;
+
+  function resize() {
+    const scale = Math.min(window.innerWidth / W, window.innerHeight / H);
+    canvas.style.width = `${Math.floor(W * scale)}px`;
+    canvas.style.height = `${Math.floor(H * scale)}px`;
+  }
+
+  function loadBest() {
+    try {
+      const n = parseInt(localStorage.getItem('space_invaders_best_r3_gemini_pro') || '0', 10);
+      return Number.isFinite(n) ? n : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  function saveBest() {
+    try { localStorage.setItem('space_invaders_best_r3_gemini_pro', String(best)); } catch {}
+  }
+
+  function updateBest() {
+    if (score > best) {
+      best = score;
+      saveBest();
+    }
+  }
+
+  function ensureAudio() {
+    if (!audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) {
+        try { audioCtx = new AC(); } catch {}
+      }
+    }
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+  }
+
+  function tone(freq, duration, type = 'square', volume = 0.03, endFreq = null, delay = 0) {
+    if (!audioCtx) return;
+    try {
+      const t = audioCtx.currentTime + delay;
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, t);
+      if (endFreq !== null) osc.frequency.exponentialRampToValueAtTime(Math.max(1, endFreq), t + duration);
+      gain.gain.setValueAtTime(volume, t);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + duration);
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start(t);
+      osc.stop(t + duration);
+    } catch {}
+  }
+
+  function noiseBurst(duration = 0.08, volume = 0.035) {
+    if (!audioCtx) return;
+    try {
+      const length = Math.floor(audioCtx.sampleRate * duration);
+      const buffer = audioCtx.createBuffer(1, length, audioCtx.sampleRate);
+      const data = buffer.getChannelData(0);
+      for (let i = 0; i < length; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / length);
+      const source = audioCtx.createBufferSource();
+      const gain = audioCtx.createGain();
+      gain.gain.value = volume;
+      source.buffer = buffer;
+      source.connect(gain);
+      gain.connect(audioCtx.destination);
+      source.start();
+    } catch {}
+  }
+
+  const sfx = {
+    fire() { tone(1000, 0.1, 'square', 0.03, 200); },
+    alienHit() { noiseBurst(0.07, 0.035); },
+    playerHit() { tone(180, 0.22, 'sawtooth', 0.05, 80); tone(90, 0.22, 'triangle', 0.04, 45, 0.12); },
+    march() {
+      const tones = [120, 110, 100, 90];
+      tone(tones[marchIndex % tones.length], 0.08, 'square', 0.03);
+      marchIndex += 1;
+    },
+    mystery() { tone(700 + (Math.random() < 0.5 ? 0 : 120), 0.08, 'triangle', 0.015, null, 0); }
+  };
+
+  function clamp(v, min, max) {
+    return Math.max(min, Math.min(max, v));
+  }
+
+  function justPressed(code) {
+    return !!keys[code] && !prevKeys[code];
+  }
+
+  function createAliens() {
+    aliens = [];
+    const spacingX = 52;
+    const spacingY = 42;
+    const baseX = (W - ((11 - 1) * spacingX + 32)) / 2;
+    const baseY = 110 + (wave - 1) * 10;
+    for (let row = 0; row < 5; row++) {
+      for (let col = 0; col < 11; col++) {
+        const type = row === 0 ? 'C' : row <= 2 ? 'B' : 'A';
+        aliens.push({
+          x: baseX + col * spacingX,
+          y: baseY + row * spacingY,
+          w: 32,
+          h: 24,
+          row,
+          col,
+          type,
+          alive: true
+        });
+      }
+    }
+    alienDir = 1;
+    alienStepTimer = alienStepInterval();
+    alienAnim = 0;
+  }
+
+  function createShields() {
+    shields = [];
+    const pattern = [
+      '0011111111111100',
+      '0111111111111110',
+      '1111111111111111',
+      '1111111111111111',
+      '1111111111111111',
+      '1111110000111111',
+      '1111100000011111',
+      '1111000000001111',
+      '1111000000001111',
+      '1111000000001111',
+      '1111000000001111',
+      '0000000000000000'
+    ];
+    const chunk = 5;
+    const starts = [90, 270, 450, 630];
+    for (const startX of starts) {
+      const chunks = [];
+      for (let r = 0; r < pattern.length; r++) {
+        for (let c = 0; c < pattern[r].length; c++) {
+          if (pattern[r][c] === '1') {
+            chunks.push({ x: startX + c * chunk, y: 420 + r * chunk, w: chunk, h: chunk, alive: true });
+          }
+        }
+      }
+      shields.push({ chunks });
+    }
+  }
+
+  function resetPlayer() {
+    player.x = W / 2 - player.w / 2;
+    playerBullet = null;
+    alienBullets = [];
+  }
+
+  function resetWave() {
+    createAliens();
+    createShields();
+    resetPlayer();
+    mysteryShip = null;
+    mysteryScoreTimer = 0;
+    mysteryScoreText = '';
+  }
+
+  function startGame() {
+    score = 0;
+    lives = 3;
+    wave = 1;
+    resetWave();
+    state = STATES.PLAYING;
+    updateBest();
+  }
+
+  function alienStepInterval() {
+    const remaining = aliens.filter(a => a.alive).length || 1;
+    const t = (remaining - 1) / 54;
+    return 0.05 + 0.95 * t;
+  }
+
+  function aliveAliens() {
+    return aliens.filter(a => a.alive);
+  }
+
+  function alienBounds() {
+    const alive = aliveAliens();
+    if (!alive.length) return null;
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const a of alive) {
+      minX = Math.min(minX, a.x);
+      maxX = Math.max(maxX, a.x + a.w);
+      minY = Math.min(minY, a.y);
+      maxY = Math.max(maxY, a.y + a.h);
+    }
+    return { minX, maxX, minY, maxY };
+  }
+
+  function bottomShooterCandidates() {
+    const byCol = new Map();
+    for (const alien of aliveAliens()) {
+      const current = byCol.get(alien.col);
+      if (!current || alien.y > current.y) byCol.set(alien.col, alien);
+    }
+    return Array.from(byCol.values());
+  }
+
+  function spawnAlienBullet() {
+    if (alienBullets.length >= 3) return;
+    const candidates = bottomShooterCandidates();
+    if (!candidates.length) return;
+    const shooter = candidates[Math.floor(Math.random() * candidates.length)];
+    alienBullets.push({ x: shooter.x + shooter.w / 2 - 2, y: shooter.y + shooter.h, w: 4, h: 14, vy: 210 + wave * 10 });
+  }
+
+  function maybeSpawnMystery(dt) {
+    if (mysteryShip) {
+      mysteryShip.x += mysteryShip.vx * dt;
+      if ((mysteryShip.vx > 0 && mysteryShip.x > W + 60) || (mysteryShip.vx < 0 && mysteryShip.x < -80)) mysteryShip = null;
+      else if (Math.floor(performance.now() / 120) % 2 === 0) {
+        ensureAudio();
+        sfx.mystery();
+      }
+      return;
+    }
+    if (Math.random() < dt * 0.05) {
+      const dir = Math.random() < 0.5 ? 1 : -1;
+      mysteryShip = {
+        x: dir > 0 ? -70 : W + 10,
+        y: 54,
+        w: 54,
+        h: 22,
+        vx: dir * 120,
+        score: [50, 100, 150, 300][Math.floor(Math.random() * 4)]
+      };
+    }
+  }
+
+  function moveAliensStep() {
+    const bounds = alienBounds();
+    if (!bounds) return;
+    const stepX = 10;
+    const stepY = 20;
+    const wouldHitEdge = alienDir > 0 ? bounds.maxX + stepX >= W - 10 : bounds.minX - stepX <= 10;
+    if (wouldHitEdge) {
+      for (const alien of aliens) if (alien.alive) alien.y += stepY;
+      alienDir *= -1;
+    } else {
+      for (const alien of aliens) if (alien.alive) alien.x += stepX * alienDir;
+    }
+    alienAnim = 1 - alienAnim;
+    ensureAudio();
+    sfx.march();
+
+    const updated = alienBounds();
+    if (updated && updated.maxY >= player.y) {
+      state = STATES.GAME_OVER;
+      updateBest();
+    }
+  }
+
+  function rectsOverlap(a, b) {
+    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  }
+
+  function playerRect() {
+    return { x: player.x, y: player.y, w: player.w, h: player.h };
+  }
+
+  function handleProjectileShieldCollision(projectile, isPlayer) {
+    for (const shield of shields) {
+      for (const chunk of shield.chunks) {
+        if (!chunk.alive) continue;
+        if (rectsOverlap(projectile, chunk)) {
+          chunk.alive = false;
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function updatePlayer(dt) {
+    const move = (keys.ArrowRight || keys.KeyD ? 1 : 0) - (keys.ArrowLeft || keys.KeyA ? 1 : 0);
+    player.x += move * player.speed * dt;
+    player.x = clamp(player.x, 10, W - player.w - 10);
+
+    if (justPressed('Space') && !playerBullet) {
+      playerBullet = { x: player.x + player.w / 2 - 1, y: player.y - 12, w: 2, h: 12, vy: -600 };
+      ensureAudio();
+      sfx.fire();
+    }
+  }
+
+  function updateBullets(dt) {
+    if (playerBullet) {
+      playerBullet.y += playerBullet.vy * dt;
+      if (playerBullet.y + playerBullet.h < 0) playerBullet = null;
+      else if (handleProjectileShieldCollision(playerBullet, true)) playerBullet = null;
+      else {
+        for (const alien of aliens) {
+          if (!alien.alive) continue;
+          if (rectsOverlap(playerBullet, alien)) {
+            alien.alive = false;
+            score += ALIEN_TYPES[alien.type].points;
+            updateBest();
+            ensureAudio();
+            sfx.alienHit();
+            playerBullet = null;
+            alienStepTimer = Math.min(alienStepTimer, alienStepInterval());
+            if (!aliveAliens().length) {
+              state = STATES.WAVE_CLEAR;
+              waveClearTimer = 1.2;
+            }
+            break;
+          }
+        }
+      }
+
+      if (playerBullet && mysteryShip && rectsOverlap(playerBullet, mysteryShip)) {
+        score += mysteryShip.score;
+        updateBest();
+        mysteryScoreText = String(mysteryShip.score);
+        mysteryScoreTimer = 1;
+        mysteryShip = null;
+        playerBullet = null;
+        ensureAudio();
+        sfx.alienHit();
+      }
+    }
+
+    for (let i = alienBullets.length - 1; i >= 0; i--) {
+      const b = alienBullets[i];
+      b.y += b.vy * dt;
+      if (b.y > H) {
+        alienBullets.splice(i, 1);
+        continue;
+      }
+      if (handleProjectileShieldCollision(b, false)) {
+        alienBullets.splice(i, 1);
+        continue;
+      }
+      if (playerBullet && rectsOverlap(b, playerBullet)) {
+        alienBullets.splice(i, 1);
+        playerBullet = null;
+        continue;
+      }
+      if (rectsOverlap(b, playerRect())) {
+        alienBullets.splice(i, 1);
+        lives -= 1;
+        ensureAudio();
+        sfx.playerHit();
+        if (lives <= 0) {
+          state = STATES.GAME_OVER;
+          updateBest();
+        } else {
+          state = STATES.RESPawning;
+          respawnTimer = 1.0;
+          resetPlayer();
+        }
+      }
+    }
+  }
+
+  function aliensVsShields() {
+    for (const alien of aliveAliens()) {
+      for (const shield of shields) {
+        for (const chunk of shield.chunks) {
+          if (chunk.alive && rectsOverlap(alien, chunk)) chunk.alive = false;
+        }
+      }
+    }
+  }
+
+  function update(dt) {
+    if (mysteryScoreTimer > 0) mysteryScoreTimer = Math.max(0, mysteryScoreTimer - dt);
+
+    if (state === STATES.RESPawning) {
+      respawnTimer -= dt;
+      if (respawnTimer <= 0) state = STATES.PLAYING;
+      return;
+    }
+
+    if (state === STATES.WAVE_CLEAR) {
+      waveClearTimer -= dt;
+      if (waveClearTimer <= 0) {
+        wave += 1;
+        resetWave();
+        state = STATES.PLAYING;
+      }
+      return;
+    }
+
+    if (state !== STATES.PLAYING) return;
+
+    updatePlayer(dt);
+    updateBullets(dt);
+    maybeSpawnMystery(dt);
+    aliensVsShields();
+
+    alienStepTimer -= dt;
+    if (alienStepTimer <= 0) {
+      moveAliensStep();
+      alienStepTimer = alienStepInterval();
+      if (Math.random() < 0.75) spawnAlienBullet();
+    }
+  }
+
+  function drawBitmap(x, y, pattern, color, scale = 4) {
+    ctx.fillStyle = color;
+    for (let r = 0; r < pattern.length; r++) {
+      for (let c = 0; c < pattern[r].length; c++) {
+        if (pattern[r][c] === '1') ctx.fillRect(x + c * scale, y + r * scale, scale, scale);
+      }
+    }
+  }
+
+  function drawPlayer() {
+    ctx.fillStyle = '#00FF00';
+    ctx.fillRect(player.x, player.y + 8, player.w, 12);
+    ctx.fillRect(player.x + 10, player.y + 2, 20, 8);
+    ctx.fillRect(player.x + 18, player.y, 4, 4);
+  }
+
+  function drawAliens() {
+    for (const alien of aliens) {
+      if (!alien.alive) continue;
+      const key = alien.type + (alienAnim ? '2' : '');
+      drawBitmap(alien.x, alien.y, ALIEN_SHAPES[key], ALIEN_TYPES[alien.type].color, 4);
+    }
+  }
+
+  function drawBullets() {
+    if (playerBullet) {
+      ctx.fillStyle = '#00FF00';
+      ctx.fillRect(playerBullet.x, playerBullet.y, playerBullet.w, playerBullet.h);
+    }
+    ctx.strokeStyle = '#FFFFFF';
+    ctx.lineWidth = 2;
+    for (const b of alienBullets) {
+      ctx.beginPath();
+      ctx.moveTo(b.x + 2, b.y);
+      ctx.lineTo(b.x, b.y + 4);
+      ctx.lineTo(b.x + 4, b.y + 8);
+      ctx.lineTo(b.x + 2, b.y + 12);
+      ctx.stroke();
+    }
+  }
+
+  function drawShields() {
+    ctx.fillStyle = '#00FF00';
+    for (const shield of shields) {
+      for (const chunk of shield.chunks) {
+        if (chunk.alive) ctx.fillRect(chunk.x, chunk.y, chunk.w, chunk.h);
+      }
+    }
+  }
+
+  function drawMystery() {
+    if (!mysteryShip) return;
+    ctx.fillStyle = '#FF0000';
+    ctx.beginPath();
+    ctx.ellipse(mysteryShip.x + mysteryShip.w / 2, mysteryShip.y + mysteryShip.h / 2, 26, 10, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillRect(mysteryShip.x + 12, mysteryShip.y + 6, 30, 8);
+    if (mysteryScoreTimer > 0) {
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = '18px "Courier New", monospace';
+      ctx.fillText(mysteryScoreText, mysteryShip ? mysteryShip.x + 26 : W / 2, 44);
+    }
+  }
+
+  function drawHUD() {
+    ctx.fillStyle = '#00FF00';
+    ctx.font = '20px "Courier New", monospace';
+    ctx.textBaseline = 'top';
+    ctx.textAlign = 'left';
+    ctx.fillText(`SCORE ${score}`, 14, 12);
+    ctx.textAlign = 'center';
+    ctx.fillText(`HIGH ${best}`, W / 2, 12);
+    ctx.textAlign = 'right';
+    ctx.fillText(`LIVES ${lives}`, W - 14, 12);
+  }
+
+  function drawStartup() {
+    ctx.fillStyle = '#FFFFFF';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'bold 46px "Courier New", monospace';
+    ctx.fillText('SPACE INVADERS', W / 2, 130);
+    ctx.font = '22px "Courier New", monospace';
+    ctx.fillText('POINT LEGEND', W / 2, 210);
+    drawBitmap(270, 250, ALIEN_SHAPES.C, '#FF00FF', 3);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillText('= 30', 385, 266);
+    drawBitmap(270, 300, ALIEN_SHAPES.B, '#00FFFF', 3);
+    ctx.fillText('= 20', 385, 316);
+    drawBitmap(270, 350, ALIEN_SHAPES.A, '#FFFF00', 3);
+    ctx.fillText('= 10', 385, 366);
+    ctx.font = '20px "Courier New", monospace';
+    ctx.fillText('Arrow Keys / A D move • Space fires • Enter starts', W / 2, 455);
+    if (Math.floor(performance.now() / 450) % 2 === 0) ctx.fillText('Press Enter to Start', W / 2, 505);
+  }
+
+  function drawOverlay(title, subtitle) {
+    ctx.fillStyle = 'rgba(0,0,0,0.65)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'bold 52px "Courier New", monospace';
+    ctx.fillText(title, W / 2, 250);
+    ctx.font = '24px "Courier New", monospace';
+    ctx.fillText(subtitle, W / 2, 320);
+  }
+
+  function render() {
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, W, H);
+    drawHUD();
+    drawShields();
+    drawAliens();
+    drawMystery();
+    drawBullets();
+    drawPlayer();
+
+    if (state === STATES.STARTUP) drawStartup();
+    else if (state === STATES.RESPawning) drawOverlay('READY', 'Incoming wave...');
+    else if (state === STATES.WAVE_CLEAR) drawOverlay('WAVE CLEAR', 'Prepare for the next assault');
+    else if (state === STATES.GAME_OVER) drawOverlay('GAME OVER', 'Press Enter to Restart');
+  }
+
+  function handleActions() {
+    const enter = justPressed('Enter');
+    if (enter || justPressed('Space')) ensureAudio();
+
+    if (state === STATES.STARTUP && enter) {
+      startGame();
+      return;
+    }
+    if (state === STATES.GAME_OVER && enter) {
+      startGame();
+    }
+  }
+
+  function syncPrev() {
+    const watched = ['ArrowLeft','ArrowRight','KeyA','KeyD','Space','Enter'];
+    for (const k of watched) prevKeys[k] = !!keys[k];
+  }
+
+  function frame(ts) {
+    if (!lastTime) lastTime = ts;
+    const dt = Math.min(DT_CAP, (ts - lastTime) / 1000);
+    lastTime = ts;
+
+    handleActions();
+    update(dt);
+    render();
+    syncPrev();
+    requestAnimationFrame(frame);
+  }
+
+  window.addEventListener('keydown', (e) => {
+    const handled = ['ArrowLeft','ArrowRight','KeyA','KeyD','Space','Enter'];
+    if (handled.includes(e.code)) e.preventDefault();
+    keys[e.code] = true;
+    if (handled.includes(e.code)) ensureAudio();
+  }, { passive: false });
+
+  window.addEventListener('keyup', (e) => {
+    keys[e.code] = false;
+  });
+
+  window.addEventListener('blur', () => {
+    for (const k in keys) keys[k] = false;
+  });
+
+  window.addEventListener('resize', resize);
+  resize();
+  resetWave();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

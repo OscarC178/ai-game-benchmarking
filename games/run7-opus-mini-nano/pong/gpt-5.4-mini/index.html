@@ -1,0 +1,334 @@
+<!-- pong | spec:run7-opus-mini-nano | built-by:gpt-5.4-mini -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Pong</title>
+<style>
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  canvas {
+    display: block;
+    background: #000;
+    image-rendering: pixelated;
+  }
+</style>
+</head>
+<body>
+<canvas id="game" width="800" height="600"></canvas>
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  const W = 800, H = 600;
+  const PADDLE_W = 12, PADDLE_H = 80;
+  const BALL_S = 12;
+
+  const state = {
+    mode: 'IDLE',
+    playerScore: 0,
+    cpuScore: 0,
+    highScore: 0,
+    pausedOverlay: false,
+    keys: new Set(),
+    lastTime: performance.now(),
+    serveTimer: 0,
+    serveDirection: 1,
+    ballSpeed: 350,
+    audioUnlocked: false
+  };
+
+  try {
+    state.highScore = parseInt(localStorage.getItem('pong_high_score') || '0', 10) || 0;
+  } catch (e) {}
+
+  const player = { x: 30, y: 260, w: PADDLE_W, h: PADDLE_H };
+  const cpu = { x: 758, y: 260, w: PADDLE_W, h: PADDLE_H, targetY: 260 };
+  const ball = { x: 394, y: 294, s: BALL_S, vx: 0, vy: 0 };
+
+  let audioCtx = null;
+  function ensureAudio() {
+    if (state.audioUnlocked) return;
+    try {
+      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+      state.audioUnlocked = true;
+    } catch (e) {}
+  }
+
+  function playTone(type, freqStart, freqEnd, duration) {
+    if (!state.audioUnlocked || !audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type;
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    const now = audioCtx.currentTime;
+    gain.gain.setValueAtTime(0.05, now);
+    if (freqEnd != null) {
+      osc.frequency.setValueAtTime(freqStart, now);
+      osc.frequency.exponentialRampToValueAtTime(Math.max(1, freqEnd), now + duration / 1000);
+    } else {
+      osc.frequency.setValueAtTime(freqStart, now);
+    }
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + duration / 1000);
+    osc.start(now);
+    osc.stop(now + duration / 1000 + 0.02);
+  }
+
+  function paddleHitSound() { playTone('square', 440, null, 50); }
+  function wallHitSound() { playTone('square', 220, null, 50); }
+  function scoreSound() { playTone('square', 660, 330, 200); }
+
+  function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+
+  function resetRound(serveToLeft) {
+    ball.x = 394;
+    ball.y = 294;
+    ball.vx = 0;
+    ball.vy = 0;
+    state.ballSpeed = 350;
+    state.serveDirection = serveToLeft ? -1 : 1;
+    state.serveTimer = 1.0;
+  }
+
+  function startGame() {
+    state.playerScore = 0;
+    state.cpuScore = 0;
+    player.y = 260;
+    cpu.y = 260;
+    cpu.targetY = 260;
+    state.mode = 'PLAYING';
+    resetRound(Math.random() < 0.5);
+  }
+
+  function endGame() {
+    state.mode = 'GAME_OVER';
+    if (state.playerScore > state.highScore) {
+      state.highScore = state.playerScore;
+      try { localStorage.setItem('pong_high_score', String(state.highScore)); } catch (e) {}
+    }
+  }
+
+  function launchBall(direction) {
+    const sign = direction < 0 ? -1 : 1;
+    const maxAngle = Math.PI / 6;
+    const angle = (Math.random() * 2 - 1) * maxAngle;
+    const speed = 350;
+    ball.x = 394;
+    ball.y = 294;
+    ball.vx = Math.cos(angle) * speed * sign;
+    ball.vy = Math.sin(angle) * speed;
+    state.ballSpeed = speed;
+  }
+
+  function maybeLaunch() {
+    launchBall(state.serveDirection);
+    state.serveTimer = 0;
+  }
+
+  function handlePaddleCollision(p) {
+    const ballRect = { x: ball.x, y: ball.y, w: BALL_S, h: BALL_S };
+    const paddleRect = { x: p.x, y: p.y, w: p.w, h: p.h };
+    if (ballRect.x < paddleRect.x + paddleRect.w &&
+        ballRect.x + ballRect.w > paddleRect.x &&
+        ballRect.y < paddleRect.y + paddleRect.h &&
+        ballRect.y + ballRect.h > paddleRect.y) {
+      const ballCenterY = ball.y + BALL_S / 2;
+      const paddleCenterY = p.y + p.h / 2;
+      const offset = clamp((ballCenterY - paddleCenterY) / (p.h / 2), -1, 1);
+      const angle = offset * (Math.PI / 3);
+      state.ballSpeed = Math.min(600, state.ballSpeed + 25);
+      const dir = (p === player) ? 1 : -1;
+      ball.vx = Math.cos(angle) * state.ballSpeed * dir;
+      ball.vy = Math.sin(angle) * state.ballSpeed;
+      if (p === player) ball.x = p.x + p.w + 0.1; else ball.x = p.x - BALL_S - 0.1;
+      paddleHitSound();
+    }
+  }
+
+  function update(dt) {
+    const up = state.keys.has('ArrowUp') || state.keys.has('KeyW');
+    const down = state.keys.has('ArrowDown') || state.keys.has('KeyS');
+
+    if (state.mode === 'PLAYING') {
+      if (up) player.y -= 400 * dt;
+      if (down) player.y += 400 * dt;
+      player.y = clamp(player.y, 0, H - player.h);
+
+      cpu.targetY = ball.y + BALL_S / 2 - cpu.h / 2;
+      const desired = cpu.y + (cpu.targetY - cpu.y) * 0.08;
+      const maxMove = 300 * dt;
+      const delta = desired - cpu.y;
+      cpu.y += clamp(delta, -maxMove, maxMove);
+      cpu.y = clamp(cpu.y, 0, H - cpu.h);
+
+      ball.x += ball.vx * dt;
+      ball.y += ball.vy * dt;
+
+      if (ball.y <= 0) {
+        ball.y = 0;
+        ball.vy = Math.abs(ball.vy);
+        wallHitSound();
+      } else if (ball.y + BALL_S >= H) {
+        ball.y = H - BALL_S;
+        ball.vy = -Math.abs(ball.vy);
+        wallHitSound();
+      }
+
+      handlePaddleCollision(player);
+      handlePaddleCollision(cpu);
+
+      if (ball.x + BALL_S < 0) {
+        state.cpuScore += 1;
+        scoreSound();
+        if (state.cpuScore >= 7) {
+          endGame();
+        } else {
+          resetRound(false);
+        }
+      } else if (ball.x > W) {
+        state.playerScore += 1;
+        scoreSound();
+        if (state.playerScore >= 7) {
+          endGame();
+        } else {
+          resetRound(true);
+        }
+      }
+
+    } else if (state.mode === 'IDLE') {
+      if (up) player.y -= 400 * dt;
+      if (down) player.y += 400 * dt;
+      player.y = clamp(player.y, 0, H - player.h);
+      cpu.y = 260;
+      ball.x = 394;
+      ball.y = 294;
+    } else if (state.mode === 'PAUSED') {
+    } else if (state.mode === 'GAME_OVER') {
+      if (up) player.y -= 400 * dt;
+      if (down) player.y += 400 * dt;
+      player.y = clamp(player.y, 0, H - player.h);
+    }
+
+    if (state.serveTimer > 0) {
+      state.serveTimer -= dt;
+      if (state.serveTimer <= 0 && state.mode === 'PLAYING') maybeLaunch();
+    }
+  }
+
+  function drawCenterLine() {
+    ctx.fillStyle = '#444444';
+    const x = 400 - 2;
+    for (let y = 0; y < H; y += 25) {
+      ctx.fillRect(x, y, 4, 15);
+    }
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, W, H);
+
+    drawCenterLine();
+
+    ctx.fillStyle = '#888888';
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('HIGH SCORE ' + state.highScore, W / 2, 16);
+
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = '48px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(state.playerScore, 300, 50);
+    ctx.fillText(state.cpuScore, 500, 50);
+
+    if (state.mode !== 'IDLE' || true) {
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(player.x, player.y, player.w, player.h);
+      ctx.fillRect(cpu.x, cpu.y, cpu.w, cpu.h);
+    }
+
+    if (state.mode === 'PLAYING' || state.mode === 'PAUSED' || state.mode === 'GAME_OVER') {
+      ctx.fillRect(ball.x, ball.y, BALL_S, BALL_S);
+    }
+
+    if (state.mode === 'IDLE') {
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = '64px monospace';
+      ctx.fillText('PONG', W / 2, 200);
+      ctx.font = '20px monospace';
+      ctx.fillStyle = '#AAAAAA';
+      ctx.fillText('Press Enter to Start', W / 2, 350);
+    }
+
+    if (state.mode === 'PAUSED') {
+      ctx.fillStyle = 'rgba(0,0,0,0.8)';
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = '36px monospace';
+      ctx.fillText('PAUSED', W / 2, H / 2);
+    }
+
+    if (state.mode === 'GAME_OVER') {
+      ctx.fillStyle = 'rgba(0,0,0,0.8)';
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = '48px monospace';
+      ctx.fillText(state.playerScore >= 7 ? 'YOU WIN' : 'GAME OVER', W / 2, 250);
+      ctx.font = '20px monospace';
+      ctx.fillText('Final Score ' + state.playerScore + ' - ' + state.cpuScore, W / 2, 310);
+      ctx.fillStyle = '#AAAAAA';
+      ctx.font = '18px monospace';
+      ctx.fillText('Press Enter to Restart', W / 2, 360);
+    }
+
+    if (state.mode === 'PLAYING' && state.serveTimer > 0) {
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = '16px monospace';
+      ctx.fillText('SERVING...', W / 2, 290);
+    }
+  }
+
+  function loop(now) {
+    const dt = Math.min(0.033, (now - state.lastTime) / 1000);
+    state.lastTime = now;
+    update(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  window.addEventListener('keydown', (e) => {
+    ensureAudio();
+    state.keys.add(e.code);
+    if (e.code === 'Enter') {
+      if (state.mode === 'IDLE' || state.mode === 'GAME_OVER') startGame();
+    } else if (e.code === 'KeyP') {
+      if (state.mode === 'PLAYING') state.mode = 'PAUSED';
+      else if (state.mode === 'PAUSED') state.mode = 'PLAYING';
+    }
+  });
+
+  window.addEventListener('keyup', (e) => {
+    state.keys.delete(e.code);
+  });
+
+  canvas.addEventListener('pointerdown', ensureAudio);
+
+  launchBall(Math.random() < 0.5 ? -1 : 1);
+  state.mode = 'IDLE';
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

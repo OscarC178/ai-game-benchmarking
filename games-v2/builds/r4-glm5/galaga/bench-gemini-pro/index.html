@@ -1,0 +1,848 @@
+<!--
+  GAME:      Galaga
+  RUN:       r4-glm5
+  BUILDER:   google/gemini-3-pro-preview
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Galaga</title>
+<style>
+    body {
+        margin: 0;
+        background-color: #111;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        height: 100vh;
+        overflow: hidden;
+        font-family: 'Courier New', Courier, monospace;
+        color: white;
+    }
+    canvas {
+        background-color: #000;
+        box-shadow: 0 0 20px rgba(0, 0, 255, 0.2);
+    }
+</style>
+</head>
+<body>
+
+<canvas id="gameCanvas" width="480" height="640"></canvas>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+const W = canvas.width;
+const H = canvas.height;
+
+// --- CONFIG & CONSTANTS ---
+const SHIP_W = 32;
+const SHIP_H = 32;
+const SHIP_Y = H - 50;
+const SHIP_SPEED = 5;
+const LASER_W = 3;
+const LASER_H = 12;
+const LASER_SPEED = 10;
+const E_MSL_W = 4;
+const E_MSL_H = 8;
+const E_MSL_SPEED = 5;
+
+const TYPE_BOSS = 0;
+const TYPE_GOEI = 1;
+const TYPE_ZAKO = 2;
+
+// --- STATE VARIABLES ---
+const ST_TITLE = 0;
+const ST_PLAYING = 1;
+const ST_PAUSED = 2;
+const ST_DEAD = 3;
+const ST_STAGE_CLEAR = 4;
+const ST_START_STAGE = 5;
+const ST_GAMEOVER = 6;
+const ST_BONUS_RESULT = 7;
+
+let state = ST_TITLE;
+let stateTimer = 0;
+
+let score = 0;
+let highScore = parseInt(localStorage.getItem('galaga_hi')) || 0;
+let lives = 3;
+let stage = 1;
+let isBonusStage = false;
+
+// Entities
+let player = null; // {x, dualMode, s1Active, s2Active, dx}
+let pLasers = [];
+let eMissiles = [];
+let enemies = [];
+let explosions = [];
+
+let extraLifeMilestone = 20000;
+
+// Formation Data
+let gridOffX = 0;
+let gridOffY = 0;
+let gridDir = 1;
+let gridTime = 0;
+let lungeTime = 0;
+let isLunging = false;
+let lungeOffsetY = 0;
+
+let diveTimer = 0;
+let curAnimFrame = 0;
+let animTimer = 0;
+
+let stars = [];
+
+// Input
+const keys = { ArrowLeft: false, ArrowRight: false, a: false, d: false, Space: false, z: false };
+let firePressed = false;
+
+// --- INITIALIZATION ---
+function initStars() {
+    stars = [];
+    for(let i=0; i<100; i++) {
+        stars.push({
+            x: Math.random() * W,
+            y: Math.random() * H,
+            speed: Math.random() * 2 + 0.5,
+            color: Math.random() > 0.5 ? '#FFF' : (Math.random() > 0.5 ? '#AAF' : '#FAA')
+        });
+    }
+}
+
+function initPlayer() {
+    player = {
+        x: W / 2,
+        dualMode: false,
+        s1Active: true,
+        s2Active: false,
+        invuln: 2.0
+    };
+}
+
+function createFormation() {
+    enemies = [];
+    let startX = W/2 - 100;
+    let startY = 100;
+    
+    // Grid: Boss (1x4), Goei (2x4), Zako (2x4)
+    // Row 0: Boss
+    for(let c=0; c<4; c++) {
+        enemies.push({
+            type: TYPE_BOSS, gridX: startX + c*50 + 25, gridY: startY,
+            x: startX + c*50 + 25, y: startY, homeX: 0, homeY: 0, // setup later
+            hp: 2, ptsF: 150, ptsD: 400,
+            state: 'grid', timer: 0
+        });
+    }
+    // Row 1: Goei
+    for(let c=0; c<4; c++) {
+        enemies.push({
+            type: TYPE_GOEI, gridX: startX + c*50, gridY: startY + 35,
+            x: startX + c*50, y: startY + 35, homeX: 0, homeY: 0,
+            hp: 1, ptsF: 80, ptsD: 160,
+            state: 'grid', timer: 0
+        });
+    }
+    // Row 2: Goei
+    for(let c=0; c<4; c++) {
+        enemies.push({
+            type: TYPE_GOEI, gridX: startX + c*50 + 25, gridY: startY + 70,
+            x: startX + c*50 + 25, y: startY + 70, homeX: 0, homeY: 0,
+            hp: 1, ptsF: 80, ptsD: 160,
+            state: 'grid', timer: 0
+        });
+    }
+    // Row 3: Zako
+    for(let c=0; c<4; c++) {
+        enemies.push({
+            type: TYPE_ZAKO, gridX: startX + c*50, gridY: startY + 105,
+            x: startX + c*50, y: startY + 105, homeX: 0, homeY: 0,
+            hp: 1, ptsF: 50, ptsD: 80,
+            state: 'grid', timer: 0
+        });
+    }
+    // Row 4: Zako
+    for(let c=0; c<4; c++) {
+        enemies.push({
+            type: TYPE_ZAKO, gridX: startX + c*50 + 25, gridY: startY + 140,
+            x: startX + c*50 + 25, y: startY + 140, homeX: 0, homeY: 0,
+            hp: 1, ptsF: 50, ptsD: 80,
+            state: 'grid', timer: 0
+        });
+    }
+    
+    // For simplicity, Stage 1 just snaps them into grid. 
+    // Other stages should have them sweep in, but we'll snap all if not Bonus stage logic
+    if (isBonusStage) setupBonusStage();
+}
+
+function setupBonusStage() {
+    // 5 waves of flying patterns, no grid settling, no shooting
+    enemies = [];
+    bonusKilled = 0;
+    bonusTotalSpawned = 0;
+    bonusWaveTimer = 0;
+    bonusWaveIdx = 0;
+}
+
+let bonusKilled = 0;
+let bonusTotalSpawned = 0;
+let bonusWaveTimer = 0;
+let bonusWaveIdx = 0;
+
+function spawnBonusWave(idx) {
+    // Spawn 8 enemies in a specific arc
+    for(let i=0; i<8; i++) {
+        let type = [TYPE_ZAKO, TYPE_GOEI, TYPE_BOSS][Math.floor(Math.random()*3)];
+        let e = {
+            type: type, 
+            x: idx%2===0 ? -30 - i*30 : W + 30 + i*30, 
+            y: H/2,
+            hp: type===TYPE_BOSS ? 2 : 1, ptsF: 100, ptsD: 100,
+            state: 'bonus_fly', timer: i*15, waveIdx: idx
+        };
+        enemies.push(e);
+        bonusTotalSpawned++;
+    }
+}
+
+function startStage() {
+    isBonusStage = (stage % 4 === 0);
+    createFormation();
+    pLasers = [];
+    eMissiles = [];
+    explosions = [];
+    
+    gridOffX = 0; gridOffY = 0;
+    gridDir = 1; isLunging = false; lungeOffsetY = 0;
+    diveTimer = 2.0;
+    
+    state = ST_START_STAGE;
+    stateTimer = 2.0;
+    
+    if (player && player.dualMode && !player.s1Active && !player.s2Active) {
+        player.s1Active = true; // Fallback sync
+    }
+}
+
+function startGame() {
+    score = 0;
+    lives = 3;
+    stage = 1;
+    extraLifeMilestone = 20000;
+    initPlayer();
+    startStage();
+}
+
+// --- INPUT HANDLING ---
+window.addEventListener('keydown', e => {
+    let k = e.key;
+    if (['ArrowLeft', 'ArrowRight', ' ', 'ArrowUp', 'ArrowDown'].includes(k)) e.preventDefault();
+    
+    if (k === 'ArrowLeft' || k.toLowerCase() === 'a') keys.ArrowLeft = true;
+    if (k === 'ArrowRight' || k.toLowerCase() === 'd') keys.ArrowRight = true;
+    if (k === ' ' || k.toLowerCase() === 'z') {
+        keys.Space = true;
+        if (!firePressed) {
+            firePressed = true;
+            if (state === ST_TITLE) startGame();
+            else if (state === ST_GAMEOVER) state = ST_TITLE;
+            else if (state === ST_PLAYING && player) fireLaser();
+        }
+    }
+    if (k.toLowerCase() === 'p' || k === 'Escape') {
+        if (state === ST_PLAYING) state = ST_PAUSED;
+        else if (state === ST_PAUSED) state = ST_PLAYING;
+    }
+    if (k.toLowerCase() === 'r') {
+        if (state === ST_PAUSED || state === ST_GAMEOVER) startGame();
+    }
+});
+
+window.addEventListener('keyup', e => {
+    let k = e.key;
+    if (k === 'ArrowLeft' || k.toLowerCase() === 'a') keys.ArrowLeft = false;
+    if (k === 'ArrowRight' || k.toLowerCase() === 'd') keys.ArrowRight = false;
+    if (k === ' ' || k.toLowerCase() === 'z') { keys.Space = false; firePressed = false; }
+});
+
+// --- CORE LOGIC ---
+
+function fireLaser() {
+    if (state !== ST_PLAYING) return;
+    let maxL = player.dualMode ? 4 : 2;
+    if (pLasers.length >= maxL) return;
+    
+    if (player.dualMode) {
+        if (player.s1Active) pLasers.push({ x: player.x - 16, y: SHIP_Y });
+        if (player.s2Active) pLasers.push({ x: player.x + 16, y: SHIP_Y });
+    } else {
+        if (player.s1Active) pLasers.push({ x: player.x, y: SHIP_Y });
+    }
+}
+
+function checkScore(pts) {
+    score += pts;
+    if (score >= extraLifeMilestone) {
+        lives++;
+        extraLifeMilestone += 50000;
+    }
+    if (score > highScore) {
+        highScore = score;
+        localStorage.setItem('galaga_hi', highScore);
+    }
+}
+
+function createExplosion(x, y, color) {
+    for(let i=0; i<15; i++) {
+        let a = Math.random() * Math.PI*2;
+        let v = Math.random() * 3 + 1;
+        explosions.push({
+            x: x, y: y,
+            vx: Math.cos(a)*v, vy: Math.sin(a)*v,
+            life: Math.random() * 0.3 + 0.2,
+            c: color
+        });
+    }
+}
+
+function update(dt) {
+    // Stars array update
+    for (let s of stars) {
+        s.y += s.speed;
+        if (s.y > H) { s.y = 0; s.x = Math.random() * W; }
+    }
+
+    if (state === ST_TITLE || state === ST_PAUSED || state === ST_GAMEOVER) return;
+
+    if (state === ST_START_STAGE || state === ST_DEAD || state === ST_STAGE_CLEAR || state === ST_BONUS_RESULT) {
+        stateTimer -= dt;
+        animTimer += dt;
+        if (animTimer > 0.3) { curAnimFrame = 1 - curAnimFrame; animTimer = 0; }
+        
+        updateExplosions(dt);
+        
+        if (stateTimer <= 0) {
+            if (state === ST_START_STAGE) {
+                state = ST_PLAYING;
+            } else if (state === ST_STAGE_CLEAR || state === ST_BONUS_RESULT) {
+                stage++;
+                startStage();
+            } else if (state === ST_DEAD) {
+                if (!player.s1Active && !player.s2Active) {
+                    lives--;
+                    if (lives <= 0) state = ST_GAMEOVER;
+                    else {
+                        player.dualMode = false;
+                        player.s1Active = true;
+                        player.invuln = 2.0;
+                        player.x = W/2;
+                        state = ST_PLAYING;
+                    }
+                } else {
+                    // Lost one of dual
+                    player.invuln = 2.0;
+                    state = ST_PLAYING;
+                }
+            }
+        }
+        
+        // Still update grid so it doesn't freeze awkwardly
+        if (state === ST_DEAD) updateGrid(dt);
+
+        return;
+    }
+
+    if (state !== ST_PLAYING) return;
+
+    // Anim
+    animTimer += dt;
+    if (animTimer > 0.3) { curAnimFrame = 1 - curAnimFrame; animTimer = 0; }
+
+    // --- PLAYER MOVE ---
+    if (player) {
+        if (player.invuln > 0) player.invuln -= dt;
+        if (keys.ArrowLeft) player.x -= SHIP_SPEED;
+        if (keys.ArrowRight) player.x += SHIP_SPEED;
+        
+        let minX = player.dualMode ? 32 : 16;
+        let maxX = player.dualMode ? W - 32 : W - 16;
+        if (player.x < minX) player.x = minX;
+        if (player.x > maxX) player.x = maxX;
+    }
+
+    // --- GRID MOVEMENT ---
+    updateGrid(dt);
+
+    // --- ENEMY LOGIC ---
+    if (isBonusStage) {
+        updateBonusStage(dt);
+    } else {
+        updateNormalEnemies(dt);
+    }
+
+    // --- PROJECTILES ---
+    for (let i = pLasers.length - 1; i >= 0; i--) {
+        pLasers[i].y -= LASER_SPEED;
+        if (pLasers[i].y < 0) pLasers.splice(i, 1);
+    }
+    
+    for (let i = eMissiles.length - 1; i >= 0; i--) {
+        eMissiles[i].y += E_MSL_SPEED;
+        if (eMissiles[i].y > H) eMissiles.splice(i, 1);
+    }
+
+    // --- COLLISIONS ---
+    checkCollisions();
+    
+    updateExplosions(dt);
+
+    // --- CLEAR CHECK ---
+    if (enemies.length === 0) {
+        if (isBonusStage) {
+            if (bonusKilled === 40) checkScore(10000); // Perfect
+            state = ST_BONUS_RESULT;
+            stateTimer = 3.0;
+        } else {
+            state = ST_STAGE_CLEAR;
+            stateTimer = 2.0;
+        }
+    } else if (isBonusStage && bonusTotalSpawned === 40) {
+        // all spawned, check if any left on screen
+        let active = enemies.filter(e => Math.abs(e.x - W/2) < W && e.y > -50 && e.y < H+50);
+        if (active.length === 0) {
+            state = ST_BONUS_RESULT;
+            stateTimer = 3.0;
+        }
+    }
+}
+
+function updateGrid(dt) {
+    if (isBonusStage) return;
+    
+    gridTime += dt;
+    gridOffX += gridDir * 60 * dt; // px per sec
+    if (gridOffX > 60) { gridDir = -1; }
+    if (gridOffX < -60) { gridDir = 1; }
+    
+    lungeTime += dt;
+    if (!isLunging && lungeTime > 5.0) {
+        isLunging = true;
+        lungeTime = 0;
+    }
+    
+    if (isLunging) {
+        lungeOffsetY = Math.sin(lungeTime * Math.PI) * 40;
+        if (lungeTime > 1.0) {
+            isLunging = false;
+            lungeOffsetY = 0;
+            lungeTime = 0;
+        }
+    }
+    
+    // Assign intended positions
+    for (let e of enemies) {
+        e.homeX = e.gridX + gridOffX;
+        e.homeY = e.gridY + lungeOffsetY;
+        
+        if (e.state === 'grid') {
+            e.x = e.homeX;
+            e.y = e.homeY;
+        }
+    }
+}
+
+function updateNormalEnemies(dt) {
+    diveTimer -= dt;
+    if (diveTimer <= 0) {
+        // Pick enemy to dive
+        let gridEnemies = enemies.filter(e => e.state === 'grid');
+        if (gridEnemies.length > 0) {
+            // Weight Boss/Goei higher
+            let weighted = [];
+            gridEnemies.forEach(e => {
+                weighted.push(e);
+                if (e.type === TYPE_BOSS) { weighted.push(e); weighted.push(e); }
+                if (e.type === TYPE_GOEI) { weighted.push(e); }
+            });
+            
+            let chosen = weighted[Math.floor(Math.random() * weighted.length)];
+            chosen.state = 'dive_start';
+            chosen.timer = 0;
+        }
+        diveTimer = Math.random() * 2 + 1.5;
+    }
+
+    for (let e of enemies) {
+        if (e.state === 'dive_start') {
+            e.state = 'diving';
+            e.diveStartX = e.x;
+            e.diveStartY = e.y;
+            e.pattern = Math.random() > 0.5 ? 'loop' : 'arc';
+            if (e.type === TYPE_BOSS && Math.random() > 0.5) e.pattern = 'tractor';
+            e.timer = 0;
+        }
+        
+        if (e.state === 'diving') {
+            e.timer += dt;
+            let t = e.timer;
+            
+            if (e.pattern === 'arc') {
+                e.x += (player.x - e.x) * 2 * dt;
+                e.y += 150 * dt;
+            } else if (e.pattern === 'loop') {
+                e.x = e.diveStartX + Math.sin(t*3) * 60;
+                e.y = e.diveStartY + t * 150;
+            } else if (e.pattern === 'tractor') {
+                // Simplified tractor: hover above player
+                if (t < 2.0) {
+                    e.y += 100 * dt;
+                    if (e.y > 400) e.y = 400; // Hover Y
+                    e.x += (player.x - e.x) * 3 * dt;
+                } else if (t < 5.0) {
+                    // Hovering & beaming
+                    e.x += (player.x - e.x) * 1.5 * dt;
+                    // Check capture logic later in collision
+                    e.isBeaming = true;
+                } else {
+                    e.isBeaming = false;
+                    e.pattern = 'arc'; // finish dive normally
+                }
+            }
+            
+            // Shoot
+            if (Math.random() < 0.01 && e.y < H - 100) {
+                eMissiles.push({ x: e.x, y: e.y + 10 });
+            }
+            
+            // Return to top
+            if (e.y > H + 50) {
+                e.y = -50;
+                e.state = 'grid'; // Snap back (simplification)
+                e.isBeaming = false;
+            }
+        }
+    }
+}
+
+function updateBonusStage(dt) {
+    bonusWaveTimer += dt;
+    if (bonusWaveTimer > 2.0 && bonusWaveIdx < 5) {
+        spawnBonusWave(bonusWaveIdx);
+        bonusWaveIdx++;
+        bonusWaveTimer = 0;
+    }
+    
+    for (let e of enemies) {
+        if (e.state === 'bonus_fly') {
+            e.timer -= dt*30; // acts as distance/angle
+            let t = e.timer;
+            // Arc pattern
+            if (e.waveIdx % 2 === 0) {
+                // From left arc
+                e.x += 150 * dt;
+                e.y = H/2 + Math.sin(e.x * 0.02) * 150;
+            } else {
+                // From right arc
+                e.x -= 150 * dt;
+                e.y = H/2 + Math.cos(e.x * 0.02) * 150;
+            }
+        }
+    }
+}
+
+function updateExplosions(dt) {
+    for (let i = explosions.length - 1; i >= 0; i--) {
+        let x = explosions[i];
+        x.x += x.vx; x.y += x.vy;
+        x.life -= dt;
+        if (x.life <= 0) explosions.splice(i, 1);
+    }
+}
+
+function AABB(x1, y1, w1, h1, x2, y2, w2, h2) {
+    return x1 < x2 + w2 && x1 + w1 > x2 && y1 < y2 + h2 && y1 + h1 > y2;
+}
+
+function checkCollisions() {
+    // Lasers vs Enemies
+    for (let i = pLasers.length - 1; i >= 0; i--) {
+        let l = pLasers[i];
+        let hit = false;
+        
+        for (let j = enemies.length - 1; j >= 0; j--) {
+            let e = enemies[j];
+            if (AABB(l.x, l.y, LASER_W, LASER_H, e.x - 12, e.y - 12, 24, 24)) {
+                hit = true;
+                e.hp--;
+                createExplosion(l.x, l.y, '#FFF');
+                
+                if (e.hp <= 0) {
+                    // Destroy
+                    createExplosion(e.x, e.y, e.type === TYPE_BOSS ? '#0F0' : '#F00');
+                    checkScore(e.state === 'grid' ? e.ptsF : e.ptsD);
+                    if (isBonusStage) bonusKilled++;
+                    
+                    // Rescue logic
+                    if (e.hasCaptured) {
+                        player.dualMode = true;
+                        player.s2Active = true;
+                    }
+                    
+                    enemies.splice(j, 1);
+                }
+                break;
+            }
+        }
+        if (hit) pLasers.splice(i, 1);
+    }
+
+    // Don't check player death if invincible, bonus stage, or already dead
+    if (isBonusStage || state !== ST_PLAYING || player.invuln > 0) return;
+
+    let pHit1 = false;
+    let pHit2 = false;
+
+    // Check hit boxes
+    let r1 = { x: player.dualMode ? player.x - 24 : player.x - 12, y: SHIP_Y - 12, w: 24, h: 24 };
+    let r2 = { x: player.dualMode ? player.x + 0 : player.x - 12, y: SHIP_Y - 12, w: 24, h: 24 }; 
+    // ^ if not dual mode, r1 overlapping r2 doesn't matter since player.s2Active is false
+
+    // Player vs Missiles
+    for (let i = eMissiles.length - 1; i >= 0; i--) {
+        let m = eMissiles[i];
+        if (player.s1Active && AABB(m.x, m.y, E_MSL_W, E_MSL_H, r1.x, r1.y, r1.w, r1.h)) { pHit1 = true; eMissiles.splice(i, 1); break; }
+        if (player.s2Active && AABB(m.x, m.y, E_MSL_W, E_MSL_H, r2.x, r2.y, r2.w, r2.h)) { pHit2 = true; eMissiles.splice(i, 1); break; }
+    }
+
+    // Player vs Enemy Bodies
+    for (let e of enemies) {
+        if (player.s1Active && AABB(e.x-12, e.y-12, 24, 24, r1.x, r1.y, r1.w, r1.h)) pHit1 = true;
+        if (player.s2Active && AABB(e.x-12, e.y-12, 24, 24, r2.x, r2.y, r2.w, r2.h)) pHit2 = true;
+    }
+
+    // Tractor beam check
+    for (let e of enemies) {
+        if (e.isBeaming && e.y < SHIP_Y) {
+            // Beam is a triangle roughly
+            let beamX = Math.abs(player.x - e.x);
+            if (beamX < 40 && !player.dualMode) { // Simplified
+                // Captured!
+                e.hasCaptured = true;
+                e.isBeaming = false;
+                e.state = 'grid'; // Head back
+                pHit1 = true; // Act as hit, we lose life but gain hostage
+            }
+        }
+    }
+
+    if (pHit1 || pHit2) {
+        if (pHit1) {
+            createExplosion(r1.x + 12, r1.y + 12, '#0FF');
+            player.s1Active = false;
+        }
+        if (pHit2) {
+            createExplosion(r2.x + 12, r2.y + 12, '#0FF');
+            player.s2Active = false;
+        }
+        
+        state = ST_DEAD;
+        stateTimer = 2.0;
+    }
+}
+
+// --- RENDERING ---
+
+function drawPlayer(x, y) {
+    ctx.fillStyle = '#FFF'; // Base
+    ctx.beginPath();
+    ctx.moveTo(x, y - 12);
+    ctx.lineTo(x + 10, y + 12);
+    ctx.lineTo(x, y + 6);
+    ctx.lineTo(x - 10, y + 12);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = '#0FF'; // Cockpit
+    ctx.fillRect(x - 2, y - 6, 4, 8);
+    ctx.fillStyle = '#F00'; // Wingtips
+    ctx.fillRect(x - 12, y + 10, 3, 3);
+    ctx.fillRect(x + 9, y + 10, 3, 3);
+}
+
+function drawEnemy(e) {
+    let x = Math.floor(e.x);
+    let y = Math.floor(e.y);
+    ctx.save();
+    ctx.translate(x, y);
+    
+    // Slight rotation if diving
+    if (e.state === 'diving') {
+        ctx.rotate(Math.sin(e.timer * 10) * 0.2); // Wiggle
+    }
+
+    if (e.type === TYPE_BOSS) {
+        ctx.fillStyle = e.hp === 2 ? '#0F0' : '#00A'; // Green, turns dark blue on hit
+        ctx.beginPath(); ctx.arc(0, 0, 12, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#F0F'; // Wings
+        ctx.fillRect(-16, (curAnimFrame? -4:0), 8, 8);
+        ctx.fillRect(8, (curAnimFrame? -4:0), 8, 8);
+        ctx.fillStyle = '#F00'; // Eyes
+        ctx.fillRect(-6, -4, 4, 4); ctx.fillRect(2, -4, 4, 4);
+    } else if (e.type === TYPE_GOEI) {
+        ctx.fillStyle = e.state === 'grid' ? '#F00' : '#A0F'; // Red -> Purple
+        ctx.fillRect(-8, -8, 16, 16);
+        ctx.fillStyle = '#FF0';
+        ctx.fillRect(-12, (curAnimFrame? -2:2), 6, 10);
+        ctx.fillRect(6, (curAnimFrame? -2:2), 6, 10);
+    } else { // ZAKO
+        ctx.fillStyle = e.state === 'grid' ? '#FF0' : '#0FF'; // Yellow -> Cyan
+        ctx.beginPath(); ctx.arc(0, 0, 8, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#FFF';
+        ctx.fillRect(-10, (curAnimFrame? -4:-2), 6, 4);
+        ctx.fillRect(4, (curAnimFrame? -4:-2), 6, 4);
+        ctx.fillStyle = '#F00'; // Eye
+        ctx.fillRect(-2, -2, 4, 4);
+    }
+    
+    // Tractor Beam Visual
+    if (e.isBeaming) {
+        ctx.fillStyle = 'rgba(255, 255, 0, 0.3)';
+        ctx.beginPath();
+        ctx.moveTo(0, 10);
+        ctx.lineTo(-40, 200);
+        ctx.lineTo(40, 200);
+        ctx.fill();
+        if (Math.random() > 0.5) {
+            ctx.strokeStyle = '#FFA';
+            ctx.stroke();
+        }
+    }
+    
+    // Captured ship attached visually
+    if (e.hasCaptured) {
+        drawPlayer(0, -20);
+    }
+    
+    ctx.restore();
+}
+
+function drawText(txt, x, y, size, align='left', color='#FFF') {
+    ctx.fillStyle = color;
+    ctx.font = `bold ${size}px 'Courier New', Courier, monospace`;
+    ctx.textAlign = align;
+    ctx.textBaseline = 'top';
+    ctx.fillText(txt, x, y);
+}
+
+function render() {
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+    
+    // Stars
+    for (let s of stars) {
+        ctx.fillStyle = s.color;
+        ctx.fillRect(s.x, s.y, 2, 2);
+    }
+
+    drawText(`SCORE\n${score}`, 10, 10, 16, 'left', '#F00');
+    drawText(`HI-SCORE\n${highScore}`, W/2, 10, 16, 'center', '#F00');
+
+    // Lives
+    for(let i=0; i<lives-1; i++) {
+        drawPlayer(20 + i*25, H - 20);
+    }
+    // Icons
+    for(let i=0; i<Math.min(stage, 10); i++) {
+        ctx.fillStyle = '#0F0';
+        ctx.fillRect(W - 20 - i*15, H - 25, 10, 10);
+    }
+
+    if (state === ST_TITLE) {
+        drawText("GALAGA", W/2, H/3, 50, 'center', '#0FF');
+        let blink = Math.floor(performance.now() / 500) % 2 === 0;
+        if (blink) drawText("Press SPACE to start", W/2, H/2 + 50, 20, 'center');
+        return;
+    }
+
+    // Player
+    if (player && player.invuln > 0) {
+        ctx.globalAlpha = Math.floor(performance.now() / 150) % 2 === 0 ? 1.0 : 0.4;
+    }
+    
+    if (player && (state === ST_PLAYING || state === ST_STAGE_CLEAR || state === ST_BONUS_RESULT || state === ST_DEAD)) {
+        if (player.dualMode) {
+            if (player.s1Active) drawPlayer(player.x - 16, SHIP_Y);
+            if (player.s2Active) drawPlayer(player.x + 16, SHIP_Y);
+        } else {
+            if (player.s1Active) drawPlayer(player.x, SHIP_Y);
+        }
+    }
+    ctx.globalAlpha = 1.0;
+
+    // Enemies
+    for (let e of enemies) {
+        drawEnemy(e);
+    }
+
+    // Projectiles
+    ctx.fillStyle = '#FF0';
+    for (let l of pLasers) {
+        ctx.fillRect(l.x - LASER_W/2, l.y, LASER_W, LASER_H);
+    }
+    ctx.fillStyle = '#F00';
+    for (let m of eMissiles) {
+        ctx.fillRect(m.x - E_MSL_W/2, m.y, E_MSL_W, E_MSL_H);
+    }
+    
+    // Explosions
+    for (let p of explosions) {
+        ctx.fillStyle = p.c;
+        ctx.fillRect(p.x, p.y, 3, 3);
+    }
+
+    // Overlays
+    if (state === ST_PAUSED) {
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        ctx.fillRect(0,0,W,H);
+        drawText("PAUSED", W/2, H/2, 40, 'center', '#0FF');
+    } else if (state === ST_START_STAGE) {
+        let msg = isBonusStage ? "CHALLENGING STAGE" : `STAGE ${stage}`;
+        drawText(msg, W/2, H/2, 24, 'center', '#0FF');
+    } else if (state === ST_GAMEOVER) {
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        ctx.fillRect(0,0,W,H);
+        drawText("GAME OVER", W/2, H/2 - 20, 40, 'center', '#F00');
+        let blink = Math.floor(performance.now() / 500) % 2 === 0;
+        if (blink) drawText("Press SPACE to restart", W/2, H/2 + 30, 16, 'center');
+    } else if (state === ST_BONUS_RESULT) {
+        drawText(`HITS: ${bonusKilled}`, W/2, H/2 - 20, 24, 'center', '#0FF');
+        if (bonusKilled === 40) drawText("PERFECT! 10000 PTS", W/2, H/2 + 20, 20, 'center', '#FF0');
+    }
+}
+
+// --- MAIN LOOP ---
+let _lastTime = 0;
+function loop(timestamp) {
+    if (!_lastTime) _lastTime = timestamp;
+    let dt = (timestamp - _lastTime) / 1000;
+    _lastTime = timestamp;
+    
+    if (dt > 0.1) dt = 0.1;
+    
+    update(dt);
+    render();
+    
+    requestAnimationFrame(loop);
+}
+
+initStars();
+requestAnimationFrame(loop);
+
+</script>
+</body>
+</html>

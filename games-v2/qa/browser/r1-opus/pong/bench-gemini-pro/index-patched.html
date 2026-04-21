@@ -1,0 +1,516 @@
+<!--
+  GAME:      Pong
+  RUN:       r1-opus
+  BUILDER:   google/gemini-3-pro-preview
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Pong</title>
+<style>
+    body {
+        margin: 0;
+        background: #111;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        height: 100vh;
+        overflow: hidden;
+        color: #fff;
+    }
+    canvas {
+        background: #000;
+        width: 858px;
+        height: 525px;
+        box-shadow: 0 0 20px rgba(255, 255, 255, 0.1);
+    }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas" width="858" height="525"></canvas>
+<script>
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+
+    // Font representation for retro digits (3x5 grid)
+    const font = [
+        "111101101101111", // 0
+        "010010010010010", // 1
+        "111001111100111", // 2
+        "111001111001111", // 3
+        "101101111001001", // 4
+        "111100111001111", // 5
+        "111100111101111", // 6
+        "111001001001001", // 7
+        "111101111101111", // 8
+        "111101111001111"  // 9
+    ];
+
+    // Game State
+    let state = 'TITLE'; // TITLE, SERVE, PLAYING, PAUSED, SCORED, MATCH_OVER
+    let mode = 1; // 1 or 2 players
+    let p1Score = 0;
+    let p2Score = 0;
+    
+    let p1Y = 217.5;
+    let p2Y = 217.5;
+    let p1Stretch = 0;
+    let p2Stretch = 0;
+    
+    let ball = {
+        x: 422, y: 255.5,
+        prevX: 422, prevY: 255.5,
+        vx: 0, vy: 0,
+        speed: 280,
+        trail: []
+    };
+    
+    let aiPredictedY = 262.5; 
+    let lastLoser = 0;
+    
+    // Timers
+    let serveTimer = 0;
+    let scoreTimer = 0;
+    let flashFrames = 0;
+    let p1Pop = 0;
+    let p2Pop = 0;
+    let lastTime = 0;
+    
+    // Attract mode ball
+    let attractBall = { x: 422, y: 255.5, vx: 300, vy: 250 };
+    
+    // Input map
+    const keys = {};
+
+    // Audio Context
+    let actx = null;
+
+    function initAudio() {
+        if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+        if (actx.state === 'suspended') actx.resume();
+    }
+
+    function playSound(type) {
+        if (!actx) return;
+        const osc = actx.createOscillator();
+        const gain = actx.createGain();
+        osc.type = 'square';
+        osc.connect(gain);
+        gain.connect(actx.destination);
+        
+        const now = actx.currentTime;
+        
+        if (type === 'hit') {
+            osc.frequency.setValueAtTime(480, now);
+            gain.gain.setValueAtTime(0.3, now);
+            gain.gain.exponentialRampToValueAtTime(0.01, now + 0.045);
+            osc.start(now);
+            osc.stop(now + 0.045);
+        } else if (type === 'bounce') {
+            osc.frequency.setValueAtTime(240, now);
+            gain.gain.setValueAtTime(0.2, now);
+            gain.gain.exponentialRampToValueAtTime(0.01, now + 0.03);
+            osc.start(now);
+            osc.stop(now + 0.03);
+        } else if (type === 'score') {
+            osc.frequency.setValueAtTime(160, now);
+            gain.gain.setValueAtTime(0.3, now);
+            gain.gain.exponentialRampToValueAtTime(0.01, now + 0.25);
+            osc.start(now);
+            osc.stop(now + 0.25);
+        } else if (type === 'win') {
+            osc.frequency.setValueAtTime(660, now);
+            osc.frequency.setValueAtTime(990, now + 0.07);
+            gain.gain.setValueAtTime(0.25, now);
+            gain.gain.exponentialRampToValueAtTime(0.01, now + 0.17);
+            osc.start(now);
+            osc.stop(now + 0.17);
+        } else if (type === 'loss') {
+            osc.frequency.setValueAtTime(140, now);
+            gain.gain.setValueAtTime(0.25, now);
+            gain.gain.exponentialRampToValueAtTime(0.01, now + 0.5);
+            osc.start(now);
+            osc.stop(now + 0.5);
+        }
+    }
+
+    window.addEventListener('keydown', e => {
+        initAudio(); // Initialize audio on first user action
+        keys[e.key] = true;
+        
+        if (state === 'TITLE') {
+            if (e.key === '1') { mode = 1; startGame(); }
+            else if (e.key === '2') { mode = 2; startGame(); }
+            else if (e.key === 'ArrowUp' || e.key === 'w' || e.key === 'W') mode = 1;
+            else if (e.key === 'ArrowDown' || e.key === 's' || e.key === 'S') mode = 2;
+            else if (e.key === 'Enter') startGame();
+        } else if (state === 'PLAYING') {
+            if ((e.key === 'p' || e.key === 'P') && !keys['p_held']) {
+                state = 'PAUSED';
+                keys['p_held'] = true;
+            }
+        } else if (state === 'PAUSED') {
+            if ((e.key === 'p' || e.key === 'P') && !keys['p_held']) {
+                state = 'PLAYING';
+                keys['p_held'] = true;
+                lastTime = performance.now(); // avoid dt spike
+            }
+        } else if (state === 'MATCH_OVER') {
+            if (e.key === 'Enter') {
+                state = 'TITLE';
+            }
+        }
+    });
+
+    window.addEventListener('keyup', e => {
+        keys[e.key] = false;
+        if (e.key === 'p' || e.key === 'P') keys['p_held'] = false;
+    });
+
+    function startGame() {
+        p1Score = p2Score = 0;
+        p1Y = p2Y = 217.5;
+        lastLoser = 0;
+        serveTimer = 1.5;
+        state = 'SERVE';
+        ball.trail = [];
+        aiPredictedY = 262.5;
+    }
+
+    function launchBall() {
+        ball.x = 422;
+        ball.y = 255.5;
+        ball.prevX = 422;
+        ball.prevY = 255.5;
+        ball.speed = 280;
+        ball.trail = [];
+        
+        let angle = (Math.random() * 70 - 35) * Math.PI / 180;
+        let dir = lastLoser === 1 ? -1 : (lastLoser === 2 ? 1 : (Math.random() < 0.5 ? 1 : -1));
+        
+        ball.vx = ball.speed * Math.cos(angle) * dir;
+        ball.vy = ball.speed * Math.sin(angle);
+        
+        state = 'PLAYING';
+    }
+
+    function updateAIPrediction() {
+        let simX = ball.x;
+        let simY = ball.y;
+        let svx = ball.vx;
+        let svy = ball.vy;
+        
+        if (svx <= 0) return; 
+        
+        let safety = 0;
+        while (simX < 800 && safety++ < 50) {
+            let tWall = svy > 0 ? (511 - simY) / svy : (svy < 0 ? -simY / svy : Infinity);
+            let tPaddle = (800 - simX) / svx;
+            
+            if (tPaddle < tWall) {
+                simY += svy * tPaddle;
+                break;
+            } else {
+                simX += svx * tWall;
+                simY += svy * tWall;
+                svy = -svy;
+            }
+        }
+        
+        let targetY = simY + 7; // Center of expected ball
+        let offset = (Math.random() * 70) - 35;
+        aiPredictedY = Math.max(0, Math.min(525, targetY + offset));
+    }
+
+    function handleScore(winner) {
+        lastLoser = winner === 1 ? 2 : 1;
+        playSound('score');
+        flashFrames = 2; // 2 frames visual snap
+        
+        if (winner === 1) {
+            p1Score++;
+            p1Pop = 0.08;
+        } else {
+            p2Score++;
+            p2Pop = 0.08;
+        }
+        
+        scoreTimer = 1.2;
+        state = 'SCORED';
+    }
+
+    function update(dt) {
+        if (p1Pop > 0) p1Pop -= dt;
+        if (p2Pop > 0) p2Pop -= dt;
+
+        if (state === 'TITLE') {
+            attractBall.x += attractBall.vx * dt;
+            attractBall.y += attractBall.vy * dt;
+            if (attractBall.y < 0) { attractBall.y = 0; attractBall.vy = -attractBall.vy; }
+            if (attractBall.y > 511) { attractBall.y = 511; attractBall.vy = -attractBall.vy; }
+            if (attractBall.x < 0) { attractBall.x = 0; attractBall.vx = -attractBall.vx; }
+            if (attractBall.x > 844) { attractBall.x = 844; attractBall.vx = -attractBall.vx; }
+        } else if (state === 'SERVE') {
+            serveTimer -= dt;
+            if (serveTimer <= 0) launchBall();
+        } else if (state === 'SCORED') {
+            scoreTimer -= dt;
+            if (scoreTimer <= 0) {
+                if (p1Score >= 11 || p2Score >= 11) {
+                    state = 'MATCH_OVER';
+                    if (mode === 1) playSound(p1Score >= 11 ? 'win' : 'loss');
+                    else playSound('win');
+                } else {
+                    serveTimer = 1.5;
+                    state = 'SERVE';
+                }
+            }
+        }
+
+        if (state === 'PLAYING') {
+            // Paddles
+            const PADDLE_SPEED = 380;
+            if (keys['w'] || keys['W']) p1Y -= PADDLE_SPEED * dt;
+            if (keys['s'] || keys['S']) p1Y += PADDLE_SPEED * dt;
+
+            if (mode === 2) {
+                if (keys['ArrowUp']) p2Y -= PADDLE_SPEED * dt;
+                if (keys['ArrowDown']) p2Y += PADDLE_SPEED * dt;
+            } else {
+                // AI behavior
+                let p2Center = p2Y + 45;
+                if (ball.vx > 0) {
+                    if (Math.abs(p2Center - aiPredictedY) > 8) {
+                        p2Y += Math.sign(aiPredictedY - p2Center) * Math.min(320 * dt, Math.abs(aiPredictedY - p2Center));
+                    }
+                } else {
+                    let driftTarget = 262.5; // center
+                    if (Math.abs(p2Center - driftTarget) > 8) {
+                        p2Y += Math.sign(driftTarget - p2Center) * Math.min(100 * dt, Math.abs(driftTarget - p2Center));
+                    }
+                }
+            }
+
+            // Clamp Paddles
+            p1Y = Math.max(0, Math.min(435, p1Y)); // 525 - 90
+            p2Y = Math.max(0, Math.min(435, p2Y));
+
+            // Ball Updates
+            ball.prevX = ball.x;
+            ball.prevY = ball.y;
+            
+            ball.trail.unshift({x: ball.x, y: ball.y});
+            if (ball.trail.length > 5) ball.trail.pop();
+            
+            ball.x += ball.vx * dt;
+            ball.y += ball.vy * dt;
+
+            // Top & Bottom Walls
+            if (ball.y < 0) {
+                ball.y = -ball.y;
+                ball.vy = -ball.vy;
+                playSound('bounce');
+            } else if (ball.y > 511) {
+                ball.y = 511 - (ball.y - 511);
+                ball.vy = -ball.vy;
+                playSound('bounce');
+            }
+
+            // Prevent pure horizontal stalls
+            if (Math.abs(ball.vy) < 50) ball.vy = ball.vy < 0 ? -50 : 50;
+
+            // Paddle Hit Sweeps
+            if (ball.x !== ball.prevX) {
+                // Left Paddle (Face at x = 44)
+                if (ball.prevX >= 44 && ball.x < 44) {
+                    let timeT = (44 - ball.prevX) / (ball.x - ball.prevX);
+                    let yCross = ball.prevY + timeT * (ball.y - ball.prevY);
+                    
+                    if (yCross + 14 >= p1Y && yCross <= p1Y + 90) {
+                        let hitY = yCross + 7;
+                        let ratio = (hitY - (p1Y + 45)) / 45;
+                        ratio = Math.max(-1, Math.min(1, ratio));
+                        let angle = ratio * Math.PI * (65 / 180);
+                        
+                        ball.speed = Math.min(550, ball.speed + 30);
+                        ball.vx = ball.speed * Math.cos(angle);
+                        ball.vy = ball.speed * Math.sin(angle);
+                        ball.x = 44; // Position just outside
+                        
+                        p1Stretch = 3;
+                        playSound('hit');
+                        if (mode === 1) updateAIPrediction();
+                    }
+                }
+                
+                // Right Paddle (Face at x = 814)
+                if (ball.prevX + 14 <= 814 && ball.x + 14 > 814) {
+                    let timeT = (814 - (ball.prevX + 14)) / ((ball.x + 14) - (ball.prevX + 14));
+                    let yCross = ball.prevY + timeT * (ball.y - ball.prevY);
+                    
+                    if (yCross + 14 >= p2Y && yCross <= p2Y + 90) {
+                        let hitY = yCross + 7;
+                        let ratio = (hitY - (p2Y + 45)) / 45;
+                        ratio = Math.max(-1, Math.min(1, ratio));
+                        let angle = ratio * Math.PI * (65 / 180);
+                        
+                        ball.speed = Math.min(550, ball.speed + 30);
+                        ball.vx = -ball.speed * Math.cos(angle);
+                        ball.vy = ball.speed * Math.sin(angle);
+                        ball.x = 800; // 814 - 14
+                        
+                        p2Stretch = 3;
+                        playSound('hit');
+                    }
+                }
+            }
+
+            // Detect Scoring
+            if (ball.x < -10) handleScore(2);
+            else if (ball.x > 868) handleScore(1);
+        }
+    }
+
+    function drawDigit(num, cx, cy, scale) {
+        const map = font[num];
+        const cellSize = 10 * scale;
+        const gap = 3 * scale;
+        const width = 3 * cellSize + 2 * gap;
+        const height = 5 * cellSize + 4 * gap;
+        
+        ctx.save();
+        ctx.translate(cx - width / 2, cy - height / 2);
+        
+        for (let i = 0; i < 15; i++) {
+            if (map[i] === '1') {
+                let col = i % 3;
+                let row = Math.floor(i / 3);
+                ctx.fillRect(col * (cellSize + gap), row * (cellSize + gap), cellSize, cellSize);
+            }
+        }
+        ctx.restore();
+    }
+
+    function drawScore(score, x, y, scale) {
+        if (score > 9) {
+            drawDigit(Math.floor(score / 10), x - 20 * scale, y, scale);
+            drawDigit(score % 10, x + 20 * scale, y, scale);
+        } else {
+            drawDigit(score, x, y, scale);
+        }
+    }
+
+    function draw() {
+        if (flashFrames > 0) {
+            ctx.fillStyle = '#FFFFFF';
+            ctx.fillRect(0, 0, 858, 525);
+            flashFrames--;
+            return;
+        }
+
+        ctx.fillStyle = '#000000';
+        ctx.fillRect(0, 0, 858, 525);
+
+        // Center Net
+        ctx.fillStyle = '#FFFFFF';
+        for (let y = 0; y < 525; y += 24) {
+            ctx.fillRect(427, y, 4, 12);
+        }
+
+        // Scores
+        let scale1 = p1Pop > 0 ? 1.3 : 1;
+        let scale2 = p2Pop > 0 ? 1.3 : 1;
+        drawScore(p1Score, 300, 60, scale1);
+        drawScore(p2Score, 558, 60, scale2);
+
+        // Paddles
+        let p1W = 14 + (p1Stretch > 0 ? 2 : 0);
+        let p1X = 30 - (p1Stretch > 0 ? 1 : 0);
+        ctx.fillRect(p1X, p1Y, p1W, 90);
+        
+        let p2W = 14 + (p2Stretch > 0 ? 2 : 0);
+        let p2X = 814 - (p2Stretch > 0 ? 1 : 0);
+        ctx.fillRect(p2X, p2Y, p2W, 90);
+
+        if (p1Stretch > 0) p1Stretch--;
+        if (p2Stretch > 0) p2Stretch--;
+
+        // Draw active elements
+        if (state === 'PLAYING' || state === 'SERVE' || state === 'PAUSED') {
+            ball.trail.forEach((pos, i) => {
+                let op = [0.5, 0.35, 0.2, 0.1, 0.05][i];
+                ctx.fillStyle = `rgba(255, 255, 255, ${op})`;
+                ctx.fillRect(pos.x, pos.y, 14, 14);
+            });
+            
+            ctx.fillStyle = '#FFFFFF';
+            let squish = p1Stretch > 0 || p2Stretch > 0;
+            if (squish) ctx.fillRect(ball.x - 1, ball.y, 16, 14);
+            else ctx.fillRect(ball.x, ball.y, 14, 14);
+        }
+
+        // Overlays
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        
+        if (state === 'TITLE') {
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
+            ctx.fillRect(attractBall.x, attractBall.y, 14, 14);
+
+            ctx.fillStyle = '#FFFFFF';
+            ctx.font = 'bold 80px monospace';
+            ctx.fillText('PONG', 429, 160);
+            
+            ctx.font = '26px monospace';
+            ctx.fillStyle = mode === 1 ? '#FFFFFF' : '#888888';
+            ctx.fillText((mode === 1 ? '▸ ' : '  ') + '1 PLAYER', 429, 280);
+            ctx.fillStyle = mode === 2 ? '#FFFFFF' : '#888888';
+            ctx.fillText((mode === 2 ? '▸ ' : '  ') + '2 PLAYERS', 429, 320);
+            
+            ctx.fillStyle = '#555555';
+            ctx.font = '14px monospace';
+            ctx.fillText('W/S and ↑/↓ to move paddles, 1/2 to select', 429, 450);
+        } else if (state === 'SERVE') {
+            ctx.fillStyle = '#FFFFFF';
+            ctx.font = '36px monospace';
+            ctx.fillText('READY', 429, 160);
+        } else if (state === 'PAUSED') {
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+            ctx.fillRect(0, 0, 858, 525);
+            ctx.fillStyle = '#FFFFFF';
+            ctx.font = '40px monospace';
+            ctx.fillText('PAUSED', 429, 262.5);
+        } else if (state === 'MATCH_OVER') {
+            ctx.fillStyle = '#FFFFFF';
+            ctx.font = '40px monospace';
+            let winnerText = "";
+            if (mode === 1) winnerText = p1Score >= 11 ? "YOU WIN" : "COMPUTER WINS";
+            else winnerText = p1Score >= 11 ? "PLAYER 1 WINS" : "PLAYER 2 WINS";
+            ctx.fillText(winnerText, 429, 200);
+            
+            if (Math.floor(performance.now() / 500) % 2 === 0) {
+                ctx.fillStyle = '#AAAAAA';
+                ctx.font = '20px monospace';
+                ctx.fillText('Press Enter to play again', 429, 300);
+            }
+        }
+    }
+
+    function gameLoop(timestamp) {
+        if (!lastTime) lastTime = timestamp;
+        let dt = (timestamp - lastTime) / 1000;
+        lastTime = timestamp;
+        dt = Math.min(dt, 0.05); // Cap dt backlogging
+        
+        update(dt);
+        draw();
+        
+        requestAnimationFrame(gameLoop);
+    }
+    
+    // Start Loop
+    requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>

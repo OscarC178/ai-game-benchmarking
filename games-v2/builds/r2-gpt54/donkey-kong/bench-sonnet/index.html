@@ -1,0 +1,800 @@
+<!--
+  GAME:      Donkey Kong
+  RUN:       r2-gpt54
+  BUILDER:   anthropic/claude-sonnet-4.6
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Donkey Kong</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#000; display:flex; align-items:center; justify-content:center; width:100vw; height:100vh; overflow:hidden; }
+canvas { display:block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+'use strict';
+
+const W=700, H=800;
+const canvas=document.getElementById('c');
+const ctx=canvas.getContext('2d');
+canvas.width=W; canvas.height=H;
+
+function resize(){
+  const s=Math.min(window.innerWidth/W,window.innerHeight/H);
+  canvas.style.width=(W*s)+'px'; canvas.style.height=(H*s)+'px';
+}
+window.addEventListener('resize',resize); resize();
+
+// ---- Audio ----
+let AC=null;
+function initAC(){ if(AC)return; try{ AC=new(window.AudioContext||window.webkitAudioContext)(); }catch(e){} }
+function beep(freq,dur,gain,type,fe){
+  if(!AC)return;
+  try{
+    const o=AC.createOscillator(),g=AC.createGain();
+    o.connect(g); g.connect(AC.destination);
+    o.type=type||'square'; o.frequency.value=freq;
+    if(fe) o.frequency.exponentialRampToValueAtTime(Math.max(1,fe),AC.currentTime+dur);
+    g.gain.setValueAtTime(gain||0.15,AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001,AC.currentTime+dur);
+    o.start(); o.stop(AC.currentTime+dur+0.01);
+  }catch(e){}
+}
+function sndJump(){ beep(660,0.08,0.15,'sine'); }
+function sndDeath(){ [400,350,300,250,200].forEach((f,i)=>setTimeout(()=>beep(f,0.08,0.2,'sawtooth'),i*70)); }
+function sndSmash(){ beep(440,0.1,0.2,'square'); setTimeout(()=>beep(220,0.08,0.15,'square'),80); }
+function sndHammer(){ beep(880,0.05,0.1,'square'); }
+function sndClear(){ [523,659,784,1047].forEach((f,i)=>setTimeout(()=>beep(f,0.1,0.2,'sine'),i*100)); }
+function sndJumpOver(){ beep(550,0.1,0.15,'sine'); }
+
+// ---- Input ----
+const keys={},prev={};
+window.addEventListener('keydown',e=>{ keys[e.code]=true; if(['Space','ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.code)) e.preventDefault(); });
+window.addEventListener('keyup',e=>{ keys[e.code]=false; });
+
+// ---- Constants ----
+const ST={TITLE:0,PLAYING:1,PAUSED:2,DEAD:3,STAGE_CLEAR:4,GAMEOVER:5};
+const HUD_H=60;
+const PW=22, PH=30;
+const GRAVITY=900;
+const BARREL_FALL_G=1200;
+
+// ---- Stage Layout ----
+// Platforms: {x1,y1,x2,y2, color} — left and right end-points
+// y1=left side height, y2=right side height (slope)
+const PLATFORMS=[
+  {x1:30,  y1:745, x2:670, y2:730, id:0}, // bottom
+  {x1:30,  y1:625, x2:670, y2:640, id:1}, // p1 slope right-up
+  {x1:30,  y1:510, x2:670, y2:525, id:2}, // p2
+  {x1:30,  y1:400, x2:670, y2:415, id:3}, // p3
+  {x1:30,  y1:290, x2:670, y2:305, id:4}, // p4
+  {x1:30,  y1:165, x2:670, y2:175, id:5}, // top
+];
+
+// Slope: for platform i, y at x = lerp(y1,y2, (x-x1)/(x2-x1))
+function platY(p,x){
+  if(!p) return 9999;
+  const t=Math.max(0,Math.min(1,(x-p.x1)/(p.x2-p.x1)));
+  return p.y1+(p.y2-p.y1)*t;
+}
+function platSlopeDir(p){
+  // Returns -1 if slopes down-right (barrel rolls right), +1 if slopes down-left
+  return (p.y2>p.y1)?1:-1; // if y2>y1, right side lower → rolls right (dir=1)
+}
+
+// Ladders: {x, y1, y2, broken(optional yBreak)}
+// y1=top, y2=bottom
+const LADDERS=[
+  {x:120, y1:165, y2:745, broken:null, id:0}, // far left full ladder (we'll restrict per platform)
+  {x:120, y1:165, y2:640, broken:510, id:1},   // broken at p2
+  {x:250, y1:165, y2:745, broken:400, id:2},   // broken at p3
+  {x:390, y1:165, y2:745, broken:290, id:3},   // broken at p4
+  {x:530, y1:165, y2:745, broken:null, id:4},   // full right ladder
+  {x:190, y1:305, y2:640, broken:null, id:5},
+  {x:460, y1:415, y2:640, broken:525, id:6},
+];
+
+// Simplified ladders: each ladder segment between two specific platforms
+const LADDER_SEGS=[
+  // {x, topY, botY, broken} — broken=true means can't enter from bottom half
+  {x:120, topY:170, botY:625, broken:false},
+  {x:260, topY:170, botY:510, broken:false},
+  {x:400, topY:170, botY:400, broken:false},
+  {x:540, topY:170, botY:295, broken:false},
+  {x:200, topY:300, botY:635, broken:true,  breakY:450},
+  {x:470, topY:415, botY:630, broken:false},
+  {x:330, topY:510, botY:745, broken:false},
+  {x:560, topY:510, botY:745, broken:false},
+  {x:80,  topY:295, botY:510, broken:false},
+  {x:610, topY:295, botY:510, broken:false},
+  {x:150, topY:165, botY:295, broken:false},
+  {x:490, topY:165, botY:305, broken:false},
+];
+
+// Hammers
+let hammerPickups=[];
+function resetHammers(){
+  hammerPickups=[
+    {x:300,y:0,platformId:2,alive:true},
+    {x:450,y:0,platformId:4,alive:true},
+  ];
+  // Position on platform surface
+  for(const h of hammerPickups){
+    const p=PLATFORMS[h.platformId];
+    h.y=platY(p,h.x)-14;
+  }
+}
+
+// ---- State ----
+let state=ST.TITLE;
+let score,hiScore,lives,stage,bonusTimer;
+let stateTimer,totalTime;
+let barrels;
+let dkThrowTimer, dkAnimT;
+let player;
+let floatScores=[];
+
+hiScore=parseInt(localStorage.getItem('dk_best')||'0');
+
+// ---- Player ----
+function makePlayer(){
+  const p=PLATFORMS[0];
+  const sx=80;
+  return {
+    x:sx, y:platY(p,sx)-PH,
+    vx:0, vy:0,
+    onGround:true, platformId:0,
+    climbing:false, ladderIdx:-1, ladderX:0,
+    facing:1,
+    hammerTime:0, hammerAnim:0,
+    jumpedOver:new Set(),
+    alive:true,
+    deathTimer:0
+  };
+}
+
+// ---- Barrels ----
+function makeBarrel(){
+  return {
+    x:130, y:110,
+    vx:0, vy:0,
+    platformId:5,
+    dir:1,
+    state:'rolling', // rolling | falling | dead
+    jumpScored:false
+  };
+}
+
+function startGame(){
+  initAC();
+  score=0; lives=3; stage=1;
+  bonusTimer=5000;
+  barrels=[]; dkThrowTimer=2; dkAnimT=0;
+  resetHammers();
+  player=makePlayer();
+  stateTimer=0; totalTime=0;
+  floatScores=[];
+  state=ST.PLAYING;
+}
+
+function resetStage(){
+  bonusTimer=5000-stage*200;
+  if(bonusTimer<1000) bonusTimer=1000;
+  barrels=[]; dkThrowTimer=2;
+  resetHammers();
+  player=makePlayer();
+  floatScores=[];
+}
+
+// ---- Helpers ----
+function lerp(a,b,t){ return a+(b-a)*t; }
+function dist(ax,ay,bx,by){ return Math.sqrt((ax-bx)**2+(ay-by)**2); }
+function aabb(ax,ay,aw,ah,bx,by,bw,bh){ return ax<bx+bw&&ax+aw>bx&&ay<by+bh&&ay+ah>by; }
+
+function getPlatformAt(x,y){
+  // Find which platform the player/barrel is standing on
+  // Check from top to bottom to find first platform within a snap range
+  for(let i=PLATFORMS.length-1;i>=0;i--){
+    const p=PLATFORMS[i];
+    if(x>=p.x1-10&&x<=p.x2+10){
+      const sy=platY(p,x);
+      if(y+PH>=sy-8&&y+PH<=sy+20) return i;
+    }
+  }
+  return -1;
+}
+
+function getLadderAt(x,y,h){
+  for(let i=0;i<LADDER_SEGS.length;i++){
+    const l=LADDER_SEGS[i];
+    if(Math.abs(x+PW/2-l.x)<18&&y+h/2>l.topY&&y+h/2<l.botY){
+      return i;
+    }
+  }
+  return -1;
+}
+
+// ---- Update ----
+let lastTime=0;
+
+function update(dt){
+  totalTime+=dt;
+
+  for(let i=floatScores.length-1;i>=0;i--){
+    floatScores[i].life-=dt; floatScores[i].y-=30*dt;
+    if(floatScores[i].life<=0) floatScores.splice(i,1);
+  }
+
+  if(state===ST.TITLE||state===ST.PAUSED||state===ST.GAMEOVER) return;
+
+  if(state===ST.DEAD){
+    stateTimer-=dt;
+    if(stateTimer<=0){
+      lives--;
+      if(lives<=0){
+        if(score>hiScore){ hiScore=score; localStorage.setItem('dk_best',hiScore); }
+        state=ST.GAMEOVER;
+      } else {
+        player=makePlayer();
+        barrels=barrels.filter(b=>b.state!=='dead');
+        state=ST.PLAYING;
+      }
+    }
+    return;
+  }
+  if(state===ST.STAGE_CLEAR){
+    stateTimer-=dt;
+    if(stateTimer<=0){
+      stage++;
+      resetStage();
+      state=ST.PLAYING;
+    }
+    return;
+  }
+
+  // Bonus timer
+  bonusTimer=Math.max(0,bonusTimer-dt*100);
+
+  // DK throw
+  dkThrowTimer-=dt;
+  dkAnimT+=dt;
+  if(dkThrowTimer<=0){
+    const b=makeBarrel();
+    b.dir=1;
+    barrels.push(b);
+    const interval=Math.max(1.5,3-stage*0.2);
+    dkThrowTimer=interval+Math.random()*0.5;
+  }
+
+  updatePlayer(dt);
+  updateBarrels(dt);
+  checkCollisions();
+}
+
+function updatePlayer(dt){
+  const pl=player;
+  if(!pl.alive) return;
+
+  pl.hammerTime=Math.max(0,pl.hammerTime-dt);
+  if(pl.hammerTime>0){ pl.hammerAnim+=dt; }
+
+  const spaceDown=keys['Space']&&!prev['Space'];
+
+  if(pl.climbing){
+    // Ladder movement
+    const l=LADDER_SEGS[pl.ladderIdx];
+    let vy=0;
+    if(keys['ArrowUp']||keys['KeyW']) vy=-120;
+    if(keys['ArrowDown']||keys['KeyS']) vy=120;
+    pl.vy=vy;
+    pl.y+=vy*dt;
+    pl.x=l.x-PW/2;
+
+    // Check broken
+    if(l.broken&&pl.y+PH/2<l.breakY&&pl.y+PH/2>l.topY+20){
+      // Already above break, ok; if going down past breakY from above = stop at breakY
+    }
+
+    // Check if reached top of ladder
+    if(pl.y+PH<=l.topY+5){
+      pl.y=l.topY-PH;
+      pl.climbing=false; pl.vy=0;
+      // Snap to nearest platform
+      const pid=getPlatformAt(pl.x+PW/2,pl.y);
+      if(pid>=0){ pl.platformId=pid; pl.onGround=true; }
+    }
+    // Check if reached bottom
+    if(pl.y+PH>=l.botY-2){
+      pl.y=l.botY-PH;
+      pl.climbing=false; pl.vy=0;
+      const pid=getPlatformAt(pl.x+PW/2,pl.y);
+      if(pid>=0){ pl.platformId=pid; pl.onGround=true; }
+    }
+    // Try to exit ladder to platform
+    if(vy!==0){
+      const pid=getPlatformAt(pl.x+PW/2,pl.y);
+      if(pid>=0&&vy<0){
+        pl.platformId=pid;
+        const p=PLATFORMS[pid];
+        pl.y=platY(p,pl.x+PW/2)-PH;
+        pl.climbing=false; pl.vy=0; pl.onGround=true;
+      }
+    }
+    return;
+  }
+
+  // Horizontal movement
+  pl.vx=0;
+  if(keys['ArrowLeft']||keys['KeyA']){ pl.vx=-150; pl.facing=-1; }
+  if(keys['ArrowRight']||keys['KeyD']){ pl.vx=150; pl.facing=1; }
+
+  // Enter ladder
+  if(!pl.hammerTime){
+    const li=getLadderAt(pl.x,pl.y,PH);
+    if(li>=0){
+      const l=LADDER_SEGS[li];
+      if((keys['ArrowUp']||keys['KeyW'])&&pl.y>l.topY){
+        pl.climbing=true; pl.ladderIdx=li; pl.vx=0; pl.onGround=false;
+        pl.x=l.x-PW/2; pl.vy=0;
+        return;
+      }
+      if((keys['ArrowDown']||keys['KeyS'])&&pl.onGround&&pl.y+PH<l.botY){
+        // Check not at top of ladder or broken gap
+        if(!l.broken||pl.y+PH>l.breakY-5){
+          pl.climbing=true; pl.ladderIdx=li; pl.vx=0; pl.onGround=false;
+          pl.x=l.x-PW/2; pl.vy=0;
+          return;
+        }
+      }
+    }
+  }
+
+  // Jump
+  if(spaceDown&&pl.onGround&&pl.hammerTime===0){
+    pl.vy=-340; pl.onGround=false;
+    sndJump();
+  }
+
+  // Apply gravity
+  if(!pl.onGround){ pl.vy+=GRAVITY*dt; }
+
+  pl.x+=pl.vx*dt;
+  pl.y+=pl.vy*dt;
+
+  // Clamp horizontal
+  pl.x=Math.max(0,Math.min(W-PW,pl.x));
+
+  // Platform grounding
+  pl.onGround=false;
+  for(let i=0;i<PLATFORMS.length;i++){
+    const p=PLATFORMS[i];
+    if(pl.x+PW/2<p.x1||pl.x+PW/2>p.x2) continue;
+    const sy=platY(p,pl.x+PW/2);
+    if(pl.y+PH>=sy-4&&pl.y+PH<=sy+20&&pl.vy>=0){
+      pl.y=sy-PH;
+      pl.vy=0; pl.onGround=true;
+      pl.platformId=i;
+      break;
+    }
+  }
+
+  // Fall below screen
+  if(pl.y>H+50){
+    killPlayer();
+  }
+
+  // Check goal (Pauline)
+  if(pl.x+PW>280&&pl.x<380&&pl.y<180&&pl.y>100){
+    stageClear();
+  }
+}
+
+function updateBarrels(dt){
+  const spd=120+stage*10;
+  for(let i=barrels.length-1;i>=0;i--){
+    const b=barrels[i];
+    if(b.state==='dead'){ barrels.splice(i,1); continue; }
+
+    if(b.state==='falling'){
+      b.vy+=BARREL_FALL_G*dt;
+      b.y+=b.vy*dt;
+      b.x+=b.vx*dt;
+      // Check landing on platform
+      let landed=false;
+      for(let pi=0;pi<PLATFORMS.length;pi++){
+        const p=PLATFORMS[pi];
+        if(b.x+9>=p.x1&&b.x+9<=p.x2){
+          const sy=platY(p,b.x+9);
+          if(b.y+9>=sy-8&&b.y+9<=sy+25&&b.vy>0){
+            b.y=sy-9; b.vy=0;
+            b.platformId=pi;
+            b.dir=platSlopeDir(p);
+            b.state='rolling';
+            landed=true; break;
+          }
+        }
+      }
+      if(b.y>H+50){ b.state='dead'; }
+      continue;
+    }
+
+    // Rolling
+    const p=PLATFORMS[b.platformId];
+    if(!p){ b.state='dead'; continue; }
+    b.dir=platSlopeDir(p);
+    b.x+=b.dir*spd*dt;
+    b.y=platY(p,b.x+9)-9;
+
+    // Off edge
+    if(b.x+18<p.x1||b.x>p.x2){
+      // Try to fall to next platform
+      if(b.platformId>0){
+        b.state='falling'; b.vy=0; b.vx=b.dir*spd*0.5;
+      } else {
+        b.state='dead'; // fell off bottom
+      }
+    }
+  }
+  // Remove barrels that fell off bottom
+  barrels=barrels.filter(b=>b.state!=='dead');
+}
+
+function checkCollisions(){
+  const pl=player;
+  if(!pl.alive) return;
+
+  // Barrel collisions
+  for(const b of barrels){
+    if(!aabb(pl.x,pl.y,PW,PH,b.x,b.y,18,18)) continue;
+    if(pl.hammerTime>0){
+      // Smash
+      b.state='dead';
+      score+=300;
+      floatScores.push({x:b.x,y:b.y-10,pts:300,life:1.2});
+      if(score>hiScore){ hiScore=score; localStorage.setItem('dk_best',hiScore); }
+      sndSmash();
+    } else {
+      killPlayer();
+      return;
+    }
+  }
+
+  // Jump-over scoring
+  if(!pl.onGround&&pl.vy>0){
+    for(const b of barrels){
+      if(b.jumpScored) continue;
+      // Player center passed horizontally near barrel
+      const pcx=pl.x+PW/2, pcy=pl.y+PH/2;
+      const bcx=b.x+9, bcy=b.y+9;
+      if(Math.abs(pcx-bcx)<22&&pcy<bcy-5){
+        b.jumpScored=true;
+        score+=100;
+        floatScores.push({x:pcx,y:pl.y-5,pts:100,life:1.2});
+        if(score>hiScore){ hiScore=score; localStorage.setItem('dk_best',hiScore); }
+        sndJumpOver();
+      }
+    }
+  }
+  // Reset jump-score flags when barrel out of range
+  for(const b of barrels){
+    if(b.jumpScored){
+      const pcx=pl.x+PW/2;
+      if(Math.abs(pcx-(b.x+9))>40) b.jumpScored=false;
+    }
+  }
+
+  // Hammer pickups
+  for(const h of hammerPickups){
+    if(!h.alive) continue;
+    if(aabb(pl.x,pl.y,PW,PH,h.x-10,h.y-10,28,28)){
+      h.alive=false;
+      pl.hammerTime=8; pl.hammerAnim=0;
+      sndHammer();
+    }
+  }
+}
+
+function killPlayer(){
+  if(!player.alive) return;
+  player.alive=false;
+  sndDeath();
+  stateTimer=1.5;
+  state=ST.DEAD;
+}
+
+function stageClear(){
+  const bonus=Math.floor(bonusTimer);
+  score+=1000+bonus;
+  if(score>hiScore){ hiScore=score; localStorage.setItem('dk_best',hiScore); }
+  sndClear();
+  stateTimer=2.5;
+  state=ST.STAGE_CLEAR;
+}
+
+// ---- Render ----
+function render(){
+  ctx.fillStyle='#000';
+  ctx.fillRect(0,0,W,H);
+
+  if(state===ST.TITLE){ drawTitle(); return; }
+
+  drawStage();
+  drawHammers();
+  drawBarrels();
+  drawDK();
+  drawPauline();
+  drawPlayer();
+  drawFloatScores();
+  drawHUD();
+
+  // State overlays
+  if(state===ST.PAUSED){
+    ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#fff'; ctx.font='bold 44px monospace'; ctx.textAlign='center';
+    ctx.fillText('PAUSED',W/2,H/2);
+    ctx.fillStyle='#888'; ctx.font='18px monospace';
+    ctx.fillText('P to resume',W/2,H/2+50);
+  }
+  if(state===ST.DEAD){
+    ctx.fillStyle='rgba(200,0,0,0.15)'; ctx.fillRect(0,0,W,H);
+  }
+  if(state===ST.STAGE_CLEAR){
+    ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#FFD700'; ctx.font='bold 42px monospace'; ctx.textAlign='center';
+    ctx.fillText('STAGE CLEAR!',W/2,H/2-20);
+    ctx.fillStyle='#fff'; ctx.font='22px monospace';
+    ctx.fillText('+1000 + BONUS: '+Math.floor(bonusTimer),W/2,H/2+30);
+  }
+  if(state===ST.GAMEOVER){
+    ctx.fillStyle='rgba(0,0,0,0.75)'; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#ff2222'; ctx.font='bold 52px monospace'; ctx.textAlign='center';
+    ctx.fillText('GAME OVER',W/2,H/2-40);
+    ctx.fillStyle='#fff'; ctx.font='24px monospace';
+    ctx.fillText('Score: '+score,W/2,H/2+10);
+    const blink=Math.floor(totalTime*2)%2===0;
+    ctx.fillStyle=blink?'#aaa':'#444'; ctx.font='18px monospace';
+    ctx.fillText('Press Enter to Restart',W/2,H/2+65);
+  }
+}
+
+function drawStage(){
+  // Platforms
+  for(const p of PLATFORMS){
+    ctx.strokeStyle='#ff4466'; ctx.lineWidth=12;
+    ctx.lineCap='square';
+    ctx.beginPath(); ctx.moveTo(p.x1,p.y1); ctx.lineTo(p.x2,p.y2); ctx.stroke();
+    // Rivets
+    ctx.fillStyle='#cc2244';
+    const steps=Math.floor((p.x2-p.x1)/50);
+    for(let i=1;i<steps;i++){
+      const t=i/steps;
+      const rx=p.x1+(p.x2-p.x1)*t, ry=p.y1+(p.y2-p.y1)*t;
+      ctx.beginPath(); ctx.arc(rx,ry+2,4,0,Math.PI*2); ctx.fill();
+    }
+  }
+
+  // Ladders
+  for(const l of LADDER_SEGS){
+    ctx.strokeStyle='#0088ff'; ctx.lineWidth=3;
+    // Left side
+    ctx.beginPath(); ctx.moveTo(l.x-8,l.topY); ctx.lineTo(l.x-8,l.botY); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(l.x+8,l.topY); ctx.lineTo(l.x+8,l.botY); ctx.stroke();
+    // Rungs
+    const rungH=14;
+    let startY=l.topY;
+    while(startY<l.botY){
+      // Skip broken section
+      if(l.broken&&startY>l.breakY-30&&startY<l.breakY+10){
+        ctx.strokeStyle='rgba(0,100,200,0.3)';
+      } else {
+        ctx.strokeStyle='#0088ff';
+      }
+      ctx.lineWidth=2;
+      ctx.beginPath(); ctx.moveTo(l.x-8,startY); ctx.lineTo(l.x+8,startY); ctx.stroke();
+      startY+=rungH;
+    }
+    // Visual break indicator
+    if(l.broken){
+      ctx.fillStyle='rgba(255,0,0,0.6)';
+      ctx.fillRect(l.x-9,l.breakY-4,18,8);
+    }
+  }
+
+  // Oil drum bottom left
+  ctx.fillStyle='#cc4400';
+  ctx.fillRect(30,PLATFORMS[0].y1+4,30,24);
+  ctx.fillStyle='#ff6600';
+  // Flame
+  const ft=Math.sin(totalTime*8)*3;
+  ctx.beginPath();
+  ctx.moveTo(38,PLATFORMS[0].y1+4);
+  ctx.quadraticCurveTo(42+ft,PLATFORMS[0].y1-10,48,PLATFORMS[0].y1+4);
+  ctx.fillStyle='#ffaa00'; ctx.fill();
+}
+
+function drawDK(){
+  const x=100, y=92;
+  const anim=Math.floor(totalTime*4)%2;
+  ctx.fillStyle='#663300';
+  ctx.fillRect(x,y,64,50);
+  ctx.fillStyle='#996633';
+  ctx.beginPath(); ctx.arc(x+32,y+8,18,0,Math.PI*2); ctx.fill();
+  // Arms
+  ctx.fillStyle='#663300';
+  if(anim){
+    ctx.fillRect(x-15,y+8,16,12);
+    ctx.fillRect(x+64,y+20,16,12);
+  } else {
+    ctx.fillRect(x-15,y+18,16,12);
+    ctx.fillRect(x+64,y+10,16,12);
+  }
+  // Face
+  ctx.fillStyle='#cc9966';
+  ctx.fillRect(x+16,y+4,30,20);
+  ctx.fillStyle='#000';
+  ctx.beginPath(); ctx.arc(x+24,y+12,3,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(x+38,y+12,3,0,Math.PI*2); ctx.fill();
+  // Label
+  ctx.fillStyle='#fff'; ctx.font='bold 11px monospace'; ctx.textAlign='center';
+  ctx.fillText('DK',x+32,y+60);
+}
+
+function drawPauline(){
+  const x=310, y=115;
+  ctx.fillStyle='#ff66aa';
+  ctx.fillRect(x,y+8,18,24);
+  ctx.fillStyle='#ffccaa';
+  ctx.beginPath(); ctx.arc(x+9,y+6,9,0,Math.PI*2); ctx.fill();
+  // HELP text blink
+  if(Math.floor(totalTime*3)%2===0){
+    ctx.fillStyle='#fff'; ctx.font='bold 13px monospace'; ctx.textAlign='center';
+    ctx.fillText('HELP!',x+9,y-5);
+  }
+}
+
+function drawPlayer(){
+  const pl=player;
+  if(!pl.alive&&state===ST.DEAD&&Math.floor(totalTime*8)%2===0) return;
+  const x=pl.x, y=pl.y;
+  // Body
+  ctx.fillStyle='#0044cc';
+  ctx.fillRect(x+2,y+14,PW-4,PH-14);
+  // Shirt
+  ctx.fillStyle='#cc2200';
+  ctx.fillRect(x+4,y+10,PW-8,10);
+  // Head
+  ctx.fillStyle='#ffccaa';
+  ctx.beginPath(); ctx.arc(x+PW/2,y+8,8,0,Math.PI*2); ctx.fill();
+  // Cap
+  ctx.fillStyle='#cc2200';
+  ctx.fillRect(x+2,y,PW-4,8);
+  // Hammer
+  if(pl.hammerTime>0){
+    const ha=Math.sin(pl.hammerAnim*8)*0.5;
+    ctx.save();
+    ctx.translate(x+PW/2,y);
+    ctx.rotate(ha);
+    ctx.fillStyle='#cc8800';
+    ctx.fillRect(-4,-20,8,20);
+    ctx.fillStyle='#886600';
+    ctx.fillRect(-10,-28,20,10);
+    ctx.restore();
+    sndHammer(); // tick during hammer (suppress volume)
+  }
+}
+
+function drawBarrels(){
+  for(const b of barrels){
+    const x=b.x, y=b.y;
+    ctx.fillStyle='#884400';
+    ctx.beginPath(); ctx.arc(x+9,y+9,9,0,Math.PI*2); ctx.fill();
+    // Hoops
+    ctx.strokeStyle='#553300'; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.arc(x+9,y+9,9,0,Math.PI*2); ctx.stroke();
+    ctx.strokeStyle='#aa6622'; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.moveTo(x,y+9); ctx.lineTo(x+18,y+9); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x+9,y); ctx.lineTo(x+9,y+18); ctx.stroke();
+  }
+}
+
+function drawHammers(){
+  for(const h of hammerPickups){
+    if(!h.alive) continue;
+    ctx.fillStyle='#ffcc00';
+    ctx.fillRect(h.x-4,h.y-20,8,20);
+    ctx.fillRect(h.x-12,h.y-26,24,10);
+    ctx.fillStyle='#ffaa00';
+    ctx.fillRect(h.x-3,h.y-22,6,16);
+  }
+}
+
+function drawFloatScores(){
+  for(const fs of floatScores){
+    ctx.globalAlpha=Math.min(1,fs.life);
+    ctx.fillStyle='#fff'; ctx.font='bold 14px monospace'; ctx.textAlign='center';
+    ctx.fillText('+'+fs.pts,fs.x,fs.y);
+  }
+  ctx.globalAlpha=1;
+}
+
+function drawHUD(){
+  ctx.fillStyle='#0a0a0a';
+  ctx.fillRect(0,0,W,HUD_H);
+  ctx.strokeStyle='#333'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(0,HUD_H); ctx.lineTo(W,HUD_H); ctx.stroke();
+
+  ctx.fillStyle='#fff'; ctx.font='17px monospace'; ctx.textAlign='left';
+  ctx.fillText('Score: '+score,10,24);
+  ctx.fillStyle='#555'; ctx.textAlign='right';
+  ctx.fillText('Best: '+hiScore,W-10,24);
+  ctx.fillStyle='#aaa'; ctx.textAlign='center';
+  ctx.fillText('Stage '+stage,W/2,24);
+  // Lives
+  ctx.fillStyle='#ffcc00'; ctx.textAlign='left'; ctx.font='14px monospace';
+  ctx.fillText('Lives: '+lives,10,50);
+  // Bonus
+  ctx.fillStyle=bonusTimer>1000?'#ffee44':'#ff4444';
+  ctx.textAlign='center'; ctx.font='bold 15px monospace';
+  ctx.fillText('BONUS: '+Math.floor(bonusTimer),W/2,50);
+  // Hammer timer
+  if(player&&player.hammerTime>0){
+    ctx.fillStyle='#ff8800'; ctx.textAlign='right'; ctx.font='14px monospace';
+    ctx.fillText('HAMMER: '+player.hammerTime.toFixed(1)+'s',W-10,50);
+  }
+}
+
+function drawTitle(){
+  ctx.fillStyle='#ff4466'; ctx.font='bold 64px monospace'; ctx.textAlign='center';
+  ctx.shadowColor='#cc0033'; ctx.shadowBlur=15;
+  ctx.fillText('DONKEY KONG',W/2,150);
+  ctx.shadowBlur=0;
+  ctx.fillStyle='#aaa'; ctx.font='17px monospace';
+  ctx.fillText('Climb the construction site.',W/2,230);
+  ctx.fillText('Donkey Kong throws barrels from the top!',W/2,258);
+  ctx.fillText('Jump over barrels or smash with a hammer.',W/2,286);
+  ctx.fillText('Climb ladders and reach the captive at the top.',W/2,314);
+  ctx.fillText('You are racing the bonus timer!',W/2,342);
+  ctx.fillStyle='#888'; ctx.font='15px monospace';
+  ctx.fillText('← → Move  |  ↑ ↓ Climb  |  Space Jump  |  P Pause',W/2,396);
+  const blink=Math.floor(totalTime*2)%2===0;
+  ctx.fillStyle=blink?'#fff':'#444'; ctx.font='22px monospace';
+  ctx.fillText('Press Enter to Start',W/2,460);
+  ctx.fillStyle='#333'; ctx.font='15px monospace';
+  ctx.fillText('Best: '+hiScore,W/2,500);
+}
+
+// ---- Main Loop ----
+function loop(now){
+  requestAnimationFrame(loop);
+  const dt=Math.min((now-lastTime)/1000,0.05);
+  lastTime=now;
+
+  const enterDown=keys['Enter']&&!prev['Enter'];
+  const pDown=keys['KeyP']&&!prev['KeyP'];
+  Object.assign(prev,keys);
+
+  if(enterDown){
+    if(state===ST.TITLE){ initAC(); startGame(); }
+    else if(state===ST.GAMEOVER){ startGame(); }
+  }
+  if(pDown){
+    if(state===ST.PLAYING) state=ST.PAUSED;
+    else if(state===ST.PAUSED) state=ST.PLAYING;
+  }
+
+  update(dt);
+  render();
+}
+
+requestAnimationFrame(ts=>{ lastTime=ts; requestAnimationFrame(loop); });
+
+})();
+</script>
+</body>
+</html>

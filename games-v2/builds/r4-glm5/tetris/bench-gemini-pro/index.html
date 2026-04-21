@@ -1,0 +1,641 @@
+<!--
+  GAME:      Tetris
+  RUN:       r4-glm5
+  BUILDER:   google/gemini-3-pro-preview
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tetris</title>
+<style>
+    body {
+        margin: 0;
+        padding: 0;
+        background-color: #111;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        height: 100vh;
+        color: #FFF;
+        font-family: sans-serif;
+        overflow: hidden;
+    }
+    #game-container {
+        display: flex;
+        gap: 20px;
+    }
+    canvas {
+        background-color: #000;
+        box-shadow: 0 0 10px rgba(255, 255, 255, 0.2);
+    }
+    .panel {
+        width: 150px;
+        display: flex;
+        flex-direction: column;
+        gap: 20px;
+    }
+    .box {
+        background-color: #222;
+        padding: 10px;
+        border: 2px solid #444;
+        text-align: center;
+    }
+    .box-title {
+        color: #888;
+        font-size: 14px;
+        margin-bottom: 5px;
+        text-transform: uppercase;
+    }
+    .box-value {
+        font-size: 24px;
+        font-weight: bold;
+    }
+    #preview-canvas {
+        background-color: transparent;
+        box-shadow: none;
+        margin-top: 5px;
+    }
+</style>
+</head>
+<body>
+
+<div id="game-container">
+    <canvas id="gameCanvas" width="300" height="600"></canvas>
+    
+    <div class="panel">
+        <div class="box">
+            <div class="box-title">Next</div>
+            <canvas id="preview-canvas" width="120" height="120"></canvas>
+        </div>
+        
+        <div class="box">
+            <div class="box-title">Score</div>
+            <div id="ui-score" class="box-value">0</div>
+        </div>
+        
+        <div class="box">
+            <div class="box-title">Level</div>
+            <div id="ui-level" class="box-value">1</div>
+        </div>
+        
+        <div class="box">
+            <div class="box-title">Lines</div>
+            <div id="ui-lines" class="box-value">0</div>
+        </div>
+        
+        <div style="color:#aaa; font-size:12px; margin-top: auto;">
+            Arrows/WASD: Move<br>
+            Up/X: Rotate<br>
+            Space: Hard Drop<br>
+            P/Esc: Pause
+        </div>
+    </div>
+</div>
+
+<script>
+// --- Constants & Config ---
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const pCtx = document.getElementById('preview-canvas').getContext('2d');
+
+const COLS = 10;
+const ROWS = 20;
+const BLOCK_SIZE = 30;
+
+const ST_TITLE = 0;
+const ST_PLAY = 1;
+const ST_PAUSE = 2;
+const ST_OVER = 3;
+
+// Pieces Def (4x4 matrix)
+const PIECES = {
+    I: { color: '#00FFFF', shape: [[0,0,0,0], [1,1,1,1], [0,0,0,0], [0,0,0,0]] },
+    O: { color: '#FFFF00', shape: [[0,0,0,0], [0,1,1,0], [0,1,1,0], [0,0,0,0]] },
+    T: { color: '#AA00FF', shape: [[0,0,0,0], [1,1,1,0], [0,1,0,0], [0,0,0,0]] },
+    S: { color: '#00FF00', shape: [[0,0,0,0], [0,1,1,0], [1,1,0,0], [0,0,0,0]] },
+    Z: { color: '#FF0000', shape: [[0,0,0,0], [1,1,0,0], [0,1,1,0], [0,0,0,0]] },
+    J: { color: '#0000FF', shape: [[0,0,0,0], [1,0,0,0], [1,1,1,0], [0,0,0,0]] },
+    L: { color: '#FF8800', shape: [[0,0,0,0], [0,0,1,0], [1,1,1,0], [0,0,0,0]] }
+};
+
+const PIECE_KEYS = ['I', 'O', 'T', 'S', 'Z', 'J', 'L'];
+
+// Level falling intervals in ms (Level index 0-14 mapped)
+const LEVEL_SPEEDS = [
+    800, 720, 630, 550, 470, 380, 300, 220, 130, 100, 80, 80, 70, 70, 70, 50, 50, 50, 30, 20
+];
+
+// --- State Variables ---
+let state = ST_TITLE;
+let grid = [];
+let bag = [];
+
+let score = 0;
+let level = 1;
+let lines = 0;
+
+let currentPiece = null;
+let nextPieceType = null;
+
+let lastTime = 0;
+let dropTimer = 0;
+let dropInterval = LEVEL_SPEEDS[0];
+
+// Input handling (DAS/ARR)
+let keys = { ArrowLeft: false, ArrowRight: false, ArrowDown: false, a: false, d: false, s: false };
+let dasDelayLeft = 0;
+let dasDelayRight = 0;
+let arrTimerMove = 0;
+const DAS_INIT = 170; // ms
+const ARR_RATE = 50;  // ms
+
+// Lock delay
+let lockDelayTimer = 0;
+let lockDelayMoves = 0; // Prevent infinite sliding
+const LOCK_DELAY = 500;
+const MAX_LOCK_MOVES = 15;
+
+// --- Utility Functions ---
+
+function createEmptyGrid() {
+    return Array.from({length: ROWS}, () => new Array(COLS).fill(null));
+}
+
+function shuffleBag() {
+    let newBag = [...PIECE_KEYS];
+    for (let i = newBag.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [newBag[i], newBag[j]] = [newBag[j], newBag[i]];
+    }
+    return newBag;
+}
+
+function getNextPiece() {
+    if (bag.length === 0) bag = shuffleBag();
+    return bag.pop();
+}
+
+function resetGame() {
+    grid = createEmptyGrid();
+    score = 0;
+    level = 1;
+    lines = 0;
+    bag = [];
+    dropInterval = LEVEL_SPEEDS[0];
+    
+    updateUI();
+    
+    nextPieceType = getNextPiece();
+    spawnPiece();
+}
+
+function spawnPiece() {
+    const type = nextPieceType;
+    nextPieceType = getNextPiece();
+    
+    // Create deep copy of shape
+    currentPiece = {
+        type: type,
+        x: type === 'O' ? 4 : 3,
+        y: type === 'I' ? -1 : 0, // Starts high to enter nicely
+        shape: PIECES[type].shape.map(row => [...row]),
+        color: PIECES[type].color
+    };
+    
+    dropTimer = 0;
+    lockDelayTimer = 0;
+    lockDelayMoves = 0;
+    
+    if (!isValidPos(currentPiece, currentPiece.x, currentPiece.y)) {
+        // Shift up slightly to fit if blocked on spawn
+        if (isValidPos(currentPiece, currentPiece.x, currentPiece.y - 1)) {
+            currentPiece.y -= 1;
+        } else {
+            state = ST_OVER;
+        }
+    }
+}
+
+// --- Logic ---
+
+function isValidPos(piece, nx, ny, nShape = piece.shape) {
+    for (let r = 0; r < nShape.length; r++) {
+        for (let c = 0; c < nShape[r].length; c++) {
+            if (nShape[r][c]) {
+                let gx = nx + c;
+                let gy = ny + r;
+                
+                // Bounds
+                if (gx < 0 || gx >= COLS || gy >= ROWS) return false;
+                
+                // Block collision (ignore negative Y for spawning above)
+                if (gy >= 0 && grid[gy][gx] !== null) return false;
+            }
+        }
+    }
+    return true;
+}
+
+function rotateShape(shape, ccw = false) {
+    const N = shape.length;
+    const res = Array.from({length: N}, () => new Array(N).fill(0));
+    
+    for (let r = 0; r < N; r++) {
+        for (let c = 0; c < N; c++) {
+            if (ccw) res[N - 1 - c][r] = shape[r][c];
+            else res[c][N - 1 - r] = shape[r][c];
+        }
+    }
+    return res;
+}
+
+function attemptRotate(ccw = false) {
+    if (state !== ST_PLAY) return;
+    
+    let newShape = rotateShape(currentPiece.shape, ccw);
+    
+    // Basic valid check
+    if (isValidPos(currentPiece, currentPiece.x, currentPiece.y, newShape)) {
+        currentPiece.shape = newShape;
+        resetLockDelay();
+        return;
+    }
+    
+    // Primitive wall kicks (Offset testing)
+    // Left/Right shift by 1 or 2
+    let offsets = [
+        {x: -1, y: 0}, {x: 1, y: 0},
+        {x: 0, y: -1},
+        {x: -2, y: 0}, {x: 2, y: 0}, // I piece needs 2 sometimes
+    ];
+    
+    for (let off of offsets) {
+        if (isValidPos(currentPiece, currentPiece.x + off.x, currentPiece.y + off.y, newShape)) {
+            currentPiece.x += off.x;
+            currentPiece.y += off.y;
+            currentPiece.shape = newShape;
+            resetLockDelay();
+            return;
+        }
+    }
+}
+
+function attemptMove(dx) {
+    if (isValidPos(currentPiece, currentPiece.x + dx, currentPiece.y)) {
+        currentPiece.x += dx;
+        resetLockDelay();
+        return true;
+    }
+    return false;
+}
+
+function hardDrop() {
+    let dy = 0;
+    while (isValidPos(currentPiece, currentPiece.x, currentPiece.y + 1)) {
+        currentPiece.y++;
+        dy++;
+    }
+    score += dy * 2;
+    updateUI();
+    lockPiece();
+}
+
+function getGhostY() {
+    if (!currentPiece) return 0;
+    let gy = currentPiece.y;
+    while (isValidPos(currentPiece, currentPiece.x, gy + 1)) {
+        gy++;
+    }
+    return gy;
+}
+
+function resetLockDelay() {
+    // Only reset if we haven't wiggled infinitely and piece is actually blocked
+    if (!isValidPos(currentPiece, currentPiece.x, currentPiece.y + 1)) {
+        if (lockDelayMoves < MAX_LOCK_MOVES) {
+            lockDelayTimer = 0;
+            lockDelayMoves++;
+        }
+    } else {
+        lockDelayTimer = 0;
+    }
+}
+
+function lockPiece() {
+    // Add to grid
+    for (let r = 0; r < currentPiece.shape.length; r++) {
+        for (let c = 0; c < currentPiece.shape[r].length; c++) {
+            if (currentPiece.shape[r][c]) {
+                let gx = currentPiece.x + c;
+                let gy = currentPiece.y + r;
+                if (gy >= 0) grid[gy][gx] = currentPiece.color;
+            }
+        }
+    }
+    
+    checkLines();
+    if(state === ST_PLAY) spawnPiece();
+}
+
+function checkLines() {
+    let linesCleared = 0;
+    for (let r = ROWS - 1; r >= 0; r--) {
+        if (grid[r].every(cell => cell !== null)) {
+            grid.splice(r, 1);
+            grid.unshift(new Array(COLS).fill(null));
+            linesCleared++;
+            r++; // Check same row index again since everything shifted down
+        }
+    }
+    
+    if (linesCleared > 0) {
+        // Score calc
+        let base = [0, 100, 300, 500, 800][linesCleared];
+        score += base * level;
+        lines += linesCleared;
+        
+        // Level up
+        let newLevel = Math.floor(lines / 10) + 1;
+        if (newLevel > level) {
+            level = newLevel;
+            let spdIdx = Math.min(level - 1, LEVEL_SPEEDS.length - 1);
+            dropInterval = LEVEL_SPEEDS[spdIdx];
+        }
+        
+        updateUI();
+    }
+}
+
+function updateUI() {
+    document.getElementById('ui-score').innerText = score;
+    document.getElementById('ui-level').innerText = level;
+    document.getElementById('ui-lines').innerText = lines;
+}
+
+// --- Input Bindings ---
+
+window.addEventListener('keydown', e => {
+    let k = e.key;
+    if (['ArrowLeft', 'ArrowRight', 'ArrowDown', 'ArrowUp', ' '].includes(k)) e.preventDefault();
+    
+    if (k === 'ArrowLeft' || k === 'a' || k === 'A') keys.ArrowLeft = true;
+    if (k === 'ArrowRight' || k === 'd' || k === 'D') keys.ArrowRight = true;
+    if (k === 'ArrowDown' || k === 's' || k === 'S') keys.ArrowDown = true;
+    
+    if (state === ST_TITLE && k === ' ') {
+        resetGame();
+        state = ST_PLAY;
+        lastTime = performance.now();
+        return;
+    }
+    
+    if (k === 'p' || k === 'P' || k === 'Escape') {
+        if (state === ST_PLAY) state = ST_PAUSE;
+        else if (state === ST_PAUSE) {
+            state = ST_PLAY;
+            lastTime = performance.now();
+        }
+    }
+    
+    if ((k === 'r' || k === 'R')) {
+        if (state !== ST_TITLE) resetGame();
+        if (state === ST_OVER || state === ST_PAUSE) {
+            state = ST_PLAY;
+            lastTime = performance.now();
+        }
+    }
+    
+    if (state !== ST_PLAY) return;
+
+    // Pulse action immediately on keydown
+    if ((k === 'ArrowLeft' || k === 'a' || k === 'A') && !e.repeat) { attemptMove(-1); dasDelayLeft = 0; arrTimerMove = 0; }
+    if ((k === 'ArrowRight' || k === 'd' || k === 'D') && !e.repeat) { attemptMove(1); dasDelayRight = 0; arrTimerMove = 0; }
+    
+    if (k === 'ArrowUp' || k === 'x' || k === 'X') attemptRotate(false); // CW
+    if (k === 'z' || k === 'Z' || k === 'Control') attemptRotate(true); // CCW
+    
+    if (k === ' ' && !e.repeat) hardDrop();
+});
+
+window.addEventListener('keyup', e => {
+    let k = e.key;
+    if (k === 'ArrowLeft' || k === 'a' || k === 'A') { keys.ArrowLeft = false; dasDelayLeft = 0; }
+    if (k === 'ArrowRight' || k === 'd' || k === 'D') { keys.ArrowRight = false; dasDelayRight = 0; }
+    if (k === 'ArrowDown' || k === 's' || k === 'S') keys.ArrowDown = false;
+});
+
+// --- Main Loop ---
+
+function update(dt) {
+    if (state !== ST_PLAY) return;
+
+    // Movement DAS/ARR
+    if (keys.ArrowLeft) {
+        dasDelayLeft += dt;
+        if (dasDelayLeft >= DAS_INIT) {
+            arrTimerMove += dt;
+            if (arrTimerMove >= ARR_RATE) {
+                attemptMove(-1);
+                arrTimerMove = 0;
+            }
+        }
+    }
+    if (keys.ArrowRight) {
+        dasDelayRight += dt;
+        if (dasDelayRight >= DAS_INIT) {
+            arrTimerMove += dt;
+            if (arrTimerMove >= ARR_RATE) {
+                attemptMove(1);
+                arrTimerMove = 0;
+            }
+        }
+    }
+
+    // Gravity
+    let effectiveInterval = keys.ArrowDown ? Math.min(dropInterval, 50) : dropInterval;
+    dropTimer += dt;
+    
+    if (dropTimer >= effectiveInterval) {
+        dropTimer = 0;
+        
+        if (isValidPos(currentPiece, currentPiece.x, currentPiece.y + 1)) {
+            currentPiece.y++;
+            if (keys.ArrowDown) score += 1; // Soft drop points
+            updateUI();
+        }
+    }
+    
+    // Lock Delay Logic
+    if (!isValidPos(currentPiece, currentPiece.x, currentPiece.y + 1)) {
+        lockDelayTimer += dt;
+        if (lockDelayTimer >= LOCK_DELAY) {
+            lockPiece();
+        }
+    } else {
+        lockDelayTimer = 0; // Not resting on anything
+    }
+}
+
+// --- Render ---
+
+function drawBlock(cContext, x, y, size, color) {
+    cContext.fillStyle = color;
+    cContext.fillRect(x, y, size, size);
+    
+    // 3D effect bevels
+    cContext.fillStyle = 'rgba(255, 255, 255, 0.3)';
+    cContext.beginPath(); cContext.moveTo(x,y); cContext.lineTo(x+size,y); cContext.lineTo(x+size-4, y+4); cContext.lineTo(x+4,y+4); cContext.fill();
+    cContext.beginPath(); cContext.moveTo(x,y); cContext.lineTo(x,y+size); cContext.lineTo(x+4, y+size-4); cContext.lineTo(x+4,y+4); cContext.fill();
+    
+    cContext.fillStyle = 'rgba(0, 0, 0, 0.3)';
+    cContext.beginPath(); cContext.moveTo(x+size,y); cContext.lineTo(x+size,y+size); cContext.lineTo(x+size-4, y+size-4); cContext.lineTo(x+size-4,y+4); cContext.fill();
+    cContext.beginPath(); cContext.moveTo(x,y+size); cContext.lineTo(x+size,y+size); cContext.lineTo(x+size-4, y+size-4); cContext.lineTo(x+4,y+size-4); cContext.fill();
+}
+
+function drawGhostBlock(cContext, x, y, size, colorHex) {
+    // Extract RGB to make rgba
+    let r = parseInt(colorHex.slice(1,3), 16);
+    let g = parseInt(colorHex.slice(3,5), 16);
+    let b = parseInt(colorHex.slice(5,7), 16);
+    cContext.fillStyle = `rgba(${r},${g},${b},0.2)`;
+    cContext.fillRect(x, y, size, size);
+    cContext.strokeStyle = `rgba(${r},${g},${b},0.5)`;
+    cContext.lineWidth = 1;
+    cContext.strokeRect(x+1, y+1, size-2, size-2);
+}
+
+function render() {
+    // Clear Main Board
+    ctx.fillStyle = '#111';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    
+    // Grid Lines
+    ctx.strokeStyle = '#222';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let i = 0; i <= COLS; i++) { ctx.moveTo(i*BLOCK_SIZE, 0); ctx.lineTo(i*BLOCK_SIZE, canvas.height); }
+    for (let i = 0; i <= ROWS; i++) { ctx.moveTo(0, i*BLOCK_SIZE); ctx.lineTo(canvas.width, i*BLOCK_SIZE); }
+    ctx.stroke();
+
+    if (state === ST_TITLE) {
+        ctx.fillStyle = 'rgba(0,0,0,0.8)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#FFF';
+        ctx.font = 'bold 40px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText("TETRIS", canvas.width/2, canvas.height/3);
+        
+        let blink = Math.floor(performance.now() / 500) % 2 === 0;
+        if (blink) {
+            ctx.font = '20px sans-serif';
+            ctx.fillText("Press SPACE to Start", canvas.width/2, canvas.height/2 + 20);
+        }
+        return;
+    }
+
+    // Draw Stack
+    for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+            if (grid[r][c]) {
+                drawBlock(ctx, c * BLOCK_SIZE, r * BLOCK_SIZE, BLOCK_SIZE, grid[r][c]);
+            }
+        }
+    }
+
+    // Draw Current Piece
+    if (currentPiece && (state === ST_PLAY || state === ST_PAUSE)) {
+        // Ghost
+        let gy = getGhostY();
+        for (let r = 0; r < currentPiece.shape.length; r++) {
+            for (let c = 0; c < currentPiece.shape[r].length; c++) {
+                if (currentPiece.shape[r][c]) {
+                    let drawY = gy + r;
+                    if (drawY >= 0) {
+                        drawGhostBlock(ctx, (currentPiece.x + c) * BLOCK_SIZE, drawY * BLOCK_SIZE, BLOCK_SIZE, currentPiece.color);
+                    }
+                }
+            }
+        }
+        
+        // Active
+        for (let r = 0; r < currentPiece.shape.length; r++) {
+            for (let c = 0; c < currentPiece.shape[r].length; c++) {
+                if (currentPiece.shape[r][c]) {
+                    let drawY = currentPiece.y + r;
+                    if (drawY >= 0) {
+                        drawBlock(ctx, (currentPiece.x + c) * BLOCK_SIZE, drawY * BLOCK_SIZE, BLOCK_SIZE, currentPiece.color);
+                    }
+                }
+            }
+        }
+    }
+
+    // Preview
+    pCtx.clearRect(0, 0, pCtx.canvas.width, pCtx.canvas.height);
+    if (nextPieceType && state !== ST_TITLE) {
+        let pShape = PIECES[nextPieceType].shape;
+        let pCol = PIECES[nextPieceType].color;
+        let ps = 25; // Smaller block for preview
+        
+        let w = pShape[0].length * ps;
+        let h = pShape.length * ps;
+        let ox = (pCtx.canvas.width - w) / 2;
+        let oy = (pCtx.canvas.height - h) / 2;
+        
+        for (let r = 0; r < pShape.length; r++) {
+            for (let c = 0; c < pShape[r].length; c++) {
+                if (pShape[r][c]) {
+                    drawBlock(pCtx, ox + c * ps, oy + r * ps, ps, pCol);
+                }
+            }
+        }
+    }
+
+    // Overlays
+    if (state === ST_PAUSE) {
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#FFF';
+        ctx.font = 'bold 30px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText("PAUSED", canvas.width/2, canvas.height/2);
+    } else if (state === ST_OVER) {
+        ctx.fillStyle = 'rgba(0,0,0,0.8)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#F00';
+        ctx.font = 'bold 36px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText("GAME OVER", canvas.width/2, canvas.height/2 - 20);
+        
+        let blink = Math.floor(performance.now() / 500) % 2 === 0;
+        if (blink) {
+            ctx.fillStyle = '#FFF';
+            ctx.font = '20px sans-serif';
+            ctx.fillText("Press R to restart", canvas.width/2, canvas.height/2 + 30);
+        }
+    }
+}
+
+// --- Loop ---
+
+function gameLoop(timestamp) {
+    if (!lastTime) lastTime = timestamp;
+    let dt = timestamp - lastTime;
+    lastTime = timestamp;
+    
+    // Clamp DT to prevent massive jumps if tab suspended
+    if (dt > 200) dt = 200;
+
+    update(dt);
+    render();
+    
+    requestAnimationFrame(gameLoop);
+}
+
+requestAnimationFrame(gameLoop);
+
+</script>
+</body>
+</html>

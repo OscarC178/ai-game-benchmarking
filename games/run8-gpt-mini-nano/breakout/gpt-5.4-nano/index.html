@@ -1,0 +1,635 @@
+<!-- breakout | spec:run8-gpt-mini-nano | built-by:gpt-5.4-nano -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Breakout</title>
+  <style>
+    html, body { margin: 0; padding: 0; background:#000; height:100%; }
+    body { display:flex; align-items:center; justify-content:center; }
+    canvas { background:#000; image-rendering: pixelated; }
+  </style>
+</head>
+<body>
+  <canvas id="game" width="800" height="600" aria-label="Breakout game canvas"></canvas>
+
+  <script>
+    (() => {
+      "use strict";
+
+      const canvas = document.getElementById("game");
+      const ctx = canvas.getContext("2d", { alpha: false });
+      const W = canvas.width, H = canvas.height;
+
+      const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+      const now = () => performance.now();
+
+      // State machine: IDLE → PLAYING → PAUSED → GAME_OVER
+      const GameState = Object.freeze({
+        IDLE: "IDLE",
+        PLAYING: "PLAYING",
+        PAUSED: "PAUSED",
+        GAME_OVER: "GAME_OVER"
+      });
+
+      const scoreValuesByRow = [7,5,4,3,2,1]; // rows 1..6
+      const brickColors = ["#FF0000", "#FF6A00", "#FFD400", "#20C020", "#1E88FF", "#8A2BE2"];
+      const paddle = {
+        w: 104,
+        h: 14,
+        x: 348,
+        y: 560,
+        speed: 520
+      };
+
+      const ball = {
+        r: 8,
+        x: 400,
+        y: 548,
+        vx: 0,
+        vy: 0,
+        attached: true
+      };
+
+      const audio = (() => {
+        let ctxAudio = null;
+
+        function ensure() {
+          if (!ctxAudio) {
+            ctxAudio = new (window.AudioContext || window.webkitAudioContext)();
+          }
+        }
+
+        function beep(freq, duration=0.06, type="square", gain=0.06, slideTo=null) {
+          try {
+            ensure();
+            const t0 = ctxAudio.currentTime;
+            const osc = ctxAudio.createOscillator();
+            const g = ctxAudio.createGain();
+            osc.type = type;
+            osc.frequency.setValueAtTime(freq, t0);
+            if (slideTo != null) osc.frequency.exponentialRampToValueAtTime(Math.max(1, slideTo), t0 + duration);
+            g.gain.setValueAtTime(gain, t0);
+            g.gain.exponentialRampToValueAtTime(0.0001, t0 + duration);
+            osc.connect(g);
+            g.connect(ctxAudio.destination);
+            osc.start(t0);
+            osc.stop(t0 + duration + 0.01);
+          } catch {}
+        }
+
+        function paddleHit() { beep(430, 0.05, "square", 0.05); }
+        function brickHit() { beep(670, 0.05, "square", 0.05); }
+        function lifeLost() {
+          // descending tone sweep
+          try {
+            ensure();
+            const t0 = ctxAudio.currentTime;
+            const osc = ctxAudio.createOscillator();
+            const g = ctxAudio.createGain();
+            osc.type = "sine";
+            osc.frequency.setValueAtTime(740, t0);
+            osc.frequency.exponentialRampToValueAtTime(130, t0 + 0.18);
+            g.gain.setValueAtTime(0.08, t0);
+            g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.18);
+            osc.connect(g);
+            g.connect(ctxAudio.destination);
+            osc.start(t0);
+            osc.stop(t0 + 0.2);
+          } catch {}
+        }
+        function levelClear() {
+          // quick ascending arpeggio
+          const notes = [440, 554.37, 659.25, 880];
+          notes.forEach((f, i) => {
+            beep(f, 0.06, "square", 0.04, (i===notes.length-1?null:null));
+          });
+        }
+
+        return { paddleHit, brickHit, lifeLost, levelClear };
+      })();
+
+      // Score + highscore
+      const SCORE_KEY = "breakout_highscore";
+      let score = 0;
+      let highScore = 0;
+      try {
+        const hs = Number(localStorage.getItem(SCORE_KEY));
+        if (Number.isFinite(hs)) highScore = hs;
+      } catch {}
+      const updateHighScore = () => {
+        if (score > highScore) {
+          highScore = score;
+          try { localStorage.setItem(SCORE_KEY, String(highScore)); } catch {}
+        }
+      };
+
+      // Bricks
+      const bricks = [];
+      const brick = {
+        w: 70,
+        h: 20,
+        x0: 19,
+        y0: 52,
+        cols: 10,
+        rows: 6,
+        gapX: 10, // choose spacing consistent with layout feel; derived from available width
+        gapY: 10
+      };
+
+      // Spec says size 70x20 each, starting at x=19 y=52 with 10x6.
+      // We'll compute gaps to fit within canvas width/height while keeping sizes exact.
+      // For crisp authenticity: use derived gapX, gapY based on remaining space.
+      function computeBrickSpacing() {
+        const totalBrickW = brick.w * brick.cols;
+        const remainingW = (W - 1) - (brick.x0 * 2) - totalBrickW; // allow some margins
+        // Ensure non-negative and clamp to 0..30
+        brick.gapX = clamp(Math.round(remainingW / (brick.cols - 1)), 0, 30);
+
+        const totalBrickH = brick.h * brick.rows;
+        // leave top margin already in y0, and bottom margin before paddle
+        const maxBrickAreaH = (brick.y0 + totalBrickH + 160); // just to avoid huge
+        // Use remaining until y at which paddle begins - a margin
+        const available = (paddle.y - 40) - brick.y0 - totalBrickH;
+        brick.gapY = clamp(Math.round(available / (brick.rows - 1)), 0, 30);
+      }
+
+      function rebuildBricks() {
+        bricks.length = 0;
+        computeBrickSpacing();
+        for (let r = 0; r < brick.rows; r++) {
+          for (let c = 0; c < brick.cols; c++) {
+            const b = {
+              x: brick.x0 + c * (brick.w + brick.gapX),
+              y: brick.y0 + r * (brick.h + brick.gapY),
+              w: brick.w,
+              h: brick.h,
+              row: r, // 0..5 mapping to points array
+              color: brickColors[r],
+              alive: true
+            };
+            bricks.push(b);
+          }
+        }
+      }
+
+      // Input
+      const keys = new Set();
+      window.addEventListener("keydown", (e) => {
+        const k = e.key;
+        if (k === "ArrowLeft" || k === "ArrowRight" || k === " " || k === "Enter" || k === "p" || k === "P" || k === "a" || k === "d") {
+          e.preventDefault();
+        }
+        keys.add(k);
+        // Special immediate actions
+        if (k === "Enter") {
+          if (game.state === GameState.IDLE) startNewGame();
+          else if (game.state === GameState.GAME_OVER) startNewGame();
+        } else if (k === "p" || k === "P") {
+          if (game.state === GameState.PLAYING) togglePause();
+          else if (game.state === GameState.PAUSED) togglePause();
+        } else if (k === " ") {
+          if (game.state === GameState.PLAYING) {
+            if (ball.attached) launchBall();
+          }
+        }
+      }, { passive: false });
+
+      window.addEventListener("keyup", (e) => {
+        keys.delete(e.key);
+      });
+
+      // Collision helpers
+      function circleIntersectsRect(cx, cy, cr, rx, ry, rw, rh) {
+        // Clamp point to rect
+        const closestX = clamp(cx, rx, rx + rw);
+        const closestY = clamp(cy, ry, ry + rh);
+        const dx = cx - closestX;
+        const dy = cy - closestY;
+        return (dx*dx + dy*dy) <= cr*cr;
+      }
+
+      function reflectOnPaddleAndSetAngle(hitOffsetNorm) {
+        // hitOffsetNorm in [-1,1], where -1 left edge, +1 right edge.
+        // outgoing angle between 240°..300° => relative upward-ish (in our coordinate, 0° is +x, 90° is +y)
+        // Use symmetric mapping: edge -> steeper. We'll aim at 60°..120° from +x? But spec gives 240°..300° which is equivalent to -120°..-60°
+        // We'll treat it as angle from +x in degrees, producing mostly upward (negative vy) with left/right based on sign.
+        // Let's compute angleDeg = 240 + (hitOffsetNorm+1)/2 * 60
+        const angleDeg = 240 + ((hitOffsetNorm + 1) / 2) * 60; // 240..300
+        const angleRad = angleDeg * Math.PI / 180;
+
+        const speed = game.baseBallSpeed;
+        // In our coordinate: x increases right, y increases down.
+        // Using standard trig where vx = cos(angle), vy = sin(angle) where y down corresponds to +sin.
+        ball.vx = Math.cos(angleRad) * speed;
+        ball.vy = Math.sin(angleRad) * speed;
+      }
+
+      function resolveCircleVsRectAxis(circleX, circleY, circleR, rect) {
+        // Basic resolution that returns {hit, axis} where axis is 'x' or 'y'
+        // Choose axis based on which overlap is greater.
+        const rx = rect.x, ry = rect.y, rw = rect.w, rh = rect.h;
+        const closestX = clamp(circleX, rx, rx + rw);
+        const closestY = clamp(circleY, ry, ry + rh);
+        const dx = circleX - closestX;
+        const dy = circleY - closestY;
+
+        if (dx*dx + dy*dy > circleR*circleR) return { hit: false, axis: null };
+
+        // Determine axis: if abs(dx) > abs(dy) => collision more horizontal => reflect x
+        // If dx==0, reflect y; if dy==0, reflect x
+        const axis = (Math.abs(dx) > Math.abs(dy)) ? "x" : "y";
+        return { hit: true, axis };
+      }
+
+      const game = {
+        state: GameState.IDLE,
+        level: 1,
+        lives: 3,
+        score: 0,
+        baseBallSpeed: 340, // will ramp with level
+        lastTime: 0,
+        acc: 0
+      };
+
+      function attachBallToPaddle() {
+        ball.attached = true;
+        ball.vx = 0;
+        ball.vy = 0;
+        ball.x = paddle.x + paddle.w / 2;
+        ball.y = paddle.y - ball.r - 0.5;
+      }
+
+      function resetPositionsForLevel() {
+        // Paddle centered
+        paddle.x = 348;
+        paddle.y = 560;
+        attachBallToPaddle();
+      }
+
+      function startNewGame() {
+        game.state = GameState.PLAYING;
+        game.level = 1;
+        game.lives = 3;
+        score = 0;
+        game.baseBallSpeed = 340;
+        rebuildBricks();
+        resetPositionsForLevel();
+        game.lastTime = now();
+      }
+
+      function togglePause() {
+        if (game.state === GameState.PLAYING) {
+          game.state = GameState.PAUSED;
+        } else if (game.state === GameState.PAUSED) {
+          game.state = GameState.PLAYING;
+          game.lastTime = now();
+        }
+      }
+
+      function launchBall() {
+        // Launches upward at 340px/s with angle between 240° and 300°; speed increases by 20px/s per level up to 520px/s
+        ball.attached = false;
+        const speed = game.baseBallSpeed;
+        // Choose angle between 240..300 degrees
+        const angleDeg = 240 + Math.random() * 60;
+        const angleRad = angleDeg * Math.PI / 180;
+        ball.vx = Math.cos(angleRad) * speed;
+        ball.vy = Math.sin(angleRad) * speed;
+      }
+
+      function setLevel(level) {
+        game.level = level;
+        const speed = 340 + (level - 1) * 20;
+        game.baseBallSpeed = Math.min(520, speed);
+      }
+
+      function clearAndAdvanceLevel() {
+        updateHighScore();
+        game.level += 1;
+        setLevel(game.level);
+        rebuildBricks();
+        resetPositionsForLevel();
+        // ball remains attached until Space
+        audio.levelClear();
+      }
+
+      function loseLifeAndResetServe() {
+        game.lives -= 1;
+        audio.lifeLost();
+        if (game.lives <= 0) {
+          updateHighScore();
+          game.state = GameState.GAME_OVER;
+          return;
+        }
+        // reset positions; ball reattaches
+        resetPositionsForLevel();
+      }
+
+      // Rendering
+      function drawText(text, x, y, color, font, align="left") {
+        ctx.save();
+        ctx.fillStyle = color;
+        ctx.font = font;
+        ctx.textAlign = align;
+        ctx.textBaseline = "top";
+        ctx.fillText(text, x, y);
+        ctx.restore();
+      }
+
+      function drawHearts(count) {
+        // Red hearts/markers top-right
+        const size = 14;
+        const gap = 6;
+        const totalW = count * size + (count - 1) * gap;
+        let x = W - totalW - 16;
+        let y = 10;
+
+        for (let i = 0; i < count; i++) {
+          drawHeart(x, y, size, "#ff2b2b");
+          x += size + gap;
+        }
+      }
+
+      function drawHeart(x, y, size, color) {
+        const s = size;
+        ctx.save();
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        const topCurveHeight = s * 0.35;
+        ctx.moveTo(x + s*0.5, y + s*0.95);
+        ctx.bezierCurveTo(x + s*1.05, y + s*0.55, x + s*0.98, y + topCurveHeight, x + s*0.5, y + topCurveHeight*0.9);
+        ctx.bezierCurveTo(x + s*0.02, y + topCurveHeight, x - s*0.05, y + s*0.55, x + s*0.5, y + s*0.95);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      }
+
+      function drawBricks() {
+        for (const b of bricks) {
+          if (!b.alive) continue;
+          ctx.save();
+          ctx.fillStyle = b.color;
+          ctx.fillRect(b.x, b.y, b.w, b.h);
+          // subtle outline
+          ctx.strokeStyle = "rgba(255,255,255,0.15)";
+          ctx.lineWidth = 1;
+          ctx.strokeRect(b.x + 0.5, b.y + 0.5, b.w - 1, b.h - 1);
+          ctx.restore();
+        }
+      }
+
+      function drawPaddle() {
+        ctx.save();
+        ctx.fillStyle = "#FFFFFF";
+        ctx.fillRect(paddle.x, paddle.y, paddle.w, paddle.h);
+        ctx.restore();
+      }
+
+      function drawBall() {
+        ctx.save();
+        ctx.fillStyle = "#FFFFFF";
+        ctx.beginPath();
+        ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI*2);
+        ctx.fill();
+        ctx.restore();
+      }
+
+      function drawUI() {
+        // Score top-left, high score top-right
+        drawText(`SCORE ${score}`, 12, 10, "#FFFFFF", "16px monospace", "left");
+        drawText(`HI ${highScore}`, W - 12, 10, "#FFFFFF", "16px monospace", "right");
+
+        drawHearts(game.lives);
+
+        // Level top-center
+        drawText(`LEVEL ${game.level}`, W/2, 10, "#AAAAAA", "16px monospace", "center");
+      }
+
+      function drawStartScreen() {
+        ctx.save();
+        ctx.fillStyle = "rgba(0,0,0,0.55)";
+        ctx.fillRect(0,0,W,H);
+
+        drawText("BREAKOUT", W/2, 246, "#FFFFFF", "56px monospace", "center");
+        drawText("Press Enter to Start", W/2, 330, "#FFFFFF", "20px monospace", "center");
+        ctx.restore();
+      }
+
+      function drawPauseOverlay() {
+        ctx.save();
+        ctx.fillStyle = "rgba(0,0,0,0.55)";
+        ctx.fillRect(0,0,W,H);
+        drawText("PAUSED", W/2, 260, "#FFFFFF", "40px monospace", "center");
+        drawText("Press P to resume", W/2, 330, "#FFFFFF", "18px monospace", "center");
+        ctx.restore();
+      }
+
+      function drawGameOverScreen() {
+        ctx.save();
+        ctx.fillStyle = "rgba(0,0,0,0.65)";
+        ctx.fillRect(0,0,W,H);
+
+        drawText("GAME OVER", W/2, 240, "#FFFFFF", "48px monospace", "center");
+        updateHighScore();
+        drawText(`FINAL SCORE ${score}`, W/2, 310, "#FFFFFF", "20px monospace", "center");
+        drawText("Press Enter to restart", W/2, 350, "#FFFFFF", "18px monospace", "center");
+        ctx.restore();
+      }
+
+      // Physics update
+      function updatePaddle(dt) {
+        let dir = 0;
+        if (keys.has("ArrowLeft") || keys.has("a") || keys.has("A")) dir -= 1;
+        if (keys.has("ArrowRight") || keys.has("d") || keys.has("D")) dir += 1;
+
+        const dx = dir * paddle.speed * dt;
+        paddle.x = clamp(paddle.x + dx, 0, W - paddle.w);
+
+        if (ball.attached) {
+          ball.x = paddle.x + paddle.w / 2;
+          ball.y = paddle.y - ball.r - 0.5;
+        }
+      }
+
+      function bounceOffWalls() {
+        // Left/right walls
+        if (ball.x - ball.r <= 0) {
+          ball.x = ball.r;
+          ball.vx = Math.abs(ball.vx);
+        } else if (ball.x + ball.r >= W) {
+          ball.x = W - ball.r;
+          ball.vx = -Math.abs(ball.vx);
+        }
+        // Top wall
+        if (ball.y - ball.r <= 0) {
+          ball.y = ball.r;
+          ball.vy = Math.abs(ball.vy);
+        }
+      }
+
+      function updateBall(dt) {
+        if (ball.attached) return;
+
+        // Move
+        ball.x += ball.vx * dt;
+        ball.y += ball.vy * dt;
+
+        // Walls
+        bounceOffWalls();
+
+        // Bottom boundary
+        if (ball.y - ball.r > H) {
+          loseLifeAndResetServe();
+          return;
+        }
+
+        // Paddle collision (circle-vs-rect)
+        // paddle rect
+        const pr = { x: paddle.x, y: paddle.y, w: paddle.w, h: paddle.h };
+        if (ball.vy > 0 && circleIntersectsRect(ball.x, ball.y, ball.r, pr.x, pr.y, pr.w, pr.h)) {
+          // Ensure it reflects upward and adjusts angle based on hit position
+          // Place ball just above paddle to avoid re-collision jitter
+          ball.y = pr.y - ball.r - 0.5;
+
+          const hitX = (ball.x - (paddle.x + paddle.w / 2));
+          const hitOffsetNorm = clamp(hitX / (paddle.w / 2), -1, 1);
+
+          reflectOnPaddleAndSetAngle(hitOffsetNorm);
+          // Ensure upward (vy negative in y-down coords)
+          if (ball.vy > 0) ball.vy *= -1;
+
+          audio.paddleHit();
+        }
+
+        // Brick collisions (one brick per update step)
+        let hitBrick = null;
+        let hitAxis = null;
+
+        for (const b of bricks) {
+          if (!b.alive) continue;
+          if (!circleIntersectsRect(ball.x, ball.y, ball.r, b.x, b.y, b.w, b.h)) continue;
+
+          // Determine axis for reflection
+          const res = resolveCircleVsRectAxis(ball.x, ball.y, ball.r, b);
+          if (!res.hit) continue;
+
+          hitBrick = b;
+          hitAxis = res.axis;
+          break;
+        }
+
+        if (hitBrick) {
+          hitBrick.alive = false;
+
+          // Reflect on axis
+          if (hitAxis === "x") ball.vx *= -1;
+          else ball.vy *= -1;
+
+          // Award points based on row (1..6 => values array index 0..5)
+          const points = scoreValuesByRow[hitBrick.row];
+          score += points;
+          audio.brickHit();
+
+          // If still colliding due to large dt, spec says destroy only one brick per update step to avoid unstable reflections.
+          // We'll stop after first hit (already done).
+          // Prevent immediate re-hit by nudging ball outward slightly.
+          if (hitAxis === "x") {
+            if (ball.x < hitBrick.x + hitBrick.w / 2) ball.x = hitBrick.x - ball.r - 0.5;
+            else ball.x = hitBrick.x + hitBrick.w + ball.r + 0.5;
+          } else {
+            if (ball.y < hitBrick.y + hitBrick.h / 2) ball.y = hitBrick.y - ball.r - 0.5;
+            else ball.y = hitBrick.y + hitBrick.h + ball.r + 0.5;
+          }
+
+          // Level clear check
+          const remaining = bricks.reduce((acc, b) => acc + (b.alive ? 1 : 0), 0);
+          if (remaining === 0) {
+            clearAndAdvanceLevel();
+          }
+        }
+      }
+
+      function allBricksCleared() {
+        for (const b of bricks) if (b.alive) return false;
+        return true;
+      }
+
+      function update(dt) {
+        if (game.state !== GameState.PLAYING) return;
+        updatePaddle(dt);
+        updateBall(dt);
+      }
+
+      function render() {
+        // clear
+        ctx.fillStyle = "#000000";
+        ctx.fillRect(0, 0, W, H);
+
+        if (game.state === GameState.IDLE) {
+          // Draw initial frame (wall + paddle/ball attached)
+          drawBricks();
+          drawPaddle();
+          drawBall();
+          drawUI();
+          drawStartScreen();
+          return;
+        }
+
+        drawBricks();
+        drawPaddle();
+        // Ball may be attached
+        drawBall();
+        drawUI();
+
+        if (game.state === GameState.PAUSED) drawPauseOverlay();
+        if (game.state === GameState.GAME_OVER) drawGameOverScreen();
+      }
+
+      function loop(ts) {
+        const t = ts;
+        if (!game.lastTime) game.lastTime = t;
+        let dt = (t - game.lastTime) / 1000;
+        game.lastTime = t;
+
+        // clamp dt to avoid tunneling
+        dt = clamp(dt, 0, 1/30);
+
+        if (game.state === GameState.PLAYING) {
+          update(dt);
+        }
+
+        render();
+        requestAnimationFrame(loop);
+      }
+
+      // Start scaffold: initial UI + bricks
+      function init() {
+        setLevel(1);
+        rebuildBricks();
+        resetPositionsForLevel();
+        game.state = GameState.IDLE;
+        score = 0;
+        game.lives = 3;
+        // display initial ball/paddle but keep it attached
+        attachBallToPaddle();
+        game.lastTime = 0;
+        requestAnimationFrame(loop);
+      }
+
+      init();
+
+      // Console transition logging (spec note)
+      let lastState = game.state;
+      setInterval(() => {
+        if (game.state !== lastState) {
+          console.log(`State: ${lastState} -> ${game.state}`);
+          lastState = game.state;
+        }
+      }, 100);
+
+    })();
+  </script>
+</body>
+</html>

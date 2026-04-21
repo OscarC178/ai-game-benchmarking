@@ -1,0 +1,432 @@
+<!--
+  GAME:      Frogger
+  RUN:       r2-gpt54
+  BUILDER:   anthropic/claude-haiku-4.5
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Frogger</title>
+  <style>
+    html, body { margin: 0; padding: 0; background: #000; display: flex; justify-content: center; align-items: center; height: 100vh; font-family: "Courier New", monospace; }
+    canvas { background: #000; display: block; border: 2px solid #333; image-rendering: pixelated; max-width: 100vw; max-height: 100vh; }
+  </style>
+</head>
+<body>
+  <canvas id="froggerCanvas" width="600" height="700"></canvas>
+  <script>
+    'use strict';
+    const canvas = document.getElementById('froggerCanvas');
+    const ctx = canvas.getContext('2d');
+    const WIDTH = 600, HEIGHT = 700;
+    const LANE_HEIGHT = 50;
+
+    const STATES = { TITLE: 'title', PLAYING: 'playing', PAUSED: 'paused', DEAD: 'dead', LEVEL_CLEAR: 'clear', GAME_OVER: 'over' };
+
+    // Game state
+    let gameState = STATES.TITLE;
+    let score = 0, bestScore = parseInt(localStorage.getItem('frogger_best') || '0');
+    let lives = 3, level = 1, gameTime = 0;
+    let timer = 50, maxTimer = 50;
+    let frog = { x: 300, y: 600, col: 7, row: 12, alive: true, hopCooldown: 0, lastMaxRow: 12 };
+    let homes = [false, false, false, false, false];
+    let deathTimer = 0, levelClearTimer = 0;
+
+    // Road lanes (6-10, rows from top)
+    let vehicles = [];
+    for (let i = 0; i < 5; i++) {
+      vehicles[i] = [];
+      const laneRow = 6 + i;
+      const y = laneRow * LANE_HEIGHT + LANE_HEIGHT / 2;
+      const dir = i % 2 === 0 ? 1 : -1;
+      const speed = 60 + i * 25;
+      const count = 3;
+      for (let j = 0; j < count; j++) {
+        vehicles[i].push({
+          x: j * (WIDTH / count), y: y, width: 50 + i * 10, height: 32,
+          vx: dir * speed, color: ['#FF0000', '#00FF00', '#0000FF', '#FFFF00', '#FF00FF'][i]
+        });
+      }
+    }
+
+    // River lanes (7-11, rows from top)
+    let riverObjects = [];
+    const riverLaneTypes = [
+      { type: 'log', lengths: [90, 130], speed: 80, dir: 1 },
+      { type: 'turtle', lengths: [70], speed: 60, dir: -1 },
+      { type: 'log', lengths: [120, 170], speed: 100, dir: 1 },
+      { type: 'turtle', lengths: [80], speed: 90, dir: -1 },
+      { type: 'log', lengths: [110], speed: 70, dir: 1 }
+    ];
+    for (let i = 0; i < 5; i++) {
+      riverObjects[i] = [];
+      const laneRow = 7 + i;
+      const y = laneRow * LANE_HEIGHT + LANE_HEIGHT / 2;
+      const config = riverLaneTypes[i];
+      const count = 2;
+      for (let j = 0; j < count; j++) {
+        const len = config.lengths[j % config.lengths.length];
+        riverObjects[i].push({
+          x: j * (WIDTH / count),
+          y: y,
+          width: len,
+          height: 32,
+          vx: config.dir * config.speed,
+          type: config.type,
+          diveTimer: 0,
+          submerged: false
+        });
+        if (config.type === 'turtle') {
+          riverObjects[i][j].diveCycle = 3 + (i * 0.5);
+          riverObjects[i][j].diveTimer = i * 0.5;
+        }
+      }
+    }
+
+    let keys = {}, audioCtx = null;
+
+    function playSound(freq, dur) {
+      if (!audioCtx) try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return; }
+      try {
+        const now = audioCtx.currentTime;
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.frequency.value = freq;
+        osc.type = 'square';
+        gain.gain.setValueAtTime(0.15, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + dur);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(now);
+        osc.stop(now + dur);
+      } catch (e) {}
+    }
+
+    function resetFrog() {
+      frog = { x: 300, y: 600, col: 7, row: 12, alive: true, hopCooldown: 0, lastMaxRow: 12 };
+      timer = maxTimer;
+    }
+
+    function checkCollisions() {
+      // Road collision
+      for (let i = 0; i < 5; i++) {
+        if (frog.row < 6 || frog.row > 10) continue;
+        if (frog.row - 6 !== i) continue;
+        for (let v of vehicles[i]) {
+          if (Math.abs(frog.x - v.x) < 40 && Math.abs(frog.y - v.y) < 30) {
+            frog.alive = false;
+            playSound(100, 0.3);
+            return;
+          }
+        }
+      }
+
+      // River logic
+      if (frog.row >= 7 && frog.row <= 11) {
+        const laneIdx = frog.row - 7;
+        let onPlatform = false;
+        for (let obj of riverObjects[laneIdx]) {
+          if (obj.submerged) continue;
+          if (Math.abs(frog.x - obj.x) < (obj.width / 2 + 15)) {
+            onPlatform = true;
+            frog.x = obj.x + obj.vx * (1 / 60);
+            break;
+          }
+        }
+        if (!onPlatform) {
+          frog.alive = false;
+          playSound(200, 0.2);
+          return;
+        }
+      }
+
+      // Home logic
+      if (frog.row === 0) {
+        const homeIndex = Math.floor((frog.x + 60) / 120);
+        if (homeIndex >= 0 && homeIndex < 5) {
+          if (!homes[homeIndex]) {
+            homes[homeIndex] = true;
+            score += 100 + Math.floor(timer);
+            if (score > bestScore) { bestScore = score; localStorage.setItem('frogger_best', bestScore); }
+            playSound(800, 0.3);
+            if (homes.every(h => h)) {
+              gameState = STATES.LEVEL_CLEAR;
+              levelClearTimer = 2;
+              score += 500;
+            } else {
+              resetFrog();
+            }
+          } else {
+            frog.alive = false;
+            playSound(100, 0.2);
+          }
+        } else {
+          frog.alive = false;
+          playSound(100, 0.2);
+        }
+      }
+    }
+
+    document.addEventListener('keydown', e => {
+      keys[e.code] = true;
+      if (e.code === 'Enter') {
+        if (gameState === STATES.TITLE || gameState === STATES.GAME_OVER) {
+          score = 0; lives = 3; level = 1;
+          homes = [false, false, false, false, false];
+          resetFrog();
+          gameState = STATES.PLAYING;
+        }
+      }
+      if (e.code === 'KeyP') gameState = gameState === STATES.PLAYING ? STATES.PAUSED : STATES.PLAYING;
+      if (gameState === STATES.PLAYING && frog.hopCooldown <= 0) {
+        if (e.code === 'ArrowUp' || e.code === 'KeyW') {
+          if (frog.row > 0) {
+            frog.row--;
+            frog.y = frog.row * LANE_HEIGHT + LANE_HEIGHT / 2;
+            if (frog.row < frog.lastMaxRow) {
+              frog.lastMaxRow = frog.row;
+              score += 10;
+            }
+            frog.hopCooldown = 0.1;
+            playSound(400, 0.08);
+          }
+        }
+        if (e.code === 'ArrowDown' || e.code === 'KeyS') {
+          if (frog.row < 12) {
+            frog.row++;
+            frog.y = frog.row * LANE_HEIGHT + LANE_HEIGHT / 2;
+            frog.hopCooldown = 0.1;
+            playSound(350, 0.08);
+          }
+        }
+        if (e.code === 'ArrowLeft' || e.code === 'KeyA') {
+          if (frog.col > 0) {
+            frog.col--;
+            frog.x = 50 + frog.col * 50;
+            frog.hopCooldown = 0.1;
+            playSound(350, 0.08);
+          }
+        }
+        if (e.code === 'ArrowRight' || e.code === 'KeyD') {
+          if (frog.col < 11) {
+            frog.col++;
+            frog.x = 50 + frog.col * 50;
+            frog.hopCooldown = 0.1;
+            playSound(350, 0.08);
+          }
+        }
+      }
+    });
+    document.addEventListener('keyup', e => { keys[e.code] = false; });
+
+    function update(dt) {
+      if (gameState === STATES.TITLE || gameState === STATES.PAUSED || gameState === STATES.GAME_OVER) return;
+
+      gameTime += dt;
+      frog.hopCooldown -= dt;
+
+      // Update vehicles
+      for (let lane = 0; lane < 5; lane++) {
+        for (let v of vehicles[lane]) {
+          v.x += v.vx * dt;
+          if (v.vx > 0 && v.x > WIDTH + 50) v.x = -50;
+          if (v.vx < 0 && v.x < -50) v.x = WIDTH + 50;
+        }
+      }
+
+      // Update river
+      for (let lane = 0; lane < 5; lane++) {
+        for (let obj of riverObjects[lane]) {
+          obj.x += obj.vx * dt;
+          if (obj.vx > 0 && obj.x > WIDTH + 100) obj.x = -100;
+          if (obj.vx < 0 && obj.x < -100) obj.x = WIDTH + 100;
+          if (obj.type === 'turtle') {
+            obj.diveTimer += dt;
+            if (obj.diveTimer > obj.diveCycle) obj.diveTimer -= obj.diveCycle;
+            obj.submerged = obj.diveTimer > obj.diveCycle * 0.6;
+          }
+        }
+      }
+
+      // Timer
+      timer -= dt;
+      if (timer <= 0) {
+        frog.alive = false;
+        playSound(100, 0.2);
+      }
+
+      // Collision check
+      if (frog.alive) checkCollisions();
+
+      // Death handling
+      if (!frog.alive) {
+        lives--;
+        deathTimer = 1;
+        if (lives > 0) {
+          gameState = STATES.DEAD;
+        } else {
+          gameState = STATES.GAME_OVER;
+        }
+      }
+
+      if (gameState === STATES.DEAD) {
+        deathTimer -= dt;
+        if (deathTimer <= 0) {
+          resetFrog();
+          gameState = STATES.PLAYING;
+        }
+      }
+
+      if (gameState === STATES.LEVEL_CLEAR) {
+        levelClearTimer -= dt;
+        if (levelClearTimer <= 0) {
+          level++;
+          homes = [false, false, false, false, false];
+          resetFrog();
+          maxTimer = Math.max(30, 50 - level * 3);
+          gameState = STATES.PLAYING;
+        }
+      }
+    }
+
+    function render() {
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+      // Lane backgrounds
+      for (let i = 0; i < 13; i++) {
+        ctx.fillStyle = i === 0 ? '#001100' : i <= 5 ? '#333333' : i === 6 ? '#001100' : '#000033';
+        ctx.fillRect(0, i * LANE_HEIGHT, WIDTH, LANE_HEIGHT);
+      }
+
+      if (gameState === STATES.TITLE) {
+        ctx.fillStyle = '#FFF';
+        ctx.font = 'bold 64px "Courier New"';
+        ctx.textAlign = 'center';
+        ctx.fillText('FROGGER', WIDTH / 2, 100);
+        ctx.font = '14px "Courier New"';
+        ctx.fillStyle = '#AAA';
+        ctx.fillText('Cross the road and river to reach home', WIDTH / 2, 200);
+        ctx.fillText('Avoid cars, water, and the timer', WIDTH / 2, 230);
+        ctx.fillText('Arrow Keys or WASD to move', WIDTH / 2, 260);
+        ctx.fillStyle = '#FF0';
+        ctx.font = 'bold 20px "Courier New"';
+        ctx.fillText('Press ENTER to Start', WIDTH / 2, 400);
+      } else {
+        // Vehicles
+        for (let lane = 0; lane < 5; lane++) {
+          for (let v of vehicles[lane]) {
+            ctx.fillStyle = v.color;
+            ctx.fillRect(v.x - v.width / 2, v.y - v.height / 2, v.width, v.height);
+            ctx.strokeStyle = '#000';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(v.x - v.width / 2, v.y - v.height / 2, v.width, v.height);
+          }
+        }
+
+        // River objects
+        for (let lane = 0; lane < 5; lane++) {
+          for (let obj of riverObjects[lane]) {
+            ctx.fillStyle = obj.type === 'log' ? '#8B4513' : obj.submerged ? '#003333' : '#00AA88';
+            ctx.fillRect(obj.x - obj.width / 2, obj.y - obj.height / 2, obj.width, obj.height);
+            ctx.strokeStyle = '#000';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(obj.x - obj.width / 2, obj.y - obj.height / 2, obj.width, obj.height);
+          }
+        }
+
+        // Home bays
+        ctx.fillStyle = '#00AA00';
+        ctx.fillRect(0, 0, WIDTH, LANE_HEIGHT);
+        for (let i = 0; i < 5; i++) {
+          ctx.strokeStyle = '#FFFF00';
+          ctx.lineWidth = 2;
+          ctx.strokeRect(i * 120 + 10, 5, 100, 40);
+          if (homes[i]) {
+            ctx.fillStyle = '#00FF00';
+            ctx.fillRect(i * 120 + 35, 10, 20, 30);
+          }
+        }
+
+        // Frog
+        if (frog.alive && (gameState !== STATES.DEAD || Math.sin(gameTime * 10) > 0)) {
+          ctx.fillStyle = '#00FF00';
+          ctx.beginPath();
+          ctx.arc(frog.x, frog.y, 14, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = '#000';
+          ctx.lineWidth = 2;
+          ctx.stroke();
+        }
+
+        // HUD
+        ctx.fillStyle = '#FFF';
+        ctx.font = '14px "Courier New"';
+        ctx.textAlign = 'left';
+        ctx.fillText('Score: ' + score, 10, 680);
+        ctx.textAlign = 'center';
+        ctx.fillText('Level: ' + level + ' Lives: ' + lives, WIDTH / 2, 680);
+        ctx.textAlign = 'right';
+        ctx.fillText('Best: ' + bestScore, WIDTH - 10, 680);
+
+        // Timer bar
+        const timerWidth = (timer / maxTimer) * (WIDTH - 20);
+        ctx.fillStyle = timer > 15 ? '#00FF00' : '#FF0000';
+        ctx.fillRect(10, 650, timerWidth, 15);
+        ctx.strokeStyle = '#FFF';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(10, 650, WIDTH - 20, 15);
+        ctx.fillStyle = '#FFF';
+        ctx.font = '12px "Courier New"';
+        ctx.textAlign = 'center';
+        ctx.fillText(Math.ceil(timer) + 's', WIDTH / 2, 662);
+
+        if (gameState === STATES.PAUSED) {
+          ctx.fillStyle = 'rgba(0,0,0,0.7)';
+          ctx.fillRect(0, 0, WIDTH, HEIGHT);
+          ctx.fillStyle = '#FFF';
+          ctx.font = 'bold 48px "Courier New"';
+          ctx.textAlign = 'center';
+          ctx.fillText('PAUSED', WIDTH / 2, HEIGHT / 2);
+        } else if (gameState === STATES.LEVEL_CLEAR) {
+          ctx.fillStyle = 'rgba(0,0,0,0.7)';
+          ctx.fillRect(0, 0, WIDTH, HEIGHT);
+          ctx.fillStyle = '#FF0';
+          ctx.font = 'bold 40px "Courier New"';
+          ctx.textAlign = 'center';
+          ctx.fillText('LEVEL CLEAR', WIDTH / 2, HEIGHT / 2 - 20);
+          ctx.fillStyle = '#FFF';
+          ctx.font = '20px "Courier New"';
+          ctx.fillText('Score: ' + score, WIDTH / 2, HEIGHT / 2 + 30);
+        } else if (gameState === STATES.GAME_OVER) {
+          ctx.fillStyle = 'rgba(0,0,0,0.8)';
+          ctx.fillRect(0, 0, WIDTH, HEIGHT);
+          ctx.fillStyle = '#FF0';
+          ctx.font = 'bold 48px "Courier New"';
+          ctx.textAlign = 'center';
+          ctx.fillText('GAME OVER', WIDTH / 2, 200);
+          ctx.fillStyle = '#FFF';
+          ctx.font = '24px "Courier New"';
+          ctx.fillText('Score: ' + score, WIDTH / 2, 280);
+          ctx.fillText('Best: ' + bestScore, WIDTH / 2, 320);
+          ctx.font = 'bold 18px "Courier New"';
+          ctx.fillText('Press ENTER to Restart', WIDTH / 2, 400);
+        }
+      }
+    }
+
+    let lastTime = performance.now();
+    function gameLoop(now) {
+      const dt = Math.min((now - lastTime) / 1000, 0.016);
+      lastTime = now;
+      update(dt);
+      render();
+      requestAnimationFrame(gameLoop);
+    }
+
+    requestAnimationFrame(gameLoop);
+  </script>
+</body>
+</html>

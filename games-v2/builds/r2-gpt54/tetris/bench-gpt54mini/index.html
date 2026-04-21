@@ -1,0 +1,186 @@
+<!--
+  GAME:      Tetris
+  RUN:       r2-gpt54
+  BUILDER:   openai/gpt-5.4-mini
+-->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>TETRIS</title>
+<style>
+  html,body{height:100%;margin:0;background:#111;display:flex;align-items:center;justify-content:center}
+  #wrap{width:100vmin;max-width:800px;max-height:600px;position:relative}
+  canvas{background:#111;display:block;width:800px;height:600px}
+  #overlay{position:absolute;left:0;top:0;width:800px;height:600px;pointer-events:none;font-family:monospace;color:#fff}
+  .hud{position:absolute;left:20px;top:20px;color:#eee;font-family:monospace}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c" width="800" height="600"></canvas>
+  <div id="overlay"></div>
+</div>
+<script>
+(() => {
+  const canvas=document.getElementById('c'), ctx=canvas.getContext('2d'); ctx.imageSmoothingEnabled=false;
+  const W=800,H=600;
+  // Playfield
+  const COLS=10, ROWS=20, CELL=28; const BOARD_X=240, BOARD_Y=20; const VISIBLE_H = ROWS*CELL;
+  // Pieces definitions (rotation states as arrays of [x,y])
+  const TETROMINO={
+    I: [ [[-2,0],[-1,0],[0,0],[1,0]], [[0,-1],[0,0],[0,1],[0,2]] ],
+    O: [ [[0,0],[1,0],[0,1],[1,1]] ],
+    T: [ [[-1,0],[0,0],[1,0],[0,1]], [[0,-1],[0,0],[0,1],[1,0]], [[-1,0],[0,0],[1,0],[0,-1]], [[0,-1],[0,0],[0,1],[-1,0]] ],
+    S: [ [[0,0],[1,0],[-1,1],[0,1]], [[0,-1],[0,0],[1,0],[1,1]] ],
+    Z: [ [[-1,0],[0,0],[0,1],[1,1]], [[1,-1],[0,0],[1,0],[0,1]] ],
+    J: [ [[-1,0],[-1,1],[0,0],[1,0]], [[0,-1],[0,0],[0,1],[-1,1]], [[-1,0],[0,0],[1,0],[1,-1]], [[0,-1],[0,0],[0,1],[1,-1]] ],
+    L: [ [[-1,0],[0,0],[1,0],[1,1]], [[0,-1],[0,0],[0,1],[-1,-1]], [[-1,-1],[-1,0],[0,0],[1,0]], [[0,-1],[0,0],[0,1],[1,1]] ]
+  };
+  const COLORS={I:'#00FFFF',O:'#FFFF00',T:'#AA00FF',S:'#00FF00',Z:'#FF3333',J:'#3333FF',L:'#FF8800'};
+
+  // Game state
+  let board = createBoard(); // rows x cols, 0 empty or color string
+  let bag = []; let nextPiece = null; let hold=null; let piece=null;
+  let score=0, best=0, lines=0, level=1;
+  try{ const b=localStorage.getItem('tetris_best'); if(b) best=parseInt(b,10)||0; }catch(e){best=0}
+
+  // timers
+  let gravityTimer=0; let gravityInterval=getGravityInterval(level);
+  let lockTimer=0; const LOCK_DELAY=0.5; let lockResets=0; const MAX_LOCK_RESETS=3;
+  let gameState='title'; // title, playing, paused, gameover
+
+  // input state
+  const keys={left:false,right:false,down:false,up:false,space:false};
+  window.addEventListener('keydown', e=>{ if(e.key==='ArrowLeft'||e.key==='a') keys.left=true; if(e.key==='ArrowRight'||e.key==='d') keys.right=true; if(e.key==='ArrowDown'||e.key==='s') keys.down=true; if(e.key==='ArrowUp'||e.key==='w') keys.up=true; if(e.key===' ') keys.space=true; if(e.key==='Enter'){ if(gameState==='title' || gameState==='gameover') startGame(); } if(e.key==='p'||e.key==='P') togglePause(); });
+  window.addEventListener('keyup', e=>{ if(e.key==='ArrowLeft'||e.key==='a') keys.left=false; if(e.key==='ArrowRight'||e.key==='d') keys.right=false; if(e.key==='ArrowDown'||e.key==='s') keys.down=false; if(e.key==='ArrowUp'||e.key==='w') keys.up=false; if(e.key===' ') keys.space=false; });
+
+  // audio (optional)
+  let audioCtx=null,audioOk=false; function ensureAudio(){ if(audioOk) return; audioOk=true; audioCtx=new (window.AudioContext||window.webkitAudioContext)(); }
+  window.addEventListener('pointerdown',()=>ensureAudio(),{once:true});
+  function beep(freq,dur=0.06,type='sine'){ if(!audioOk) return; const o=audioCtx.createOscillator(); const g=audioCtx.createGain(); o.type=type; o.frequency.value=freq; o.connect(g); g.connect(audioCtx.destination); g.gain.setValueAtTime(0.0001,audioCtx.currentTime); g.gain.exponentialRampToValueAtTime(0.12,audioCtx.currentTime+0.01); o.start(); g.gain.exponentialRampToValueAtTime(0.0001,audioCtx.currentTime+dur); o.stop(audioCtx.currentTime+dur+0.02); }
+
+  // helpers
+  function createBoard(){ const b=[]; for(let r=0;r<ROWS;r++){ b[r]=new Array(COLS).fill(0); } return b; }
+  function spawnFromBag(){ if(bag.length===0){ bag = shuffle(['I','O','T','S','Z','J','L']); } return bag.pop(); }
+  function shuffle(a){ for(let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; } return a; }
+  function getGravityInterval(l){ // ms to seconds per row
+    const table=[1.0,0.85,0.7,0.55,0.42,0.33,0.25,0.2,0.15,0.12]; return (table[Math.min(table.length-1,l-1)]); }
+
+  function newPiece(){ const t = spawnFromBag(); const states = TETROMINO[t]; const rot = 0; // initial rotation
+    // spawn position centered
+    const x = Math.floor(COLS/2); const y = -2; // allow negative
+    piece = {type:t, rot:rot, x:x, y:y, states:states, color:COLORS[t]}; lockTimer=0; lockResets=0; }
+
+  function canPlace(pieceObj,xOverride=piece.x,yOverride=piece.y,rotOverride=piece.rot){ const states = TETROMINO[pieceObj.type]; const state = states[rotOverride % states.length]; for(const b of state){ const x = xOverride + b[0]; const y = yOverride + b[1]; if(x<0 || x>=COLS || y>=ROWS) return false; if(y>=0 && board[y][x]) return false; } return true; }
+
+  function placePiece(){ const state = TETROMINO[piece.type][piece.rot % TETROMINO[piece.type].length]; for(const b of state){ const x=piece.x + b[0]; const y=piece.y + b[1]; if(y>=0 && y<ROWS && x>=0 && x<COLS) board[y][x]=piece.color; }
+    // lock sound
+    beep(120,0.06,'sawtooth');
+    // clear lines
+    const cleared = clearLines(); if(cleared>0){ const points = (cleared===1?100:cleared===2?300:cleared===3?500:800) * level(); score += points; lines += cleared; const oldLevel = level(); if(Math.floor(lines/10)+1 > oldLevel) gravityInterval = getGravityInterval(level()); beep(600,0.12); }
+    // spawn next
+    newPiece(); // check spawn collision
+    if(!canPlace(piece,piece.x,piece.y,piece.rot)){ gameOver(); }
+  }
+
+  function clearLines(){ let cleared=0; for(let r=ROWS-1;r>=0;r--){ if(board[r].every(c=>c)){ cleared++; board.splice(r,1); board.unshift(new Array(COLS).fill(0)); r++; } } return cleared; }
+
+  function hardDrop(){ // move down until can't
+    let drop=0; while(canPlace(piece,piece.x,piece.y+1,piece.rot)){ piece.y++; drop++; }
+    score += drop*2; placePiece(); }
+
+  function softDrop(dt){ const moved = canPlace(piece,piece.x,piece.y+1,piece.rot); if(moved){ piece.y += 1; score += 1; } }
+
+  function rotate(){ const states = TETROMINO[piece.type]; const newRot = (piece.rot+1) % states.length; // try kicks
+    const tests = [[0,0],[-1,0],[1,0],[-2,0],[2,0],[0,-1]]; for(const t of tests){ if(canPlace(piece,piece.x+t[0],piece.y+t[1],newRot)){ piece.x += t[0]; piece.y += t[1]; piece.rot = newRot; beep(800,0.04); return true; } } return false; }
+
+  function move(dx){ if(canPlace(piece,piece.x+dx,piece.y,piece.rot)){ piece.x += dx; beep(700,0.02); return true; } return false; }
+
+  function level(){ return Math.floor(lines/10)+1; }
+
+  function gameOver(){ gameState='gameover'; overlayText('GAME OVER\nScore: '+score+'\nPress Enter to Restart'); if(score>best){ best=score; try{ localStorage.setItem('tetris_best',String(best)); }catch(e){} } }
+
+  function startGame(){ board=createBoard(); bag=[]; nextPiece=spawnFromBag(); newPiece(); score=0; lines=0; level(); gravityInterval=getGravityInterval(level()); gameState='playing'; overlayText(''); }
+
+  function togglePause(){ if(gameState==='playing'){ gameState='paused'; overlayText('PAUSED'); } else if(gameState==='paused'){ gameState='playing'; overlayText(''); } }
+
+  // ghost calculation
+  function ghostY(){ let y=piece.y; while(canPlace(piece,piece.x,y+1,piece.rot)) y++; return y; }
+
+  // main loop
+  let lastTime=performance.now(); function loop(now){ const dt = Math.min(0.05,(now-lastTime)/1000); lastTime=now; if(gameState==='playing'){ // input handling simple: immediate moves per key press; allow holding
+      // horizontal DAS simplified: immediate repeat every frame if held
+      if(keys.left) move(-1); if(keys.right) move(1);
+      if(keys.up){ rotate(); keys.up=false; }
+      // hard drop
+      if(keys.space){ hardDrop(); keys.space=false; }
+      // gravity
+      gravityTimer += dt;
+      // soft drop faster
+      if(keys.down){ if(gravityTimer >= 0.05){ gravityTimer=0; if(canPlace(piece,piece.x,piece.y+1,piece.rot)){ piece.y++; score += 1; } else { // touch
+            lockTimer += 0.05; }
+        } }
+      const interval = getGravityInterval(level()); if(gravityTimer >= interval){ gravityTimer = 0; if(canPlace(piece,piece.x,piece.y+1,piece.rot)){ piece.y++; lockTimer=0; lockResets=0; } else { // landed
+          lockTimer += interval; if(lockTimer >= LOCK_DELAY){ placePiece(); lockTimer=0; lockResets=0; } }
+      }
+      // lock resets allowed when player moves/rotates while touching
+      if((keys.left || keys.right) && !canPlace(piece,piece.x,piece.y+1,piece.rot)){ // moving while grounded resets lock once
+        if(lockResets < MAX_LOCK_RESETS){ lockTimer = 0; lockResets++; }
+      }
+    }
+    render(); requestAnimationFrame(loop); }
+
+  // rendering
+  function render(){ // background
+    ctx.fillStyle='#111'; ctx.fillRect(0,0,W,H);
+    // draw playfield background
+    ctx.fillStyle='#000'; ctx.fillRect(BOARD_X,BOARD_Y,COLS*CELL,ROWS*CELL);
+    // grid
+    ctx.strokeStyle='#222'; ctx.lineWidth=1; for(let c=0;c<=COLS;c++){ ctx.beginPath(); ctx.moveTo(BOARD_X + c*CELL, BOARD_Y); ctx.lineTo(BOARD_X + c*CELL, BOARD_Y + ROWS*CELL); ctx.stroke(); }
+    for(let r=0;r<=ROWS;r++){ ctx.beginPath(); ctx.moveTo(BOARD_X, BOARD_Y + r*CELL); ctx.lineTo(BOARD_X + COLS*CELL, BOARD_Y + r*CELL); ctx.stroke(); }
+    // draw locked cells
+    for(let r=0;r<ROWS;r++){ for(let c=0;c<COLS;c++){ if(board[r][c]) drawCell(BOARD_X + c*CELL, BOARD_Y + r*CELL, board[r][c]); } }
+    if(gameState==='title'){ // title screen
+      drawCenteredText('TETRIS',200, 40); drawCenteredText('Press Enter to Start',300,24); drawInstructions(); drawNextPreview(); drawStats(); return; }
+    // ghost
+    if(piece){ const gy = ghostY(); const state = TETROMINO[piece.type][piece.rot % TETROMINO[piece.type].length]; for(const b of state){ const x = BOARD_X + (piece.x + b[0])*CELL; const y = BOARD_Y + (gy + b[1])*CELL; drawGhost(x,y,piece.color); } }
+    // draw active piece
+    if(piece){ const state = TETROMINO[piece.type][piece.rot % TETROMINO[piece.type].length]; for(const b of state){ const x = BOARD_X + (piece.x + b[0])*CELL; const y = BOARD_Y + (piece.y + b[1])*CELL; drawCell(x,y,piece.color); } }
+    // draw border
+    ctx.strokeStyle='#888'; ctx.lineWidth=3; ctx.strokeRect(BOARD_X-2,BOARD_Y-2,COLS*CELL+4,ROWS*CELL+4);
+    // HUD: next, score, level, lines, best
+    drawNextPreview(); drawStats(); if(gameState==='paused') drawCenteredText('PAUSED',300,36); if(gameState==='gameover') drawCenteredText('GAME OVER\nPress Enter to Restart',300,24); }
+
+  function drawCell(x,y,color){ ctx.fillStyle=color; ctx.fillRect(x+2,y+2,CELL-4,CELL-4); ctx.strokeStyle='#0008'; ctx.strokeRect(x+2,y+2,CELL-4,CELL-4); }
+  function drawGhost(x,y,color){ ctx.fillStyle = withAlpha(color,0.2); ctx.fillRect(x+2,y+2,CELL-4,CELL-4); ctx.strokeStyle=withAlpha('#000',0.05); ctx.strokeRect(x+2,y+2,CELL-4,CELL-4); }
+  function withAlpha(hex,alpha){ const r=parseInt(hex.substr(1,2),16), g=parseInt(hex.substr(3,2),16), b=parseInt(hex.substr(5,2),16); return `rgba(${r},${g},${b},${alpha})`; }
+
+  function drawCenteredText(text,y,size=32){ ctx.fillStyle='#fff'; ctx.font=`bold ${size}px monospace`; ctx.textAlign='center'; const lines=text.split('\n'); for(let i=0;i<lines.length;i++){ ctx.fillText(lines[i], BOARD_X + COLS*CELL/2, y + i*(size+6)); } }
+
+  function drawNextPreview(){ // box
+    const px=560, py=60, box=112; ctx.fillStyle='#222'; ctx.fillRect(px,py,box,box); ctx.strokeStyle='#666'; ctx.strokeRect(px,py,box,box); ctx.fillStyle='#fff'; ctx.font='14px monospace'; ctx.textAlign='center'; ctx.fillText('NEXT', px + box/2, py-8);
+    // draw next piece centered
+    const t = bag.length? bag[bag.length-1] : spawnFromBag(); const states=TETROMINO[t]; const st = states[0]; // use neutral rotation
+    // compute bounds
+    let minx=9e9,maxx=-9e9,miny=9e9,maxy=-9e9; for(const b of st){ minx=Math.min(minx,b[0]); maxx=Math.max(maxx,b[0]); miny=Math.min(miny,b[1]); maxy=Math.max(maxy,b[1]); }
+    const w=(maxx-minx+1), h=(maxy-miny+1); const scale = Math.min((box-20)/(w*CELL),(box-20)/(h*CELL)); const originX = px + box/2 - (w*CELL*scale)/2; const originY = py + box/2 - (h*CELL*scale)/2;
+    for(const b of st){ const cx = originX + (b[0]-minx)*CELL*scale; const cy = originY + (b[1]-miny)*CELL*scale; ctx.fillStyle = COLORS[t] || '#888'; ctx.fillRect(cx+2,cy+2,CELL*scale-4,CELL*scale-4); ctx.strokeStyle='#0008'; ctx.strokeRect(cx+2,cy+2,CELL*scale-4,CELL*scale-4); }
+  }
+
+  function drawStats(){ ctx.fillStyle='#fff'; ctx.font='14px monospace'; ctx.textAlign='left'; ctx.fillText('SCORE: '+score,560,200); ctx.fillText('BEST: '+best,560,230); ctx.fillText('LEVEL: '+level(),560,260); ctx.fillText('LINES: '+lines,560,290); ctx.fillText('Controls: ←/A →/D Rotate:↑/W Drop: Space',560,340); }
+
+  // initial setup
+  function init(){ board=createBoard(); bag=[]; spawnFromBag(); newPiece(); gameState='title'; overlayText('Press Enter to Start'); requestAnimationFrame(loop); }
+
+  // overlay convenience
+  function overlayText(t){ const o=document.getElementById('overlay'); o.textContent = t||''; }
+
+  // start
+  init();
+
+})();
+</script>
+</body>
+</html>

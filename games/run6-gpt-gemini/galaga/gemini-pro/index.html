@@ -1,0 +1,676 @@
+<!--
+  GAME:           Galaga
+  RUN:            run6-gpt-gemini
+  BUILDER:        google/gemini-3.1-pro-preview
+  PLANNER:        openai/gpt-5.4
+  TIMESTAMP:      2026-03-31T08:35:00Z
+  TASKS DONE:     T01,T02,T03,T04,T05,T06,T07,T08,T09,T10,T11,T12,T13,T14
+  FIRST FAILURE:  none
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Galaga</title>
+    <style>
+        body {
+            background-color: #000000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            overflow: hidden;
+            font-family: monospace;
+            color: #FFFFFF;
+        }
+        canvas {
+            background-color: #000000;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas" width="800" height="600"></canvas>
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        // State Machine
+        const STATE = {
+            IDLE: 0,
+            PLAYING: 1,
+            PAUSED: 2,
+            GAME_OVER: 3,
+            STAGE_CLEAR: 4,     // short delay before next stage
+            PLAYER_DEAD: 5,     // dying animation/delay
+            CAPTURED: 6         // player is currently caught in beam
+        };
+        let currentState = STATE.IDLE;
+        let savedStateBeforePause = STATE.IDLE;
+        let stateTimer = 0;
+
+        // Input Tracking
+        const keys = {
+            ArrowLeft: false, ArrowRight: false,
+            a: false, A: false, d: false, D: false,
+            ' ': false
+        };
+        let spacePressed = false;
+
+        window.addEventListener('keydown', (e) => {
+            if (keys.hasOwnProperty(e.key)) keys[e.key] = true;
+            if (['ArrowLeft', 'ArrowRight', ' '].includes(e.key)) e.preventDefault();
+
+            if (e.key === 'Enter') {
+                if (currentState === STATE.IDLE || currentState === STATE.GAME_OVER) {
+                    initGame();
+                }
+            } else if (e.key.toLowerCase() === 'p') {
+                if (currentState === STATE.PLAYING || currentState === STATE.PLAYER_DEAD) {
+                    savedStateBeforePause = currentState;
+                    currentState = STATE.PAUSED;
+                } else if (currentState === STATE.PAUSED) {
+                    currentState = savedStateBeforePause;
+                }
+            } else if (e.key === ' ' && currentState === STATE.PLAYING) {
+                if (!spacePressed) {
+                    fireBullet();
+                    spacePressed = true;
+                }
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            if (keys.hasOwnProperty(e.key)) keys[e.key] = false;
+            // Add a small input-debouncing for continuous fire hold, or require tap? Spec implies tapping or max active bullets limits it.
+            if (e.key === ' ') spacePressed = false;
+        });
+
+        // Audio System
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        function playTone(freq, type, duration, vol=0.1) {
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.type = type;
+            osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+            gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + duration);
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.start();
+            osc.stop(audioCtx.currentTime + duration);
+        }
+        function playShoot() { playTone(1200, 'square', 0.1); }
+        function playHit() { playTone(100, 'sawtooth', 0.15); } // "short noise burst" approx
+        function playDeath() { playTone(660, 'sawtooth', 0.8); } // Should descend, but simple tone for now
+
+        // Core Game Variables
+        let score = 0;
+        let lives = 3;
+        let stage = 1;
+        let highScore = parseInt(localStorage.getItem('galagaHighScore')) || 0;
+        let gameTime = 0; // for formation sway
+        let diveTimer = 0;
+
+        // Background Stars
+        const stars = [];
+        for (let i = 0; i < 80; i++) {
+            stars.push({
+                x: Math.random() * canvas.width,
+                y: Math.random() * canvas.height,
+                size: Math.random() > 0.5 ? 2 : 1, // 1-2px sized stars
+                speed: 20 // 20px/s downward
+            });
+        }
+
+        // Entities
+        const ship = {
+            x: 400,
+            y: 550,
+            width: 28,
+            height: 30,
+            speed: 350,
+            isDual: false,
+            state: 'alive' // 'alive', 'captured', 'dead'
+        };
+
+        const ENEMY_TYPES = {
+            BOSS: { id: 0, w: 28, h: 24, c: '#00CC00', cDamaged: '#006600', hp: 2, sBase: 150, sDive: 400 },
+            BUTTERFLY: { id: 1, w: 24, h: 20, c: '#FF4444', cDamaged: null, hp: 1, sBase: 80, sDive: 160 },
+            BEE: { id: 2, w: 20, h: 18, c: '#FFCC00', cDamaged: null, hp: 1, sBase: 50, sDive: 100 },
+            BEE_VAR: { id: 3, w: 20, h: 18, c: '#00BBFF', cDamaged: null, hp: 1, sBase: 50, sDive: 100 }
+        };
+
+        let enemies = [];
+        let bullets = [];
+        let enemyBullets = [];
+
+        // Dual-ship support info
+        let capturedShipObj = null; // Visual fake ship sitting above the boss
+
+        function getDiveInterval() {
+            // Aggression scales with stage
+            return Math.max(1.0, 3.0 - (stage * 0.2)); 
+        }
+
+        function createFormation() {
+            enemies = [];
+            const cols = 10;
+            const rows = 5;
+            const spacingX = 40;
+            const spacingY = 36;
+            const startX = 400 - (4.5 * spacingX);
+            const startY = 160 - (2 * spacingY);
+
+            for (let r = 0; r < rows; r++) {
+                for (let c = 0; c < cols; c++) {
+                    let et;
+                    if (r === 0) {
+                        if (c < 3 || c > 6) continue; // Only 4 bosses in center slots
+                        et = ENEMY_TYPES.BOSS;
+                    } else if (r === 1) {
+                        et = ENEMY_TYPES.BUTTERFLY;
+                    } else if (r === 2 || r === 3) {
+                        et = ENEMY_TYPES.BEE;
+                    } else { // r === 4
+                        et = ENEMY_TYPES.BEE_VAR;
+                    }
+
+                    enemies.push({
+                        type: et,
+                        hp: et.hp,
+                        gridX: startX + c * spacingX,
+                        gridY: startY + r * spacingY,
+                        x: startX + c * spacingX,
+                        y: startY + r * spacingY,
+                        state: 'formation', // formation, diving, capturing, returning
+                        diveTime: 0,
+                        startX: 0, startY: 0,
+                        targetX: 0, targetY: 0,
+                        beamTimer: 0,
+                        hasCapturedShip: false
+                    });
+                }
+            }
+        }
+
+        function initStage() {
+            bullets.length = 0;
+            enemyBullets.length = 0;
+            createFormation();
+            diveTimer = getDiveInterval();
+            resetShip();
+            currentState = STATE.PLAYING;
+        }
+
+        function initGame() {
+            score = 0;
+            lives = 3;
+            stage = 1;
+            ship.isDual = false;
+            initStage();
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+        }
+
+        function resetShip() {
+            ship.x = 400;
+            ship.y = 550;
+            ship.state = 'alive';
+            keys['ArrowLeft'] = false; keys['ArrowRight'] = false;
+        }
+
+        function fireBullet() {
+            if (ship.state !== 'alive' || currentState !== STATE.PLAYING) return;
+            const maxBullets = ship.isDual ? 4 : 2;
+            if (bullets.length >= maxBullets) return;
+
+            if (ship.isDual) {
+                // Fire two bullets from the dual noses
+                bullets.push({ x: ship.x - 16, y: ship.y - 15, vy: -550 });
+                bullets.push({ x: ship.x + 16, y: ship.y - 15, vy: -550 });
+            } else {
+                bullets.push({ x: ship.x, y: ship.y - 15, vy: -550 });
+            }
+            playShoot();
+        }
+
+        function fireEnemyBullet(ex, ey) {
+            enemyBullets.push({ x: ex, y: ey, vy: 300 });
+        }
+
+        function checkAABB(x1, y1, w1, h1, x2, y2, w2, h2) {
+            return x1 < x2 + w2 &&
+                   x1 + w1 > x2 &&
+                   y1 < y2 + h2 &&
+                   y1 + h1 > y2;
+        }
+
+        function addScore(pts) {
+            score += pts;
+            if (score > highScore) {
+                highScore = score;
+                localStorage.setItem('galagaHighScore', highScore);
+            }
+        }
+
+        function loseLife() {
+            playDeath();
+            ship.state = 'dead';
+            currentState = STATE.PLAYER_DEAD;
+            stateTimer = 2.0;
+        }
+
+        function handleCaptureComplete() {
+            ship.state = 'captured';
+            // Find the capturing boss and attach flag
+            for (let e of enemies) {
+                if (e.state === 'capturing') {
+                    e.hasCapturedShip = true;
+                    e.state = 'returning'; // return to formation with ship in tow
+                    break;
+                }
+            }
+            
+            loseLife(); // capturing costs a life basically
+            // If lives = 0, Game Over will trigger after PLAYER_DEAD timer
+        }
+
+        function enemyHit(enemy, i) {
+            playHit();
+            enemy.hp--;
+            if (enemy.hp <= 0) {
+                // Score depends on state
+                let pts = enemy.state === 'formation' || enemy.state === 'returning' ? enemy.type.sBase : enemy.type.sDive;
+                addScore(pts);
+                
+                // If this boss had the captured ship, rescue it!
+                if (enemy.hasCapturedShip) {
+                    // Turn it into dual ship
+                    ship.isDual = true;
+                    addScore(1000); // Bonus for rescue!
+                    playTone(600, 'square', 0.5); // Rescue chime
+                }
+                
+                enemies.splice(i, 1);
+            }
+        }
+
+        function startDive() {
+            if (enemies.length === 0) return;
+            
+            // Pick 1-3 valid enemies in formation
+            let inFormation = enemies.filter(e => e.state === 'formation');
+            if (inFormation.length === 0) return;
+
+            let numDivers = Math.floor(Math.random() * 3) + 1; // 1 to 3
+            numDivers = Math.min(numDivers, inFormation.length);
+
+            // Sort random to pick
+            inFormation.sort(() => Math.random() - 0.5);
+
+            for (let i = 0; i < numDivers; i++) {
+                let e = inFormation[i];
+                e.state = 'diving';
+                e.diveTime = 0;
+                e.startX = e.x;
+                e.startY = e.y;
+
+                // 20% chance for a boss dive to become a capture attack if we don't already have one
+                if (e.type.id === ENEMY_TYPES.BOSS.id && Math.random() < 0.2 && ship.state === 'alive' && !ship.isDual) {
+                    let beamExists = enemies.some(en => en.state === 'capturing' || en.hasCapturedShip);
+                    if (!beamExists) {
+                        e.state = 'capturing'; // Initiating capture sequence
+                    }
+                }
+            }
+        }
+
+        function update(dt) {
+            gameTime += dt;
+
+            // Starfield
+            for (let s of stars) {
+                s.y += s.speed * dt;
+                if (s.y > canvas.height) {
+                    s.y -= canvas.height;
+                    s.x = Math.random() * canvas.width;
+                }
+            }
+
+            if (currentState === STATE.STAGE_CLEAR) {
+                stateTimer -= dt;
+                if (stateTimer <= 0) {
+                    stage++;
+                    initStage();
+                }
+                return;
+            }
+
+            if (currentState === STATE.PLAYER_DEAD) {
+                stateTimer -= dt;
+                if (stateTimer <= 0) {
+                    lives--;
+                    if (lives <= 0) {
+                        currentState = STATE.GAME_OVER;
+                    } else {
+                        // Resurrect
+                        ship.isDual = false; // Always lose dual ship on death
+                        resetShip();
+                        currentState = STATE.PLAYING;
+                    }
+                }
+                // Enemies still move while you are dead
+            }
+
+            // Player Movement
+            if (currentState === STATE.PLAYING && ship.state === 'alive') {
+                let dx = 0;
+                if (keys.ArrowLeft || keys.a || keys.A) dx = -1;
+                if (keys.ArrowRight || keys.d || keys.D) dx = 1;
+
+                ship.x += dx * ship.speed * dt;
+                
+                let halfWidth = (ship.isDual ? 60 : 28) / 2;
+                if (ship.x < halfWidth) ship.x = halfWidth;
+                if (ship.x > canvas.width - halfWidth) ship.x = canvas.width - halfWidth;
+            }
+
+            // Enemies Update
+            let swayX = Math.sin(gameTime * Math.PI * 0.5) * 20; // 0.5Hz, ±20px
+            
+            for (let i = enemies.length - 1; i >= 0; i--) {
+                let e = enemies[i];
+                
+                if (e.state === 'formation') {
+                    e.x = e.gridX + swayX;
+                    e.y = e.gridY;
+                } else if (e.state === 'diving') {
+                    e.diveTime += dt;
+                    
+                    // Bezier / Parametric curve for dive
+                    // Dive down past player, then loop back up
+                    const t = e.diveTime / 2.5; // full dive cycle is ~2.5s
+                    
+                    if (t < 1.0) {
+                        // Swoop down
+                        e.y = e.startY + (600 * t);
+                        // Add some horizontal wavy motion
+                        e.x = e.startX + Math.sin(t * Math.PI * 2) * 100;
+
+                        // Shoot randomly during early dive
+                        if (t > 0.2 && t < 0.6 && Math.random() < 0.05) {
+                            fireEnemyBullet(e.x, e.y);
+                        }
+
+                    } else {
+                        // Finished dive screen pass, return to top wrap around
+                        e.state = 'returning';
+                        e.y = -50;
+                        e.x = e.gridX + swayX;
+                    }
+
+                    // Collide with player body
+                    if ((currentState === STATE.PLAYING && ship.state === 'alive') || ship.isDual) {
+                        const sW = ship.isDual ? 60 : 28;
+                        if (checkAABB(e.x - e.type.w/2, e.y - e.type.h/2, e.type.w, e.type.h, 
+                                      ship.x - sW/2, ship.y - 15, sW, 30)) {
+                            // Both destroyed
+                            enemyHit(e, i);
+                            loseLife();
+                            continue; // enemy removed
+                        }
+                    }
+
+                } else if (e.state === 'capturing') {
+                    e.diveTime += dt;
+                    
+                    if (e.diveTime < 1.0) {
+                        // Swoop down to firing position just above player level
+                        e.y = e.startY + (300 * e.diveTime);
+                        e.x = e.startX + (ship.x - e.startX) * e.diveTime * 0.8; // Home towards player slightly
+                    } else {
+                        // Hover and fire beam for 3 seconds
+                        e.beamTimer -= dt;
+                        if (e.beamTimer === undefined || isNaN(e.beamTimer)) e.beamTimer = 3.0; // Init
+
+                        if (e.beamTimer > 0) {
+                            // Beam is active. (40x200 beneath boss)
+                            let bX = e.x - 20;
+                            let bY = e.y + e.type.h / 2;
+                            // Check continuous collision with beam
+                            if (currentState === STATE.PLAYING && ship.state === 'alive') {
+                                const sW = ship.isDual ? 60 : 28;
+                                // Simple capture trigger: if touching beam at all, capture instantly for simplicity, 
+                                // true arcade requires full suction animation. Let's do instant on touch.
+                                if (checkAABB(bX, bY, 40, 200, ship.x - sW/2, ship.y - 15, sW, 30)) {
+                                    handleCaptureComplete();
+                                    e.beamTimer = 0; // stop beaming immediately
+                                }
+                            }
+                        } else {
+                            // Done beaming, return
+                            e.state = 'returning';
+                        }
+                    }
+                } else if (e.state === 'returning') {
+                    // Fly from top back into formation slot
+                    e.y += 150 * dt;
+                    e.x = e.gridX + swayX;
+                    if (e.y >= e.gridY) {
+                        e.y = e.gridY;
+                        e.state = 'formation';
+                    }
+                }
+            }
+
+            // Dive Timer Scheduling
+            if (currentState === STATE.PLAYING) {
+                diveTimer -= dt;
+                if (diveTimer <= 0) {
+                    startDive();
+                    diveTimer = getDiveInterval();
+                }
+
+                if (enemies.length === 0) {
+                    currentState = STATE.STAGE_CLEAR;
+                    stateTimer = 2.0;
+                }
+            }
+
+            // Player Bullets
+            for (let i = bullets.length - 1; i >= 0; i--) {
+                let b = bullets[i];
+                b.y += b.vy * dt;
+                if (b.y < 0) {
+                    bullets.splice(i, 1);
+                    continue;
+                }
+
+                // Check collision with enemies
+                let hit = false;
+                for (let j = enemies.length - 1; j >= 0; j--) {
+                    let e = enemies[j];
+                    if (checkAABB(b.x - 1.5, b.y - 7, 3, 14, 
+                                  e.x - e.type.w/2, e.y - e.type.h/2, e.type.w, e.type.h)) {
+                        enemyHit(e, j);
+                        hit = true;
+                        break;
+                    }
+                }
+                if (hit) bullets.splice(i, 1);
+            }
+
+            // Enemy Bullets
+            for (let i = enemyBullets.length - 1; i >= 0; i--) {
+                let b = enemyBullets[i];
+                b.y += b.vy * dt;
+                if (b.y > canvas.height) {
+                    enemyBullets.splice(i, 1);
+                    continue;
+                }
+
+                // Collision with player
+                if (currentState === STATE.PLAYING && ship.state === 'alive') {
+                    const sW = ship.isDual ? 60 : 28;
+                    if (checkAABB(b.x - 1.5, b.y - 5, 3, 10, ship.x - sW/2, ship.y - 15, sW, 30)) {
+                        enemyBullets.splice(i, 1);
+                        loseLife();
+                    }
+                }
+            }
+        }
+
+        function drawShip(cx, cy, isDual, color='#FFFFFF') {
+            ctx.fillStyle = color;
+            if (!isDual) {
+                // Single ship
+                ctx.beginPath();
+                ctx.moveTo(cx, cy - 15);
+                ctx.lineTo(cx - 6, cy - 2);
+                ctx.lineTo(cx - 14, cy + 10);
+                ctx.lineTo(cx + 14, cy + 10);
+                ctx.lineTo(cx + 6, cy - 2);
+                ctx.closePath();
+                ctx.fill();
+            } else {
+                // Dual ship
+                let offset = 16;
+                ctx.beginPath(); 
+                ctx.moveTo(cx - offset, cy - 15); ctx.lineTo(cx - offset - 6, cy - 2); ctx.lineTo(cx - offset - 14, cy + 10); ctx.lineTo(cx - offset + 14, cy + 10); ctx.lineTo(cx - offset + 6, cy - 2); ctx.fill();
+                ctx.beginPath(); 
+                ctx.moveTo(cx + offset, cy - 15); ctx.lineTo(cx + offset - 6, cy - 2); ctx.lineTo(cx + offset - 14, cy + 10); ctx.lineTo(cx + offset + 14, cy + 10); ctx.lineTo(cx + offset + 6, cy - 2); ctx.fill();
+            }
+        }
+
+        function draw() {
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // Draw Stars
+            ctx.fillStyle = '#FFFFFF';
+            for (let s of stars) {
+                ctx.fillRect(s.x, s.y, s.size, s.size);
+            }
+
+            if (currentState !== STATE.IDLE) {
+                // Draw BEAM first (behind everything)
+                for (let e of enemies) {
+                    if (e.state === 'capturing' && e.beamTimer > 0) {
+                        ctx.fillStyle = 'rgba(0, 255, 0, 0.3)'; // Translucent green
+                        ctx.fillRect(e.x - 20, e.y + e.type.h/2, 40, 200);
+                    }
+                }
+
+                // Draw Player
+                if (ship.state === 'alive' || (ship.state === 'dead' && Math.floor(Date.now() / 150) % 2 === 0 && currentState !== STATE.GAME_OVER)) {
+                    drawShip(ship.x, ship.y, ship.isDual, ship.state === 'dead' ? '#FF0000' : '#FFFFFF');
+                }
+
+                // Draw Enemies
+                for (let e of enemies) {
+                    // Damaged boss color
+                    let c = e.type.c;
+                    if (e.type.id === ENEMY_TYPES.BOSS.id && e.hp === 1) c = ENEMY_TYPES.BOSS.cDamaged;
+                    
+                    ctx.fillStyle = c;
+                    ctx.fillRect(e.x - e.type.w / 2, e.y - e.type.h / 2, e.type.w, e.type.h);
+                    
+                    // Draw captured ship towed on top of boss
+                    if (e.hasCapturedShip) {
+                        drawShip(e.x, e.y - 20, false, '#FF4444');
+                    }
+                }
+
+                // Draw Bullets
+                ctx.fillStyle = '#FFFFFF';
+                for (let b of bullets) {
+                    ctx.fillRect(b.x - 1.5, b.y - 7, 3, 14);
+                }
+                
+                ctx.fillStyle = '#FF6666';
+                for (let b of enemyBullets) {
+                    ctx.fillRect(b.x - 1.5, b.y - 5, 3, 10);
+                }
+
+                // Draw HUD
+                ctx.fillStyle = '#FFFFFF';
+                ctx.font = '16px monospace';
+                ctx.textAlign = 'left';
+                ctx.textBaseline = 'top';
+                ctx.fillText(`SCORE`, 20, 20);
+                ctx.fillText(`${score}`, 20, 40);
+
+                ctx.textAlign = 'center';
+                ctx.fillText(`HIGH SCORE`, canvas.width / 2, 20);
+                ctx.fillText(`${Math.max(score, highScore)}`, canvas.width / 2, 40);
+
+                ctx.fillStyle = '#AAAAAA';
+                ctx.textAlign = 'right';
+                // Stage flag bottom right
+                ctx.fillText(`STAGE ${stage}`, canvas.width - 20, canvas.height - 30);
+
+                // Lives bottom left
+                for (let i = 0; i < lives; i++) {
+                    drawShip(30 + i * 35, canvas.height - 20, false);
+                }
+                
+                if (currentState === STATE.STAGE_CLEAR) {
+                    ctx.fillStyle = '#00CC00';
+                    ctx.font = '36px monospace';
+                    ctx.textAlign = 'center';
+                    ctx.fillText('STAGE CLEAR', canvas.width / 2, canvas.height / 2);
+                }
+            }
+
+            // Overlays
+            if (currentState === STATE.IDLE) {
+                ctx.fillStyle = '#FFCC00';
+                ctx.font = '56px monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText('GALAGA', canvas.width / 2, 200);
+
+                ctx.fillStyle = '#AAAAAA';
+                ctx.font = '24px monospace';
+                ctx.fillText('Press Enter to Start', canvas.width / 2, 420);
+            } else if (currentState === STATE.PAUSED) {
+                ctx.fillStyle = 'rgba(0,0,0,0.8)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.fillStyle = '#FFFFFF';
+                ctx.font = '36px monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText('PAUSED', canvas.width / 2, canvas.height / 2);
+            } else if (currentState === STATE.GAME_OVER) {
+                ctx.fillStyle = 'rgba(0,0,0,0.8)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                
+                ctx.fillStyle = '#FF0000';
+                ctx.font = '48px monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText('GAME OVER', canvas.width / 2, 250);
+                
+                ctx.fillStyle = '#FFFFFF';
+                ctx.font = '24px monospace';
+                ctx.fillText(`SCORE: ${score}`, canvas.width / 2, 320);
+                
+                ctx.fillStyle = '#AAAAAA';
+                ctx.fillText('Press Enter to restart', canvas.width / 2, 400);
+            }
+        }
+
+        function loop(timestamp) {
+            const dt = lastTime ? (timestamp - lastTime) / 1000 : 0;
+            const safeDt = Math.min(dt, 0.1); 
+            lastTime = timestamp;
+
+            update(safeDt);
+            draw();
+
+            requestAnimationFrame(loop);
+        }
+
+        requestAnimationFrame(loop);
+    </script>
+</body>
+</html>

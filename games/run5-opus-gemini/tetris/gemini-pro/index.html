@@ -1,0 +1,700 @@
+<!--
+  GAME:           Tetris
+  RUN:            run5-opus-gemini
+  BUILDER:        google/gemini-3.1-pro-preview
+  PLANNER:        anthropic/claude-opus-4-6
+  TIMESTAMP:      2026-03-31T08:17:00Z
+  TASKS DONE:     T01,T02,T03,T04,T05,T06,T07,T08,T09,T10,T11,T12,T13,T14,T15
+  FIRST FAILURE:  none
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tetris</title>
+    <style>
+        body {
+            background-color: #111111;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            overflow: hidden;
+            color: #FFFFFF;
+            font-family: monospace;
+        }
+        canvas {
+            background-color: #111111;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas" width="800" height="600"></canvas>
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        // Playfield details
+        const COLS = 10;
+        const ROWS = 20;
+        const CELL = 28;
+        const PF_X = 240;
+        const PF_Y = 10;
+        const PF_W = COLS * CELL;
+        const PF_H = ROWS * CELL;
+
+        // State Machine
+        const STATE = {
+            IDLE: 0,
+            PLAYING: 1,
+            PAUSED: 2,
+            GAME_OVER: 3,
+            LINE_CLEAR_WAIT: 4
+        };
+        let currentState = STATE.IDLE;
+        let savedStateBeforePause = STATE.IDLE;
+
+        // Input Config
+        let keyState = {};
+        let leftTimer = 0;
+        let rightTimer = 0;
+        const moveDelay = 150; 
+        const moveRepeat = 50; 
+        
+        // Use an object to track if a key was just pressed and action taken to prevent continuous firing on hold
+        let pressedInputs = {
+            up: false,
+            z: false,
+            space: false
+        };
+
+        window.addEventListener('keydown', (e) => {
+            keyState[e.key] = true;
+            if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) {
+                e.preventDefault();
+            }
+
+            if (currentState === STATE.PLAYING) {
+                if (e.key === 'ArrowUp' || e.key.toLowerCase() === 'w') {
+                    if (!pressedInputs.up) {
+                        rotateCurrent(1);
+                        pressedInputs.up = true;
+                    }
+                }
+                if (e.key.toLowerCase() === 'z') {
+                    if (!pressedInputs.z) {
+                        rotateCurrent(-1);
+                        pressedInputs.z = true;
+                    }
+                }
+                if (e.key === ' ') {
+                    if (!pressedInputs.space) {
+                        hardDrop();
+                        pressedInputs.space = true;
+                    }
+                }
+                if (e.key === 'ArrowLeft' || e.key.toLowerCase() === 'a') {
+                    if (leftTimer <= 0) {
+                        moveCurrent(-1, 0);
+                        leftTimer = moveDelay;
+                    }
+                }
+                if (e.key === 'ArrowRight' || e.key.toLowerCase() === 'd') {
+                    if (rightTimer <= 0) {
+                        moveCurrent(1, 0);
+                        rightTimer = moveDelay;
+                    }
+                }
+            }
+
+            if (e.key === 'Enter') {
+                if (currentState === STATE.IDLE || currentState === STATE.GAME_OVER) {
+                    initGame();
+                }
+            } else if (e.key.toLowerCase() === 'p') {
+                if (currentState === STATE.PLAYING) {
+                    savedStateBeforePause = currentState;
+                    currentState = STATE.PAUSED;
+                } else if (currentState === STATE.PAUSED) {
+                    currentState = savedStateBeforePause;
+                }
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            keyState[e.key] = false;
+            if (e.key === 'ArrowUp' || e.key.toLowerCase() === 'w') pressedInputs.up = false;
+            if (e.key.toLowerCase() === 'z') pressedInputs.z = false;
+            if (e.key === ' ') pressedInputs.space = false;
+            
+            if (e.key === 'ArrowLeft' || e.key.toLowerCase() === 'a') leftTimer = 0;
+            if (e.key === 'ArrowRight' || e.key.toLowerCase() === 'd') rightTimer = 0;
+        });
+
+        const TYPES = ['I', 'O', 'T', 'S', 'Z', 'J', 'L'];
+        const TETROMINOES = {
+            I: { color: '#00FFFF', shapes: [
+                [[0,1], [1,1], [2,1], [3,1]], 
+                [[2,0], [2,1], [2,2], [2,3]], 
+                [[0,2], [1,2], [2,2], [3,2]], 
+                [[1,0], [1,1], [1,2], [1,3]]  
+            ]},
+            O: { color: '#FFFF00', shapes: [
+                [[1,0], [2,0], [1,1], [2,1]],
+                [[1,0], [2,0], [1,1], [2,1]],
+                [[1,0], [2,0], [1,1], [2,1]],
+                [[1,0], [2,0], [1,1], [2,1]]
+            ]},
+            T: { color: '#AA00FF', shapes: [
+                [[1,0], [0,1], [1,1], [2,1]],
+                [[1,0], [1,1], [2,1], [1,2]],
+                [[0,1], [1,1], [2,1], [1,2]],
+                [[1,0], [0,1], [1,1], [1,2]]
+            ]},
+            S: { color: '#00FF00', shapes: [
+                [[1,0], [2,0], [0,1], [1,1]],
+                [[1,0], [1,1], [2,1], [2,2]],
+                [[1,1], [2,1], [0,2], [1,2]],
+                [[0,0], [0,1], [1,1], [1,2]]
+            ]},
+            Z: { color: '#FF0000', shapes: [
+                [[0,0], [1,0], [1,1], [2,1]],
+                [[2,0], [1,1], [2,1], [1,2]],
+                [[0,1], [1,1], [1,2], [2,2]],
+                [[1,0], [0,1], [1,1], [0,2]]
+            ]},
+            J: { color: '#0000FF', shapes: [
+                [[0,0], [0,1], [1,1], [2,1]],
+                [[1,0], [2,0], [1,1], [1,2]],
+                [[0,1], [1,1], [2,1], [2,2]],
+                [[1,0], [1,1], [0,2], [1,2]]
+            ]},
+            L: { color: '#FF8800', shapes: [
+                [[2,0], [0,1], [1,1], [2,1]],
+                [[1,0], [1,1], [1,2], [2,2]],
+                [[0,1], [1,1], [2,1], [0,2]],
+                [[0,0], [1,0], [1,1], [1,2]]
+            ]}
+        };
+
+        let playfield = Array.from({ length: ROWS }, () => Array(COLS).fill(null));
+        let bag = [];
+        let nextBag = []; // To preview next piece reliably
+        
+        let currentPiece = null; 
+        
+        let level = 1;
+        let score = 0;
+        let lines = 0;
+        let highScore = parseInt(localStorage.getItem('tetrisHighScore')) || 0;
+
+        let gravityTimer = 0;
+        let lockTimer = 0;
+        let lockResets = 0;
+        let isLocking = false;
+
+        let clearLinesAnimWait = 0;
+        let linesToClear = [];
+
+        function updateHighScore() {
+            if (score > highScore) {
+                highScore = score;
+                localStorage.setItem('tetrisHighScore', highScore);
+            }
+        }
+
+        function getGravityInterval() {
+            return Math.max(100, 1000 - 75 * (level - 1));
+        }
+
+        function createShuffledBag() {
+            let temp = [...TYPES];
+            for (let i = temp.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [temp[i], temp[j]] = [temp[j], temp[i]];
+            }
+            return temp;
+        }
+
+        function getNextPiece() {
+            if (bag.length === 0) {
+                bag = nextBag;
+                nextBag = createShuffledBag();
+            }
+            return bag.shift();
+        }
+
+        function spawnPiece() {
+            let type = getNextPiece();
+
+            let spawnX = 3;
+            // O piece shifts right slightly for centered look in standard rules
+            if (type === 'O') spawnX = 4;
+
+            currentPiece = {
+                type: type,
+                rot: 0,
+                x: spawnX,
+                y: 0,
+                cells: TETROMINOES[type].shapes[0]
+            };
+            
+            if (checkCollision(currentPiece.x, currentPiece.y, currentPiece.cells)) {
+                updateHighScore();
+                currentState = STATE.GAME_OVER;
+            } else {
+                gravityTimer = getGravityInterval();
+                lockTimer = 500;
+                lockResets = 0;
+                isLocking = false;
+            }
+        }
+
+        function checkCollision(x, y, cells) {
+            for (let i = 0; i < 4; i++) {
+                let col = x + cells[i][0];
+                let row = y + cells[i][1];
+
+                if (col < 0 || col >= COLS || row >= ROWS) return true;
+                if (row >= 0 && playfield[row][col] !== null) return true;
+            }
+            return false;
+        }
+
+        function moveCurrent(dx, dy) {
+            if (!currentPiece) return false;
+            
+            if (!checkCollision(currentPiece.x + dx, currentPiece.y + dy, currentPiece.cells)) {
+                currentPiece.x += dx;
+                currentPiece.y += dy;
+                
+                if (dy > 0) {
+                    // Moving down resets lock delay
+                    lockTimer = 500;
+                } else if (dx !== 0) {
+                    // Moving sideways can optionally reset lock delay up to 3 times per spec
+                    if (isLocking && lockResets < 3) {
+                        lockTimer = 500;
+                        lockResets++;
+                        isLocking = false;
+                    }
+                }
+                
+                return true;
+            }
+            return false;
+        }
+
+        function rotateCurrent(dir) {
+            if (!currentPiece) return;
+            if (currentPiece.type === 'O') return; 
+
+            let nextRot = (currentPiece.rot + dir + 4) % 4;
+            let nextCells = TETROMINOES[currentPiece.type].shapes[nextRot];
+
+            const wallKicks = [
+                [0,0], [-1,0], [1,0], [0,-1]
+            ];
+            const iKicks = [
+                [0,0], [-1,0], [1,0], [0,-1], [-2,0], [2,0]
+            ];
+            
+            const kicks = currentPiece.type === 'I' ? iKicks : wallKicks;
+
+            for (let i = 0; i < kicks.length; i++) {
+                let kx = kicks[i][0];
+                let ky = kicks[i][1];
+
+                if (!checkCollision(currentPiece.x + kx, currentPiece.y + ky, nextCells)) {
+                    currentPiece.x += kx;
+                    currentPiece.y += ky;
+                    currentPiece.rot = nextRot;
+                    currentPiece.cells = nextCells;
+                    
+                    if (isLocking && lockResets < 3) {
+                        lockTimer = 500;
+                        lockResets++;
+                        isLocking = false;
+                    }
+                    return;
+                }
+            }
+        }
+
+        function getGhostY() {
+            if (!currentPiece) return 0;
+            let gy = currentPiece.y;
+            while (!checkCollision(currentPiece.x, gy + 1, currentPiece.cells)) {
+                gy++;
+            }
+            return gy;
+        }
+
+        function hardDrop() {
+            if (!currentPiece) return;
+            let gy = getGhostY();
+            let droppedRows = gy - currentPiece.y;
+            currentPiece.y = gy;
+            score += droppedRows * 2;
+            lockCurrentPiece();
+        }
+
+        function lockCurrentPiece() {
+            for (let i = 0; i < 4; i++) {
+                let col = currentPiece.x + currentPiece.cells[i][0];
+                let row = currentPiece.y + currentPiece.cells[i][1];
+                if (row >= 0) { 
+                    playfield[row][col] = TETROMINOES[currentPiece.type].color;
+                }
+            }
+            currentPiece = null;
+            checkLines();
+        }
+
+        function checkLines() {
+            linesToClear = [];
+            for (let r = 0; r < ROWS; r++) {
+                let isFull = true;
+                for (let c = 0; c < COLS; c++) {
+                    if (playfield[r][c] === null) {
+                        isFull = false;
+                        break;
+                    }
+                }
+                if (isFull) linesToClear.push(r);
+            }
+
+            if (linesToClear.length > 0) {
+                clearLinesAnimWait = 100; // 100ms flash
+                currentState = STATE.LINE_CLEAR_WAIT;
+            } else {
+                spawnPiece();
+            }
+        }
+
+        function processClearedLines() {
+            let clearedCount = linesToClear.length;
+            
+            // Remove full rows
+            for (let i = 0; i < linesToClear.length; i++) {
+                let r = linesToClear[i];
+                playfield.splice(r, 1);
+            }
+            
+            // Insert empties at top
+            for (let i = 0; i < clearedCount; i++) {
+                playfield.unshift(Array(COLS).fill(null));
+            }
+
+            lines += clearedCount;
+            
+            let linePoints = 0;
+            if (clearedCount === 1) linePoints = 100;
+            else if (clearedCount === 2) linePoints = 300;
+            else if (clearedCount === 3) linePoints = 500;
+            else if (clearedCount === 4) linePoints = 800; // Tetris!
+            
+            score += linePoints * level;
+            
+            level = Math.floor(lines / 10) + 1;
+
+            spawnPiece();
+            currentState = STATE.PLAYING;
+        }
+
+        function initGame() {
+            playfield = Array.from({ length: ROWS }, () => Array(COLS).fill(null));
+            bag = createShuffledBag();
+            nextBag = createShuffledBag();
+            score = 0;
+            level = 1;
+            lines = 0;
+            spawnPiece();
+            currentState = STATE.PLAYING;
+        }
+
+        let lastTime = 0;
+
+        function update(dt) {
+            let ms = dt * 1000;
+            if (currentState === STATE.PLAYING) {
+                // Horizontal repeat movement
+                if (keyState['ArrowLeft'] || keyState['a'] || keyState['A']) {
+                    leftTimer -= ms;
+                    if (leftTimer <= 0) {
+                        moveCurrent(-1, 0);
+                        leftTimer = moveRepeat;
+                    }
+                }
+                if (keyState['ArrowRight'] || keyState['d'] || keyState['D']) {
+                    rightTimer -= ms;
+                    if (rightTimer <= 0) {
+                        moveCurrent(1, 0);
+                        rightTimer = moveRepeat;
+                    }
+                }
+
+                // Gravity & Soft Drop
+                let isSoftDrop = keyState['ArrowDown'] || keyState['s'] || keyState['S'];
+                
+                // If locking, don't force fall unless down is held and we have gravity
+                if (isSoftDrop) {
+                    gravityTimer -= ms;
+                    // Apply 50ms tick explicitly for softdrop. 
+                    if (gravityTimer <= 0) {
+                        if (moveCurrent(0, 1)) {
+                            score += 1;
+                            gravityTimer = 50;
+                        } else {
+                            gravityTimer = 0;
+                        }
+                    }
+                } else {
+                    gravityTimer -= ms;
+                    if (gravityTimer <= 0) {
+                        if (moveCurrent(0, 1)) {
+                            gravityTimer = getGravityInterval();
+                        } else {
+                            // Hit bottom, wait for lock delay if piece exists
+                            gravityTimer = 0;
+                        }
+                    }
+                }
+
+                // Lock Delay Logic
+                if (currentPiece) {
+                    isLocking = checkCollision(currentPiece.x, currentPiece.y + 1, currentPiece.cells);
+                    if (isLocking) {
+                        lockTimer -= ms;
+                        if (lockTimer <= 0) {
+                            lockCurrentPiece();
+                        }
+                    }
+                }
+            } else if (currentState === STATE.LINE_CLEAR_WAIT) {
+                clearLinesAnimWait -= ms;
+                if (clearLinesAnimWait <= 0) {
+                    processClearedLines();
+                }
+            }
+        }
+
+        function drawCellScreen(x, y, color, alpha = 1.0) {
+            ctx.fillStyle = color;
+            ctx.globalAlpha = alpha;
+            ctx.fillRect(x, y, CELL, CELL);
+            
+            // Inner darker border
+            ctx.fillStyle = '#000000';
+            ctx.globalAlpha = 0.3 * alpha;
+            ctx.fillRect(x + 2, y + 2, CELL - 4, CELL - 4);
+            ctx.globalAlpha = 1.0;
+        }
+
+        function drawDrawPlayfield() {
+            // Background
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(PF_X, PF_Y, PF_W, PF_H);
+
+            // Grid lines overlay (drawn behind blocks)
+            ctx.strokeStyle = '#333333';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            for (let x = 0; x <= COLS; x++) {
+                ctx.moveTo(PF_X + x * CELL, PF_Y);
+                ctx.lineTo(PF_X + x * CELL, PF_Y + PF_H);
+            }
+            for (let y = 0; y <= ROWS; y++) {
+                ctx.moveTo(PF_X, PF_Y + y * CELL);
+                ctx.lineTo(PF_X + PF_W, PF_Y + y * CELL);
+            }
+            ctx.stroke();
+
+            // Draw locked blocks
+            let flashLines = currentState === STATE.LINE_CLEAR_WAIT;
+            for (let r = 0; r < ROWS; r++) {
+                // If animating flash, draw white
+                if (flashLines && linesToClear.includes(r)) {
+                    for (let c = 0; c < COLS; c++) {
+                        drawCellScreen(PF_X + c * CELL, PF_Y + r * CELL, '#FFFFFF');
+                    }
+                } else {
+                    for (let c = 0; c < COLS; c++) {
+                        if (playfield[r][c]) {
+                            drawCellScreen(PF_X + c * CELL, PF_Y + r * CELL, playfield[r][c]);
+                        }
+                    }
+                }
+            }
+
+            // Draw active and ghost
+            if (currentPiece && currentState !== STATE.GAME_OVER && currentState !== STATE.LINE_CLEAR_WAIT) {
+                // Ghost piece
+                let gy = getGhostY();
+                const color = TETROMINOES[currentPiece.type].color;
+                
+                for (let i = 0; i < 4; i++) {
+                    let col = currentPiece.x + currentPiece.cells[i][0];
+                    let row = gy + currentPiece.cells[i][1];
+                    if (row >= 0) drawCellScreen(PF_X + col * CELL, PF_Y + row * CELL, color, 0.3);
+                }
+                
+                // Active piece
+                for (let i = 0; i < 4; i++) {
+                    let col = currentPiece.x + currentPiece.cells[i][0];
+                    let row = currentPiece.y + currentPiece.cells[i][1];
+                    if (row >= 0) drawCellScreen(PF_X + col * CELL, PF_Y + row * CELL, color);
+                }
+            }
+
+            // Border
+            ctx.strokeStyle = '#555555';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(PF_X - 1, PF_Y - 1, PF_W + 2, PF_H + 2);
+        }
+
+        function drawNextPiece() {
+            let nX = 560;
+            let nY = 60;
+
+            ctx.fillStyle = '#AAAAAA';
+            ctx.font = '14px monospace';
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'top';
+            ctx.fillText('NEXT', nX, nY - 20);
+
+            // Preview box
+            ctx.strokeStyle = '#555555';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(nX, nY, 112, 112); // 4x4 cells of 28px
+
+            let nextType = bag.length > 0 ? bag[0] : nextBag[0];
+            if (nextType && currentState !== STATE.IDLE) { // Hide during IDLE
+                let cells = TETROMINOES[nextType].shapes[0]; // State 0
+                let color = TETROMINOES[nextType].color;
+
+                for(let i=0; i<4; i++) {
+                    let cCode = cells[i][0];
+                    let rCode = cells[i][1];
+
+                    // Shift preview visual center based on I/O vs the rest
+                    let offsetC = 1;
+                    let offsetR = 1;
+                    if (nextType === 'I') { offsetC = 0; offsetR = 0; }
+                    if (nextType === 'O') { offsetC = 1; offsetR = 0; }
+
+                    drawCellScreen(nX + (cCode + offsetC) * CELL, nY + (rCode + offsetR) * CELL, color);
+                }
+            }
+        }
+
+        function drawHUD() {
+            const padX = 560;
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'top';
+
+            function drawLabelVal(y, title, val) {
+                ctx.fillStyle = '#AAAAAA';
+                ctx.font = '14px monospace';
+                ctx.fillText(title, padX, y);
+
+                ctx.fillStyle = '#FFFFFF';
+                ctx.font = '20px monospace';
+                ctx.fillText(val.toString(), padX, y + 20);
+            }
+
+            drawLabelVal(200, 'SCORE', score);
+            drawLabelVal(280, 'LEVEL', level);
+            drawLabelVal(340, 'LINES', lines);
+            drawLabelVal(420, 'HIGH SCORE', highScore);
+        }
+
+        function draw() {
+            ctx.fillStyle = '#111111';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            drawDrawPlayfield();
+            drawNextPiece();
+            drawHUD();
+
+            // UI Overlays
+            if (currentState === STATE.IDLE) {
+                ctx.fillStyle = '#FFFFFF';
+                ctx.textAlign = 'center';
+                ctx.font = '48px monospace';
+                ctx.fillText('TETRIS', PF_X + PF_W/2, PF_Y + 150);
+                
+                // Draw 7 piece legends aligned tightly
+                let legendX = PF_X + 28;
+                let legendY = PF_Y + 220;
+                
+                // Manually position 7 mini pieces side by side to meet T14 Acceptance Criteria. Use half scale (14px).
+                const legendCELL = 14;
+                const legDraw = (type, lX, lY) => {
+                    let cells = TETROMINOES[type].shapes[0];
+                    let cHex = TETROMINOES[type].color;
+                    for(let i=0; i<4; i++) {
+                        let c = cells[i][0]; let r = cells[i][1];
+                        ctx.fillStyle = cHex;
+                        ctx.fillRect(lX + c*legendCELL, lY + r*legendCELL, legendCELL, legendCELL);
+                        ctx.strokeStyle = '#000000'; ctx.lineWidth = 1;
+                        ctx.strokeRect(lX + c*legendCELL, lY + r*legendCELL, legendCELL, legendCELL);
+                    }
+                }
+                
+                legDraw('I', PF_X + 20 , legendY);
+                legDraw('O', PF_X + 85, legendY);
+                legDraw('T', PF_X + 135, legendY);
+                legDraw('S', PF_X + 185, legendY);
+                legDraw('Z', PF_X + 90, legendY + 50);
+                legDraw('J', PF_X + 140, legendY + 50);
+                legDraw('L', PF_X + 190, legendY + 50);
+
+                ctx.font = '18px monospace';
+                ctx.fillStyle = '#AAAAAA';
+                ctx.fillText('Press Enter to Start', PF_X + PF_W/2, PF_Y + 420);
+
+            } else if (currentState === STATE.PAUSED) {
+                ctx.fillStyle = 'rgba(0,0,0,0.8)';
+                ctx.fillRect(PF_X, PF_Y, PF_W, PF_H);
+                ctx.fillStyle = '#FFFFFF';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.font = '36px monospace';
+                ctx.fillText('PAUSED', PF_X + PF_W/2, PF_Y + PF_H/2);
+            } else if (currentState === STATE.GAME_OVER) {
+                ctx.fillStyle = 'rgba(0,0,0,0.8)';
+                ctx.fillRect(PF_X, PF_Y, PF_W, PF_H);
+                
+                ctx.fillStyle = '#FFFFFF';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.font = '36px monospace';
+                ctx.fillText('GAME OVER', PF_X + PF_W/2, PF_Y + PF_H/2 - 40);
+                
+                ctx.font = '24px monospace';
+                ctx.fillText(`Score: ${score}`, PF_X + PF_W/2, PF_Y + PF_H/2 + 10);
+                
+                ctx.font = '14px monospace';
+                ctx.fillStyle = '#AAAAAA';
+                ctx.fillText('Press Enter to Restart', PF_X + PF_W/2, PF_Y + PF_H/2 + 60);
+            }
+        }
+
+        function loop(timestamp) {
+            const dt = lastTime ? (timestamp - lastTime) / 1000 : 0;
+            const safeDt = Math.min(dt, 0.1); 
+            lastTime = timestamp;
+
+            update(safeDt);
+            draw();
+
+            requestAnimationFrame(loop);
+        }
+
+        requestAnimationFrame(loop);
+    </script>
+</body>
+</html>

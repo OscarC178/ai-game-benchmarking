@@ -1,0 +1,409 @@
+<!--
+  GAME:      Tetris
+  RUN:       r3-gemini-pro
+  BUILDER:   google/gemini-3-flash-preview
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tetris - Arcade Classic</title>
+    <style>
+        body {
+            background-color: #000;
+            color: #fff;
+            margin: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            overflow: hidden;
+            font-family: 'Courier New', Courier, monospace;
+        }
+        canvas {
+            border: 4px solid #333;
+            background-color: #111;
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="tetris" width="500" height="600"></canvas>
+    <script>
+        const canvas = document.getElementById('tetris');
+        const ctx = canvas.getContext('2d');
+        const COLS = 10;
+        const ROWS = 20;
+        const SIZE = 30;
+
+        // Sound System
+        let audioCtx = null;
+        function initAudio() {
+            if (audioCtx) return;
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+
+        function playSound(freq, duration, type = 'square', ramp = false) {
+            if (!audioCtx) return;
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.type = type;
+            osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+            if (ramp) osc.frequency.exponentialRampToValueAtTime(ramp, audioCtx.currentTime + duration);
+            gain.gain.setValueAtTime(0.05, audioCtx.currentTime);
+            gain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + duration);
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.start();
+            osc.stop(audioCtx.currentTime + duration);
+        }
+
+        // Tetromino Data
+        const PIECES = {
+            'I': { color: '#00FFFF', matrix: [[0,0,0,0],[1,1,1,1],[0,0,0,0],[0,0,0,0]] },
+            'J': { color: '#0000FF', matrix: [[1,0,0],[1,1,1],[0,0,0]] },
+            'L': { color: '#FFA500', matrix: [[0,0,1],[1,1,1],[0,0,0]] },
+            'O': { color: '#FFFF00', matrix: [[1,1],[1,1]] },
+            'S': { color: '#00FF00', matrix: [[0,1,1],[1,1,0],[0,0,0]] },
+            'T': { color: '#800080', matrix: [[0,1,0],[1,1,1],[0,0,0]] },
+            'Z': { color: '#FF0000', matrix: [[1,1,0],[0,1,1],[0,0,0]] }
+        };
+
+        // Game State
+        let board = Array.from({ length: ROWS }, () => Array(COLS).fill(0));
+        let active = null;
+        let next = null;
+        let score = 0;
+        let level = 1;
+        let lines = 0;
+        let gameState = 'STARTUP';
+        let lastTime = 0;
+        let dropInterval = 1000;
+        let dropTimer = 0;
+        let lockTimer = 0;
+
+        // Input DAS logic
+        const keys = {};
+        const dasDelay = 150;
+        const arrRate = 50;
+        let dasTimer = 0;
+        let arrTimer = 0;
+
+        function createPiece(type) {
+            const p = PIECES[type];
+            return {
+                type,
+                color: p.color,
+                matrix: p.matrix.map(row => [...row]),
+                pos: { x: Math.floor(COLS/2) - Math.floor(p.matrix[0].length/2), y: 0 }
+            };
+        }
+
+        function reset() {
+            board = Array.from({ length: ROWS }, () => Array(COLS).fill(0));
+            score = 0;
+            level = 1;
+            lines = 0;
+            dropInterval = 1000;
+            next = createPiece(getRandomType());
+            spawn();
+        }
+
+        function getRandomType() {
+            const types = Object.keys(PIECES);
+            return types[Math.floor(Math.random() * types.length)];
+        }
+
+        function spawn() {
+            active = next;
+            next = createPiece(getRandomType());
+            if (collide(active.matrix, active.pos)) {
+                gameState = 'GAMEOVER';
+                playSound(150, 0.5, 'sawtooth', 50);
+            }
+        }
+
+        function collide(matrix, pos) {
+            for (let y = 0; y < matrix.length; y++) {
+                for (let x = 0; x < matrix[y].length; x++) {
+                    if (matrix[y][x]) {
+                        let bx = pos.x + x;
+                        let by = pos.y + y;
+                        if (bx < 0 || bx >= COLS || by >= ROWS || (by >= 0 && board[by][bx])) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+
+        function rotate() {
+            const m = active.matrix;
+            const nextM = m[0].map((_, i) => m.map(row => row[i]).reverse());
+            // Attempt standard rotation
+            if (!collide(nextM, active.pos)) {
+                active.matrix = nextM;
+                playSound(800, 0.05);
+                return;
+            }
+            // Basic Wall Kicks
+            const kicks = [{x:-1,y:0}, {x:1,y:0}, {x:0,y:-1}];
+            for (let k of kicks) {
+                const nextPos = { x: active.pos.x + k.x, y: active.pos.y + k.y };
+                if (!collide(nextM, nextPos)) {
+                    active.pos = nextPos;
+                    active.matrix = nextM;
+                    playSound(800, 0.05);
+                    return;
+                }
+            }
+        }
+
+        function attemptMove(dir) {
+            if (!collide(active.matrix, { x: active.pos.x + dir, y: active.pos.y })) {
+                active.pos.x += dir;
+                playSound(1000, 0.01, 'sine');
+                return true;
+            }
+            return false;
+        }
+
+        function lock() {
+            active.matrix.forEach((row, y) => {
+                row.forEach((cell, x) => {
+                    if (cell) {
+                        if (active.pos.y + y < 0) return;
+                        board[active.pos.y + y][active.pos.x + x] = active.color;
+                    }
+                });
+            });
+            clearLines();
+            spawn();
+            playSound(200, 0.1, 'sawtooth', 50);
+        }
+
+        function clearLines() {
+            let cleared = 0;
+            for (let y = ROWS - 1; y >= 0; y--) {
+                if (board[y].every(cell => cell !== 0)) {
+                    board.splice(y, 1);
+                    board.unshift(Array(COLS).fill(0));
+                    cleared++;
+                    y++; // check same row again
+                }
+            }
+            if (cleared > 0) {
+                lines += cleared;
+                if (cleared === 1) score += 100 * level;
+                if (cleared === 2) score += 300 * level;
+                if (cleared === 3) score += 500 * level;
+                if (cleared === 4) {
+                    score += 800 * level;
+                    playSound(600, 0.3, 'sine', 1200);
+                } else {
+                    playSound(600, 0.1, 'sine', 800);
+                }
+                const oldLevel = level;
+                level = Math.floor(lines / 10) + 1;
+                if (level > oldLevel) {
+                    dropInterval = Math.max(50, 1000 * Math.pow(0.8, level - 1));
+                }
+            }
+        }
+
+        function drop() {
+            if (!collide(active.matrix, { x: active.pos.x, y: active.pos.y + 1 })) {
+                active.pos.y++;
+                dropTimer = 0;
+                lockTimer = 0;
+                return true;
+            }
+            return false;
+        }
+
+        function hardDrop() {
+            let count = 0;
+            while (drop()) {
+                count++;
+            }
+            score += count * 2;
+            lock();
+        }
+
+        function drawBlock(x, y, color, alpha = 1) {
+            ctx.globalAlpha = alpha;
+            ctx.fillStyle = color;
+            const px = x * SIZE;
+            const py = y * SIZE;
+            ctx.fillRect(px, py, SIZE, SIZE);
+            
+            // Bevel effect
+            ctx.lineWidth = 2;
+            ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+            ctx.beginPath();
+            ctx.moveTo(px, py + SIZE); ctx.lineTo(px, py); ctx.lineTo(px + SIZE, py);
+            ctx.stroke();
+            
+            ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+            ctx.beginPath();
+            ctx.moveTo(px, py + SIZE); ctx.lineTo(px + SIZE, py + SIZE); ctx.lineTo(px + SIZE, py);
+            ctx.stroke();
+            ctx.globalAlpha = 1;
+        }
+
+        function getGhostY() {
+            let y = active.pos.y;
+            while (!collide(active.matrix, { x: active.pos.x, y: y + 1 })) {
+                y++;
+            }
+            return y;
+        }
+
+        function draw() {
+            // Background
+            ctx.fillStyle = '#111';
+            ctx.fillRect(0, 0, 300, 600);
+            
+            // Grid
+            ctx.strokeStyle = '#222';
+            ctx.lineWidth = 1;
+            for(let x=0; x<=COLS; x++) {
+                ctx.beginPath(); ctx.moveTo(x*SIZE, 0); ctx.lineTo(x*SIZE, 600); ctx.stroke();
+            }
+            for(let y=0; y<=ROWS; y++) {
+                ctx.beginPath(); ctx.moveTo(0, y*SIZE); ctx.lineTo(300, y*SIZE); ctx.stroke();
+            }
+
+            // Board
+            board.forEach((row, y) => {
+                row.forEach((cell, x) => {
+                    if (cell) drawBlock(x, y, cell);
+                });
+            });
+
+            if (gameState === 'PLAYING') {
+                // Ghost
+                const gy = getGhostY();
+                active.matrix.forEach((row, y) => {
+                    row.forEach((cell, x) => {
+                        if (cell) drawBlock(active.pos.x + x, gy + y, active.color, 0.2);
+                    });
+                });
+
+                // Active piece
+                active.matrix.forEach((row, y) => {
+                    row.forEach((cell, x) => {
+                        if (cell) drawBlock(active.pos.x + x, active.pos.y + y, active.color);
+                    });
+                });
+            }
+
+            // Sidebar
+            ctx.fillStyle = '#000';
+            ctx.fillRect(300, 0, 200, 600);
+            ctx.textAlign = 'start';
+            ctx.fillStyle = '#fff';
+            ctx.font = '20px "Courier New"';
+            
+            ctx.fillText('NEXT', 330, 50);
+            if (next) {
+                const ox = 330, oy = 70;
+                next.matrix.forEach((row, y) => {
+                    row.forEach((cell, x) => {
+                        if (cell) {
+                            ctx.fillStyle = next.color;
+                            ctx.fillRect(ox + x*20, oy + y*20, 20, 20);
+                            ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+                            ctx.strokeRect(ox + x*20, oy + y*20, 20, 20);
+                        }
+                    });
+                });
+            }
+
+            ctx.fillStyle = '#fff';
+            ctx.fillText(`SCORE: ${score}`, 330, 200);
+            ctx.fillText(`LEVEL: ${level}`, 330, 240);
+            ctx.fillText(`LINES: ${lines}`, 330, 280);
+
+            // Overlays
+            ctx.textAlign = 'center';
+            if (gameState === 'STARTUP') {
+                ctx.fillStyle = 'rgba(0,0,0,0.7)'; ctx.fillRect(0,0,500,600);
+                ctx.fillStyle = '#0FF'; ctx.font = 'bold 40px sans-serif'; ctx.fillText('TETRIS', 250, 200);
+                ctx.fillStyle = '#fff'; ctx.font = '18px monospace';
+                ctx.fillText('PRESS ENTER TO START', 250, 300);
+                ctx.fillText('ARROWS: MOVE & ROTATE', 250, 350);
+                ctx.fillText('SPACE: HARD DROP', 250, 380);
+            }
+            if (gameState === 'GAMEOVER') {
+                ctx.fillStyle = 'rgba(0,0,0,0.85)'; ctx.fillRect(0,0,500,600);
+                ctx.fillStyle = '#F00'; ctx.font = 'bold 40px sans-serif'; ctx.fillText('GAME OVER', 250, 250);
+                ctx.fillStyle = '#fff'; ctx.font = '20px monospace';
+                ctx.fillText(`SCORE: ${score}`, 250, 320);
+                ctx.fillText('PRESS ENTER TO RESTART', 250, 400);
+            }
+        }
+
+        function update(time = 0) {
+            const dt = time - lastTime;
+            lastTime = time;
+
+            if (gameState === 'PLAYING') {
+                // Gravity
+                dropTimer += dt;
+                if (dropTimer > dropInterval) {
+                    if (!drop()) {
+                        lockTimer += dt;
+                        if (lockTimer > 500) lock();
+                    }
+                }
+
+                // DAS logic
+                if (keys['ArrowLeft'] || keys['ArrowRight']) {
+                    dasTimer += dt;
+                    if (dasTimer > dasDelay) {
+                        arrTimer += dt;
+                        if (arrTimer > arrRate) {
+                            attemptMove(keys['ArrowLeft'] ? -1 : 1);
+                            arrTimer = 0;
+                        }
+                    }
+                }
+            }
+
+            draw();
+            requestAnimationFrame(update);
+        }
+
+        window.addEventListener('keydown', e => {
+            if (e.repeat) return;
+            initAudio();
+            keys[e.code] = true;
+
+            if (gameState === 'STARTUP' || gameState === 'GAMEOVER') {
+                if (e.code === 'Enter') {
+                    reset();
+                    gameState = 'PLAYING';
+                }
+                return;
+            }
+
+            if (gameState === 'PLAYING') {
+                if (e.code === 'ArrowLeft') { dasTimer = 0; attemptMove(-1); }
+                if (e.code === 'ArrowRight') { dasTimer = 0; attemptMove(1); }
+                if (e.code === 'ArrowUp') rotate();
+                if (e.code === 'ArrowDown') { score++; drop(); }
+                if (e.code === 'Space') hardDrop();
+            }
+        });
+
+        window.addEventListener('keyup', e => {
+            keys[e.code] = false;
+        });
+
+        requestAnimationFrame(update);
+    </script>
+</body>
+</html>

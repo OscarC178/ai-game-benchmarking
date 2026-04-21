@@ -1,0 +1,494 @@
+<!-- GAME: Galaga | RUN: run4-gpt-isolated | BUILDER: claude-opus-4.6 | PLANNER: openai/gpt-5.4 -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Galaga</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #000; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c" width="800" height="600"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const W = 800, H = 600;
+
+// ── Stars ─────────────────────────────────────────────────────────────────────
+const stars = Array.from({length: 80}, () => ({
+  x: Math.random() * W, y: Math.random() * H,
+  speed: 10 + Math.random() * 20, size: Math.random() > 0.8 ? 2 : 1
+}));
+
+// ── State ─────────────────────────────────────────────────────────────────────
+const S = { IDLE: 0, PLAYING: 1, PAUSED: 2, GAME_OVER: 3 };
+let state = S.IDLE;
+let score = 0, hiScore = parseInt(localStorage.getItem('galaga_hi') || '0');
+let lives = 3, stage = 1;
+let stateTimer = 0;
+
+// ── Player ────────────────────────────────────────────────────────────────────
+let player = { x: 400, y: 550, w: 28, h: 30, speed: 350, dual: false };
+let captured = false;
+let capturedBossIdx = -1;
+
+// ── Bullets ───────────────────────────────────────────────────────────────────
+let playerBullets = [];
+let enemyBullets = [];
+const BULLET_SPEED = 550;
+const ENEMY_BULLET_SPEED = 300;
+const MAX_PLAYER_BULLETS = 2;
+
+// ── Enemies ───────────────────────────────────────────────────────────────────
+// Formation: 10 cols × 5 rows
+const FORM_START_X = 155, FORM_START_Y = 120;
+const FORM_SPACE_X = 50, FORM_SPACE_Y = 44;
+
+// Row types: 0=boss(green), 1=butterfly(red), 2=bee(yellow), 3=bee(yellow), 4=bee(cyan)
+const ROW_DEFS = [
+  { type: 'boss',      color: '#00CC00', color2: '#009900', w: 28, h: 24, pts_form: 150, pts_dive: 400, hp: 2 },
+  { type: 'butterfly', color: '#FF4444', color2: '#CC2222', w: 24, h: 20, pts_form: 80,  pts_dive: 160, hp: 1 },
+  { type: 'bee',       color: '#FFCC00', color2: '#CC9900', w: 20, h: 18, pts_form: 50,  pts_dive: 100, hp: 1 },
+  { type: 'bee',       color: '#FFCC00', color2: '#CC9900', w: 20, h: 18, pts_form: 50,  pts_dive: 100, hp: 1 },
+  { type: 'bee',       color: '#00BBFF', color2: '#0088CC', w: 20, h: 18, pts_form: 50,  pts_dive: 100, hp: 1 },
+];
+
+let enemies = [];
+let swayAngle = 0;
+let diveTimer = 0, diveInterval = 2.5;
+let tractorBeam = null;
+
+function initEnemies() {
+  enemies = [];
+  for (let row = 0; row < 5; row++) {
+    const def = ROW_DEFS[row];
+    for (let col = 0; col < 10; col++) {
+      enemies.push({
+        ...def,
+        row, col,
+        baseX: FORM_START_X + col * FORM_SPACE_X,
+        baseY: FORM_START_Y + row * FORM_SPACE_Y,
+        x: FORM_START_X + col * FORM_SPACE_X,
+        y: FORM_START_Y + row * FORM_SPACE_Y,
+        hp: def.hp,
+        maxHp: def.hp,
+        diving: false,
+        diveAngle: 0,
+        diveX: 0, diveY: 0,
+        diveVX: 0, diveVY: 0,
+        divePhase: 0,
+        fireTimer: 0,
+        capturedShip: false,
+      });
+    }
+  }
+}
+
+// ── Input ─────────────────────────────────────────────────────────────────────
+const keys = {};
+document.addEventListener('keydown', e => {
+  keys[e.key] = true;
+  if (e.key === 'Enter') {
+    if (state === S.IDLE || state === S.GAME_OVER) startGame();
+  }
+  if (e.key === 'p' || e.key === 'P') {
+    if (state === S.PLAYING) state = S.PAUSED;
+    else if (state === S.PAUSED) state = S.PLAYING;
+  }
+  if (e.key === ' ') {
+    if (state === S.PLAYING) firePlayerBullet();
+    e.preventDefault();
+  }
+});
+document.addEventListener('keyup', e => { keys[e.key] = false; });
+
+function firePlayerBullet() {
+  const max = player.dual ? 4 : MAX_PLAYER_BULLETS;
+  if (playerBullets.length >= max) return;
+  playerBullets.push({ x: player.x, y: player.y - 15, w: 3, h: 14 });
+  if (player.dual) playerBullets.push({ x: player.x + 30, y: player.y - 15, w: 3, h: 14 });
+}
+
+// ── Start / Reset ─────────────────────────────────────────────────────────────
+function startGame() {
+  score = 0; lives = 3; stage = 1;
+  player.x = 400; player.y = 550; player.dual = false;
+  captured = false; capturedBossIdx = -1;
+  playerBullets = []; enemyBullets = [];
+  tractorBeam = null;
+  diveTimer = 0; diveInterval = 2.5;
+  initEnemies();
+  state = S.PLAYING;
+}
+
+function nextStage() {
+  stage++;
+  diveInterval = Math.max(1.0, 2.5 - stage * 0.2);
+  playerBullets = []; enemyBullets = [];
+  tractorBeam = null;
+  initEnemies();
+}
+
+// ── Update ────────────────────────────────────────────────────────────────────
+function update(dt) {
+  if (state !== S.PLAYING) return;
+
+  // Stars
+  stars.forEach(s => { s.y += s.speed * dt; if (s.y > H) { s.y = 0; s.x = Math.random() * W; } });
+
+  // Player move
+  if (keys['ArrowLeft'] || keys['a'] || keys['A']) player.x -= player.speed * dt;
+  if (keys['ArrowRight'] || keys['d'] || keys['D']) player.x += player.speed * dt;
+  const pw = player.dual ? 60 : 28;
+  player.x = Math.max(pw / 2, Math.min(W - pw / 2, player.x));
+
+  // Auto fire
+  if (keys[' ']) { /* handled by keydown */ }
+
+  // Sway formation
+  swayAngle += dt * Math.PI * 2 * 0.5; // 0.5Hz
+  const sway = Math.sin(swayAngle) * 20;
+
+  // Update enemies
+  const aliveEnemies = enemies.filter(e => e.hp > 0);
+  if (aliveEnemies.length === 0) { nextStage(); return; }
+
+  enemies.forEach(e => {
+    if (e.hp <= 0) return;
+
+    if (!e.diving) {
+      e.x = e.baseX + sway;
+      e.y = e.baseY;
+    } else {
+      // Dive movement — curved path using angle
+      e.divePhase += dt;
+      const t = e.divePhase;
+      const curveX = e.diveX + Math.sin(t * 2) * 80;
+      const curveY = e.diveY + t * 200;
+      e.x = curveX;
+      e.y = curveY;
+      e.diveVX = (curveX - e.x);
+      e.diveVY = 200;
+
+      // Fire during dive
+      e.fireTimer -= dt;
+      if (e.fireTimer <= 0) {
+        e.fireTimer = 1 + Math.random();
+        const angle = Math.atan2(player.y - e.y, player.x - e.x);
+        enemyBullets.push({ x: e.x, y: e.y, vx: Math.cos(angle) * ENEMY_BULLET_SPEED, vy: Math.sin(angle) * ENEMY_BULLET_SPEED, w: 3, h: 10 });
+      }
+
+      // Boss tractor beam
+      if (e.type === 'boss' && tractorBeam && tractorBeam.bossIdx === enemies.indexOf(e)) {
+        tractorBeam.x = e.x;
+        tractorBeam.y = e.y;
+        // Check player in beam
+        if (!captured) {
+          const beamLeft = tractorBeam.x - 20, beamRight = tractorBeam.x + 20;
+          const beamTop = tractorBeam.y, beamBottom = tractorBeam.y + 200;
+          if (player.x > beamLeft && player.x < beamRight && player.y > beamTop && player.y < beamBottom) {
+            tractorBeam.captureTimer = (tractorBeam.captureTimer || 0) + dt;
+            if (tractorBeam.captureTimer > 1.5) {
+              captured = true;
+              capturedBossIdx = enemies.indexOf(e);
+              e.capturedShip = true;
+              tractorBeam = null;
+              lives = Math.max(0, lives - 1);
+              if (lives <= 0) { state = S.GAME_OVER; return; }
+            }
+          }
+        }
+      }
+
+      // Off screen — return to formation
+      if (e.y > H + 50) {
+        e.diving = false;
+        e.x = e.baseX;
+        e.y = e.baseY;
+        if (tractorBeam && tractorBeam.bossIdx === enemies.indexOf(e)) tractorBeam = null;
+      }
+    }
+  });
+
+  // Trigger dives
+  diveTimer += dt;
+  if (diveTimer >= diveInterval) {
+    diveTimer = 0;
+    const available = enemies.filter(e => e.hp > 0 && !e.diving);
+    const count = Math.min(1 + Math.floor(Math.random() * 3), available.length);
+    for (let i = 0; i < count; i++) {
+      const e = available[Math.floor(Math.random() * available.length)];
+      available.splice(available.indexOf(e), 1);
+      e.diving = true;
+      e.diveX = e.x;
+      e.diveY = e.y;
+      e.divePhase = 0;
+      e.fireTimer = 0.5 + Math.random();
+      // Boss capture attack
+      if (e.type === 'boss' && !captured && !tractorBeam && Math.random() < 0.3) {
+        tractorBeam = { x: e.x, y: e.y, bossIdx: enemies.indexOf(e), captureTimer: 0 };
+      }
+    }
+  }
+
+  // Player bullets
+  playerBullets = playerBullets.filter(b => { b.y -= BULLET_SPEED * dt; return b.y > -20; });
+
+  // Enemy bullets
+  enemyBullets.forEach(b => { b.x += b.vx * dt; b.y += b.vy * dt; });
+  enemyBullets = enemyBullets.filter(b => b.y < H + 20 && b.x > -20 && b.x < W + 20);
+
+  // Player bullet ↔ enemy collisions
+  playerBullets = playerBullets.filter(pb => {
+    for (let i = 0; i < enemies.length; i++) {
+      const e = enemies[i];
+      if (e.hp <= 0) continue;
+      if (pb.x > e.x - e.w/2 && pb.x < e.x + e.w/2 && pb.y < e.y + e.h/2 && pb.y + pb.h > e.y - e.h/2) {
+        e.hp--;
+        if (e.hp <= 0) {
+          score += e.diving ? e.pts_dive : e.pts_form;
+          // Rescue check
+          if (i === capturedBossIdx && captured) {
+            captured = false; capturedBossIdx = -1; e.capturedShip = false;
+            player.dual = true;
+          }
+          if (score > hiScore) { hiScore = score; localStorage.setItem('galaga_hi', hiScore); }
+        }
+        return false;
+      }
+    }
+    return true;
+  });
+
+  // Enemy bullet ↔ player
+  const phw = player.dual ? 44 : 14;
+  enemyBullets = enemyBullets.filter(eb => {
+    if (eb.x > player.x - phw && eb.x < player.x + phw && eb.y > player.y - 15 && eb.y < player.y + 15) {
+      playerHit(); return false;
+    }
+    return true;
+  });
+
+  // Diving enemy ↔ player collision
+  enemies.forEach(e => {
+    if (!e.diving || e.hp <= 0) return;
+    if (Math.abs(e.x - player.x) < phw + e.w/2 && Math.abs(e.y - player.y) < 20 + e.h/2) {
+      e.hp = 0;
+      playerHit();
+    }
+  });
+}
+
+function playerHit() {
+  lives--;
+  if (lives <= 0) { state = S.GAME_OVER; hiScore = Math.max(hiScore, score); localStorage.setItem('galaga_hi', hiScore); }
+  player.dual = false;
+}
+
+// ── Draw ──────────────────────────────────────────────────────────────────────
+function drawShip(x, y, color, dual) {
+  ctx.fillStyle = color;
+  if (!dual) {
+    // Fighter silhouette
+    ctx.beginPath();
+    ctx.moveTo(x, y - 15);
+    ctx.lineTo(x - 14, y + 15);
+    ctx.lineTo(x - 6, y + 8);
+    ctx.lineTo(x, y + 12);
+    ctx.lineTo(x + 6, y + 8);
+    ctx.lineTo(x + 14, y + 15);
+    ctx.closePath();
+    ctx.fill();
+    // Cockpit
+    ctx.fillStyle = '#88CCFF';
+    ctx.beginPath(); ctx.ellipse(x, y - 2, 4, 6, 0, 0, Math.PI * 2); ctx.fill();
+  } else {
+    // Dual ship
+    for (let side of [-16, 16]) {
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.moveTo(x + side, y - 15);
+      ctx.lineTo(x + side - 12, y + 15);
+      ctx.lineTo(x + side - 5, y + 8);
+      ctx.lineTo(x + side, y + 12);
+      ctx.lineTo(x + side + 5, y + 8);
+      ctx.lineTo(x + side + 12, y + 15);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+}
+
+function drawEnemy(e) {
+  if (e.hp <= 0) return;
+  const damaged = e.maxHp > 1 && e.hp < e.maxHp;
+  const color = damaged ? '#FF8800' : e.color;
+
+  ctx.fillStyle = color;
+  if (e.type === 'boss') {
+    // Insect shape
+    ctx.beginPath();
+    ctx.ellipse(e.x, e.y, e.w/2, e.h/2, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = damaged ? '#FFCC44' : e.color2;
+    ctx.beginPath();
+    ctx.ellipse(e.x, e.y - 4, e.w/4, e.h/4, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // Wings
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.ellipse(e.x - e.w/2 - 4, e.y, 8, 5, -0.5, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(e.x + e.w/2 + 4, e.y, 8, 5, 0.5, 0, Math.PI * 2); ctx.fill();
+    if (e.capturedShip) {
+      // Tiny captured ship below boss
+      ctx.fillStyle = '#AAAAFF';
+      ctx.beginPath();
+      ctx.moveTo(e.x, e.y + 16);
+      ctx.lineTo(e.x - 8, e.y + 26);
+      ctx.lineTo(e.x + 8, e.y + 26);
+      ctx.closePath();
+      ctx.fill();
+    }
+  } else if (e.type === 'butterfly') {
+    ctx.beginPath();
+    ctx.ellipse(e.x, e.y, e.w/2, e.h/2, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = e.color2;
+    ctx.beginPath();
+    ctx.ellipse(e.x - e.w/2 - 2, e.y - 2, 7, 5, -0.3, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(e.x + e.w/2 + 2, e.y - 2, 7, 5, 0.3, 0, Math.PI * 2); ctx.fill();
+  } else {
+    // Bee
+    ctx.beginPath();
+    ctx.ellipse(e.x, e.y, e.w/2, e.h/2, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(e.x - e.w/2, e.y - 2, e.w, 3);
+  }
+}
+
+function draw() {
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(0, 0, W, H);
+
+  // Stars
+  stars.forEach(s => {
+    ctx.fillStyle = `rgba(255,255,255,${0.4 + s.size * 0.3})`;
+    ctx.fillRect(s.x, s.y, s.size, s.size);
+  });
+
+  if (state === S.IDLE) {
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#FFCC00';
+    ctx.font = 'bold 56px monospace';
+    ctx.fillText('GALAGA', W/2, 200);
+    const legend = [
+      { color:'#00CC00', name:'Boss Galaga (2 hits)' },
+      { color:'#FF4444', name:'Butterfly' },
+      { color:'#FFCC00', name:'Bee' },
+    ];
+    legend.forEach((l, i) => {
+      ctx.fillStyle = l.color;
+      ctx.font = '18px monospace';
+      ctx.fillText('◆ ' + l.name, W/2, 290 + i * 34);
+    });
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = '22px monospace';
+    ctx.fillText('Press Enter to Start', W/2, 420);
+    ctx.textAlign = 'left';
+    return;
+  }
+
+  // Enemies
+  enemies.forEach(drawEnemy);
+
+  // Tractor beam
+  if (tractorBeam) {
+    const alpha = 0.3 + 0.2 * Math.sin(Date.now() / 100);
+    ctx.fillStyle = `rgba(0,255,0,${alpha})`;
+    ctx.fillRect(tractorBeam.x - 20, tractorBeam.y, 40, 200);
+    ctx.strokeStyle = `rgba(0,255,100,${alpha + 0.2})`;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(tractorBeam.x - 20, tractorBeam.y, 40, 200);
+  }
+
+  // Player bullets
+  ctx.fillStyle = '#FFFFFF';
+  playerBullets.forEach(b => ctx.fillRect(b.x - 1.5, b.y, 3, 14));
+
+  // Enemy bullets
+  ctx.fillStyle = '#FF6666';
+  enemyBullets.forEach(b => ctx.fillRect(b.x - 1.5, b.y, 3, 10));
+
+  // Player ship
+  if (!captured || lives > 0) {
+    drawShip(player.x, player.y, '#FFFFFF', player.dual);
+  }
+
+  // HUD
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = '16px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText('Score: ' + score, 10, 22);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#FFCC00';
+  ctx.fillText('Best: ' + hiScore, W/2, 22);
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#AAAAAA';
+  ctx.font = '14px monospace';
+  ctx.fillText('Stage ' + stage, W - 10, H - 10);
+  ctx.textAlign = 'left';
+
+  // Lives
+  for (let i = 0; i < lives; i++) {
+    const lx = 14 + i * 26, ly = H - 24;
+    ctx.fillStyle = '#FFFFFF';
+    ctx.beginPath();
+    ctx.moveTo(lx, ly - 10);
+    ctx.lineTo(lx - 10, ly + 8);
+    ctx.lineTo(lx + 10, ly + 8);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  if (state === S.PAUSED) {
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = '36px monospace';
+    ctx.fillText('PAUSED', W/2, H/2);
+    ctx.textAlign = 'left';
+  }
+
+  if (state === S.GAME_OVER) {
+    ctx.fillStyle = 'rgba(0,0,0,0.75)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#FF4444';
+    ctx.font = 'bold 48px monospace';
+    ctx.fillText('GAME OVER', W/2, 260);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = '24px monospace';
+    ctx.fillText('Score: ' + score, W/2, 320);
+    ctx.fillText('Press Enter to Restart', W/2, 380);
+    ctx.textAlign = 'left';
+  }
+}
+
+// ── Loop ──────────────────────────────────────────────────────────────────────
+let lastTime = 0;
+function loop(ts) {
+  const dt = Math.min((ts - lastTime) / 1000, 0.05);
+  lastTime = ts;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(t => { lastTime = t; requestAnimationFrame(loop); });
+</script>
+</body>
+</html>

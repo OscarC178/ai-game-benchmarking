@@ -1,0 +1,597 @@
+<!-- REBUILT by Ross — replacing low-score build -->
+<!-- Tetris | spec:run5-opus-gemini | built-by:ross-subagent -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Tetris</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #111111; display: flex; justify-content: center; align-items: center; height: 100vh; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c" width="800" height="600"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+const COLS = 10, ROWS = 20, CELL = 28;
+const PF_X = 240, PF_Y = 10;
+const PF_W = COLS * CELL, PF_H = ROWS * CELL;
+
+const COLORS = {
+  I:'#00FFFF', O:'#FFFF00', T:'#AA00FF',
+  S:'#00FF00', Z:'#FF0000', J:'#0000FF', L:'#FF8800'
+};
+
+// Tetromino shapes — each rotation state as array of [col,row] offsets
+const PIECES = {
+  I: [
+    [[0,1],[1,1],[2,1],[3,1]],
+    [[2,0],[2,1],[2,2],[2,3]],
+    [[0,2],[1,2],[2,2],[3,2]],
+    [[1,0],[1,1],[1,2],[1,3]]
+  ],
+  O: [
+    [[1,0],[2,0],[1,1],[2,1]],
+    [[1,0],[2,0],[1,1],[2,1]],
+    [[1,0],[2,0],[1,1],[2,1]],
+    [[1,0],[2,0],[1,1],[2,1]]
+  ],
+  T: [
+    [[1,0],[0,1],[1,1],[2,1]],
+    [[1,0],[1,1],[2,1],[1,2]],
+    [[0,1],[1,1],[2,1],[1,2]],
+    [[1,0],[0,1],[1,1],[1,2]]
+  ],
+  S: [
+    [[1,0],[2,0],[0,1],[1,1]],
+    [[1,0],[1,1],[2,1],[2,2]],
+    [[1,1],[2,1],[0,2],[1,2]],
+    [[0,0],[0,1],[1,1],[1,2]]
+  ],
+  Z: [
+    [[0,0],[1,0],[1,1],[2,1]],
+    [[2,0],[1,1],[2,1],[1,2]],
+    [[0,1],[1,1],[1,2],[2,2]],
+    [[1,0],[0,1],[1,1],[0,2]]
+  ],
+  J: [
+    [[0,0],[0,1],[1,1],[2,1]],
+    [[1,0],[2,0],[1,1],[1,2]],
+    [[0,1],[1,1],[2,1],[2,2]],
+    [[1,0],[1,1],[0,2],[1,2]]
+  ],
+  L: [
+    [[2,0],[0,1],[1,1],[2,1]],
+    [[1,0],[1,1],[1,2],[2,2]],
+    [[0,1],[1,1],[2,1],[0,2]],
+    [[0,0],[1,0],[1,1],[1,2]]
+  ]
+};
+
+const PIECE_TYPES = ['I','O','T','S','Z','J','L'];
+
+// Wall kick data (SRS-like) for standard pieces
+const WALL_KICKS = [
+  [[0,0],[-1,0],[1,0],[0,-1],[-1,-1],[1,-1]], // standard
+];
+const I_KICKS = [
+  [[0,0],[-2,0],[1,0],[-2,-1],[1,2]], // 0->R, R->0
+  [[0,0],[-1,0],[2,0],[-1,2],[2,-1]], // R->2, 2->R
+  [[0,0],[2,0],[-1,0],[2,1],[-1,-2]], // 2->L, L->2
+  [[0,0],[1,0],[-2,0],[1,-2],[-2,1]], // L->0, 0->L
+];
+
+// ─── Game State ──────────────────────────────────────────────────────────────
+let state = 'IDLE'; // IDLE, PLAYING, PAUSED, GAME_OVER
+let board = [];
+let currentPiece = null;
+let nextType = null;
+let bag = [];
+let score = 0, level = 1, lines = 0, highScore = 0;
+let gravityTimer = 0;
+let lockTimer = 0, lockResets = 0;
+let isLocking = false;
+let clearFlash = null; // {rows, timer}
+let flashPhase = false;
+let lastTime = 0;
+
+// ─── 7-Bag Randomizer ────────────────────────────────────────────────────────
+function refillBag() {
+  bag = [...PIECE_TYPES];
+  for (let i = bag.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [bag[i], bag[j]] = [bag[j], bag[i]];
+  }
+}
+
+function nextFromBag() {
+  if (bag.length === 0) refillBag();
+  return bag.pop();
+}
+
+// ─── Board Helpers ───────────────────────────────────────────────────────────
+function createBoard() {
+  return Array.from({length: ROWS}, () => Array(COLS).fill(null));
+}
+
+function getCells(type, rot, col, row) {
+  return PIECES[type][rot].map(([dc, dr]) => [col + dc, row + dr]);
+}
+
+function isValid(type, rot, col, row) {
+  const cells = getCells(type, rot, col, row);
+  for (const [c, r] of cells) {
+    if (c < 0 || c >= COLS || r >= ROWS) return false;
+    if (r >= 0 && board[r][c]) return false;
+  }
+  return true;
+}
+
+function lockPiece() {
+  const {type, rot, col, row} = currentPiece;
+  const cells = getCells(type, rot, col, row);
+  for (const [c, r] of cells) {
+    if (r >= 0) board[r][c] = type;
+  }
+  // Check line clears
+  checkLines();
+  spawnPiece();
+}
+
+function checkLines() {
+  const fullRows = [];
+  for (let r = 0; r < ROWS; r++) {
+    if (board[r].every(c => c !== null)) fullRows.push(r);
+  }
+  if (fullRows.length > 0) {
+    clearFlash = {rows: fullRows, timer: 100};
+    flashPhase = true;
+    // Score
+    const multipliers = [0, 100, 300, 500, 800];
+    score += (multipliers[fullRows.length] || 800) * level;
+    lines += fullRows.length;
+    level = Math.floor(lines / 10) + 1;
+    if (score > highScore) {
+      highScore = score;
+      localStorage.setItem('tetris_hi', highScore);
+    }
+  }
+}
+
+function clearLines(rows) {
+  rows.sort((a, b) => b - a);
+  for (const r of rows) {
+    board.splice(r, 1);
+    board.unshift(Array(COLS).fill(null));
+  }
+}
+
+function spawnPiece() {
+  const type = nextType || nextFromBag();
+  nextType = nextFromBag();
+  const startCol = 3;
+  const startRow = 0;
+  if (!isValid(type, 0, startCol, startRow)) {
+    state = 'GAME_OVER';
+    if (score > highScore) {
+      highScore = score;
+      localStorage.setItem('tetris_hi', highScore);
+    }
+    return;
+  }
+  currentPiece = {type, rot: 0, col: startCol, row: startRow};
+  gravityTimer = 0;
+  isLocking = false;
+  lockTimer = 0;
+  lockResets = 0;
+}
+
+// ─── Ghost Piece ─────────────────────────────────────────────────────────────
+function getGhostRow() {
+  const {type, rot, col, row} = currentPiece;
+  let ghostRow = row;
+  while (isValid(type, rot, col, ghostRow + 1)) ghostRow++;
+  return ghostRow;
+}
+
+// ─── Controls ────────────────────────────────────────────────────────────────
+const keys = {};
+document.addEventListener('keydown', e => {
+  const k = e.key;
+  if (keys[k]) return; // already held
+  keys[k] = true;
+
+  if (k === 'Enter') {
+    if (state === 'IDLE' || state === 'GAME_OVER') startGame();
+    return;
+  }
+  if (k === 'p' || k === 'P') {
+    if (state === 'PLAYING') state = 'PAUSED';
+    else if (state === 'PAUSED') state = 'PLAYING';
+    return;
+  }
+  if (state !== 'PLAYING') return;
+
+  if (k === 'ArrowLeft' || k === 'a' || k === 'A') movePiece(-1);
+  if (k === 'ArrowRight' || k === 'd' || k === 'D') movePiece(1);
+  if (k === 'ArrowDown' || k === 's' || k === 'S') softDrop();
+  if (k === 'ArrowUp' || k === 'w' || k === 'W') rotatePiece(1);
+  if (k === 'z' || k === 'Z') rotatePiece(-1);
+  if (k === ' ') hardDrop();
+});
+document.addEventListener('keyup', e => { keys[e.key] = false; });
+
+let softDropActive = false;
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowDown' || e.key === 's' || e.key === 'S') softDropActive = true;
+});
+document.addEventListener('keyup', e => {
+  if (e.key === 'ArrowDown' || e.key === 's' || e.key === 'S') softDropActive = false;
+});
+
+function movePiece(dx) {
+  const {type, rot, col, row} = currentPiece;
+  if (isValid(type, rot, col + dx, row)) {
+    currentPiece.col += dx;
+    if (isLocking) { lockTimer = 0; lockResets++; }
+  }
+}
+
+function rotatePiece(dir) {
+  const {type, rot, col, row} = currentPiece;
+  const newRot = (rot + dir + 4) % 4;
+  // Wall kicks
+  const kicks = type === 'I' ? 
+    [[0,0],[-1,0],[2,0],[-1,-2],[2,1]] : 
+    [[0,0],[-1,0],[1,0],[0,-1],[-1,-1],[1,-1]];
+  for (const [dx, dy] of kicks) {
+    if (isValid(type, newRot, col + dx, row + dy)) {
+      currentPiece.rot = newRot;
+      currentPiece.col = col + dx;
+      currentPiece.row = row + dy;
+      if (isLocking && lockResets < 3) { lockTimer = 0; lockResets++; }
+      return;
+    }
+  }
+}
+
+function softDrop() {
+  const {type, rot, col, row} = currentPiece;
+  if (isValid(type, rot, col, row + 1)) {
+    currentPiece.row++;
+    score++;
+  }
+}
+
+function hardDrop() {
+  const {type, rot, col, row} = currentPiece;
+  const ghost = getGhostRow();
+  score += (ghost - row) * 2;
+  currentPiece.row = ghost;
+  lockPiece();
+}
+
+// ─── Game Init ───────────────────────────────────────────────────────────────
+function startGame() {
+  board = createBoard();
+  score = 0; level = 1; lines = 0;
+  highScore = parseInt(localStorage.getItem('tetris_hi') || '0');
+  bag = [];
+  refillBag();
+  nextType = nextFromBag();
+  clearFlash = null;
+  gravityTimer = 0;
+  isLocking = false;
+  lockTimer = 0;
+  lockResets = 0;
+  spawnPiece();
+  state = 'PLAYING';
+}
+
+// ─── Update ──────────────────────────────────────────────────────────────────
+function getGravityInterval() {
+  return Math.max(100, 1000 - 75 * (level - 1));
+}
+
+function update(dt) {
+  if (state !== 'PLAYING') return;
+  if (clearFlash) {
+    clearFlash.timer -= dt * 1000;
+    if (clearFlash.timer <= 0) {
+      clearLines(clearFlash.rows);
+      clearFlash = null;
+      spawnPiece();
+    }
+    return; // Pause gravity during flash
+  }
+
+  const interval = softDropActive ? 50 : getGravityInterval();
+  gravityTimer += dt * 1000;
+
+  if (!currentPiece) return;
+
+  const {type, rot, col, row} = currentPiece;
+  const canFall = isValid(type, rot, col, row + 1);
+
+  if (canFall) {
+    isLocking = false;
+    lockTimer = 0;
+    if (gravityTimer >= interval) {
+      gravityTimer -= interval;
+      currentPiece.row++;
+      if (softDropActive) score++;
+    }
+  } else {
+    // On ground
+    isLocking = true;
+    lockTimer += dt * 1000;
+    if (lockTimer >= 500) {
+      lockPiece();
+    }
+  }
+}
+
+// ─── Rendering ───────────────────────────────────────────────────────────────
+function hexAlpha(hex, alpha) {
+  const r = parseInt(hex.slice(1,3),16);
+  const g = parseInt(hex.slice(3,5),16);
+  const b = parseInt(hex.slice(5,7),16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+function drawCell(x, y, color, alpha=1) {
+  const px = PF_X + x * CELL;
+  const py = PF_Y + y * CELL;
+  ctx.fillStyle = alpha < 1 ? hexAlpha(color, alpha) : color;
+  ctx.fillRect(px + 1, py + 1, CELL - 2, CELL - 2);
+  // 3D border highlight
+  if (alpha >= 1) {
+    ctx.fillStyle = 'rgba(255,255,255,0.25)';
+    ctx.fillRect(px + 1, py + 1, CELL - 2, 3);
+    ctx.fillRect(px + 1, py + 1, 3, CELL - 2);
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.fillRect(px + CELL - 4, py + 1, 3, CELL - 2);
+    ctx.fillRect(px + 1, py + CELL - 4, CELL - 2, 3);
+  }
+}
+
+function drawBoard() {
+  // Background
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(PF_X, PF_Y, PF_W, PF_H);
+  // Grid lines
+  ctx.strokeStyle = '#333333';
+  ctx.lineWidth = 1;
+  for (let c = 0; c <= COLS; c++) {
+    ctx.beginPath();
+    ctx.moveTo(PF_X + c * CELL, PF_Y);
+    ctx.lineTo(PF_X + c * CELL, PF_Y + PF_H);
+    ctx.stroke();
+  }
+  for (let r = 0; r <= ROWS; r++) {
+    ctx.beginPath();
+    ctx.moveTo(PF_X, PF_Y + r * CELL);
+    ctx.lineTo(PF_X + PF_W, PF_Y + r * CELL);
+    ctx.stroke();
+  }
+  // Border
+  ctx.strokeStyle = '#555555';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(PF_X, PF_Y, PF_W, PF_H);
+}
+
+function drawBoardCells() {
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      if (board[r][c]) {
+        // Flash effect
+        if (clearFlash && clearFlash.rows.includes(r)) {
+          const t = clearFlash.timer / 100;
+          const flashColor = t > 0.5 ? '#FFFFFF' : COLORS[board[r][c]];
+          drawCell(c, r, flashColor);
+        } else {
+          drawCell(c, r, COLORS[board[r][c]]);
+        }
+      }
+    }
+  }
+}
+
+function drawPiece(type, rot, col, row, alpha=1) {
+  const cells = getCells(type, rot, col, row);
+  for (const [c, r] of cells) {
+    if (r >= 0) drawCell(c, r, COLORS[type], alpha);
+  }
+}
+
+function drawGhost() {
+  if (!currentPiece) return;
+  const {type, rot, col} = currentPiece;
+  const ghostRow = getGhostRow();
+  const cells = getCells(type, rot, col, ghostRow);
+  for (const [c, r] of cells) {
+    if (r >= 0) {
+      const px = PF_X + c * CELL;
+      const py = PF_Y + r * CELL;
+      ctx.strokeStyle = hexAlpha(COLORS[type], 0.5);
+      ctx.lineWidth = 2;
+      ctx.strokeRect(px + 1, py + 1, CELL - 2, CELL - 2);
+      ctx.fillStyle = hexAlpha(COLORS[type], 0.15);
+      ctx.fillRect(px + 1, py + 1, CELL - 2, CELL - 2);
+    }
+  }
+}
+
+function drawNextPiece() {
+  const nx = 560, ny = 60;
+  ctx.strokeStyle = '#555555';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(nx, ny, 112, 112);
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(nx, ny, 112, 112);
+  ctx.fillStyle = '#AAAAAA';
+  ctx.font = '14px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText('NEXT', nx, ny - 8);
+
+  if (!nextType) return;
+  const rot = 0;
+  const cells = PIECES[nextType][rot];
+  const minC = Math.min(...cells.map(c=>c[0]));
+  const maxC = Math.max(...cells.map(c=>c[0]));
+  const minR = Math.min(...cells.map(c=>c[1]));
+  const maxR = Math.max(...cells.map(c=>c[1]));
+  const pw = (maxC - minC + 1) * CELL;
+  const ph = (maxR - minR + 1) * CELL;
+  const ox = nx + (112 - pw) / 2;
+  const oy = ny + (112 - ph) / 2;
+  for (const [dc, dr] of cells) {
+    const px = ox + (dc - minC) * CELL;
+    const py = oy + (dr - minR) * CELL;
+    ctx.fillStyle = COLORS[nextType];
+    ctx.fillRect(px + 1, py + 1, CELL - 2, CELL - 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.25)';
+    ctx.fillRect(px + 1, py + 1, CELL - 2, 3);
+    ctx.fillRect(px + 1, py + 1, 3, CELL - 2);
+  }
+}
+
+function drawHUD() {
+  ctx.textAlign = 'left';
+  // Score
+  ctx.fillStyle = '#AAAAAA';
+  ctx.font = '14px monospace';
+  ctx.fillText('SCORE', 560, 200);
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = '20px monospace';
+  ctx.fillText(score, 560, 220);
+  // Level
+  ctx.fillStyle = '#AAAAAA';
+  ctx.font = '14px monospace';
+  ctx.fillText('LEVEL', 560, 280);
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = '20px monospace';
+  ctx.fillText(level, 560, 300);
+  // Lines
+  ctx.fillStyle = '#AAAAAA';
+  ctx.font = '14px monospace';
+  ctx.fillText('LINES', 560, 340);
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = '20px monospace';
+  ctx.fillText(lines, 560, 360);
+  // High Score
+  ctx.fillStyle = '#AAAAAA';
+  ctx.font = '14px monospace';
+  ctx.fillText('BEST', 560, 420);
+  ctx.fillStyle = '#FFFF00';
+  ctx.font = '18px monospace';
+  ctx.fillText(highScore, 560, 440);
+}
+
+function drawStartScreen() {
+  ctx.fillStyle = '#111111';
+  ctx.fillRect(0, 0, 800, 600);
+  // Playfield bg
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(PF_X, PF_Y, PF_W, PF_H);
+  ctx.strokeStyle = '#555555';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(PF_X, PF_Y, PF_W, PF_H);
+  // Title
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = 'bold 48px monospace';
+  ctx.fillText('TETRIS', PF_X + PF_W/2, PF_Y + 160);
+  // Show piece preview
+  const previewTypes = ['I','O','T','S','Z','J','L'];
+  const startX = PF_X + 20;
+  let px = startX;
+  let py = PF_Y + 220;
+  for (const t of previewTypes) {
+    const cells = PIECES[t][0];
+    const minC = Math.min(...cells.map(c=>c[0]));
+    for (const [dc, dr] of cells) {
+      const cx = PF_X + 14 + (px + (dc - minC)) * 16 - (previewTypes.indexOf(t) * 0);
+      // simplified: just draw color blocks
+    }
+  }
+  // Draw pieces in a row
+  let ox = PF_X + 10;
+  for (const t of previewTypes) {
+    const cells = PIECES[t][0];
+    const minC = Math.min(...cells.map(c=>c[0]));
+    const minR = Math.min(...cells.map(c=>c[1]));
+    for (const [dc, dr] of cells) {
+      const sx = ox + (dc - minC) * 18;
+      const sy = py + (dr - minR) * 18;
+      ctx.fillStyle = COLORS[t];
+      ctx.fillRect(sx, sy, 16, 16);
+    }
+    ox += 40;
+  }
+  // Prompt
+  ctx.fillStyle = '#AAAAAA';
+  ctx.font = '18px monospace';
+  ctx.fillText('Press Enter to Start', PF_X + PF_W/2, PF_Y + 380);
+}
+
+function drawGameOver() {
+  ctx.fillStyle = 'rgba(0,0,0,0.75)';
+  ctx.fillRect(PF_X, PF_Y, PF_W, PF_H);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = 'bold 36px monospace';
+  ctx.fillText('GAME OVER', PF_X + PF_W/2, PF_Y + PF_H/2 - 60);
+  ctx.font = '20px monospace';
+  ctx.fillText('Score: ' + score, PF_X + PF_W/2, PF_Y + PF_H/2 - 20);
+  ctx.fillStyle = '#AAAAAA';
+  ctx.font = '16px monospace';
+  ctx.fillText('Press Enter to Restart', PF_X + PF_W/2, PF_Y + PF_H/2 + 20);
+}
+
+function drawPaused() {
+  ctx.fillStyle = 'rgba(0,0,0,0.75)';
+  ctx.fillRect(PF_X, PF_Y, PF_W, PF_H);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = 'bold 36px monospace';
+  ctx.fillText('PAUSED', PF_X + PF_W/2, PF_Y + PF_H/2);
+}
+
+// ─── Main Loop ───────────────────────────────────────────────────────────────
+function loop(ts) {
+  const dt = Math.min((ts - lastTime) / 1000, 0.1);
+  lastTime = ts;
+
+  ctx.fillStyle = '#111111';
+  ctx.fillRect(0, 0, 800, 600);
+
+  if (state === 'IDLE') {
+    drawStartScreen();
+  } else if (state === 'PLAYING' || state === 'PAUSED' || state === 'GAME_OVER') {
+    update(dt);
+    drawBoard();
+    drawBoardCells();
+    if (currentPiece && state === 'PLAYING') {
+      drawGhost();
+      drawPiece(currentPiece.type, currentPiece.rot, currentPiece.col, currentPiece.row);
+    }
+    drawNextPiece();
+    drawHUD();
+    if (state === 'PAUSED') drawPaused();
+    if (state === 'GAME_OVER') drawGameOver();
+  }
+
+  requestAnimationFrame(loop);
+}
+
+highScore = parseInt(localStorage.getItem('tetris_hi') || '0');
+requestAnimationFrame(ts => { lastTime = ts; requestAnimationFrame(loop); });
+</script>
+</body>
+</html>

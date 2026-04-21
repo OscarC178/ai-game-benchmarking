@@ -1,0 +1,976 @@
+<!--
+  GAME:      Frogger
+  RUN:       r3-gemini-pro
+  BUILDER:   z-ai/glm-5
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Frogger</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      background: #000;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      overflow: hidden;
+    }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <script>
+    // ==================== CONSTANTS ====================
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    
+    const W = 600;
+    const H = 650;
+    canvas.width = W;
+    canvas.height = H;
+    
+    const CELL_H = 40;
+    const FROG_SIZE = 30;
+    const FROG_OFFSET = (CELL_H - FROG_SIZE) / 2;
+    
+    // Row definitions (0 = top HUD, 1-13 = play area)
+    const ROW_GOAL = 1;
+    const ROW_RIVER_START = 2;
+    const ROW_RIVER_END = 6;
+    const ROW_MEDIAN = 7;
+    const ROW_ROAD_START = 8;
+    const ROW_ROAD_END = 12;
+    const ROW_START = 13;
+    
+    // Game states
+    const STATE_START = 0;
+    const STATE_PLAYING = 1;
+    const STATE_DEAD = 2;
+    const STATE_GAMEOVER = 3;
+    
+    // Timer
+    const LEVEL_TIME = 40000; // 40 seconds
+    
+    // Colors
+    const COLORS = {
+      grass: '#228B22',
+      road: '#333333',
+      river: '#0000AA',
+      median: '#228B22',
+      goal: '#228B22',
+      frog: '#00FF00',
+      frogDark: '#00AA00',
+      log: '#8B4513',
+      logLight: '#A0522D',
+      turtle: '#228B22',
+      turtleShell: '#2E8B57',
+      turtleDiving: '#1E6B4A',
+      car1: '#FF0000',
+      car2: '#FFFF00',
+      car3: '#FF00FF',
+      car4: '#00FFFF',
+      truck: '#FFA500',
+      white: '#FFFFFF',
+      black: '#000000',
+      water: '#0000CC',
+      timer: '#00FF00',
+      timerWarn: '#FF0000',
+      text: '#FFFFFF',
+      yellow: '#FFFF00',
+      red: '#FF0000'
+    };
+    
+    // ==================== GAME STATE ====================
+    let state = STATE_START;
+    let score = 0;
+    let highScore = parseInt(localStorage.getItem('frogger_highscore') || '0');
+    let lives = 3;
+    let level = 1;
+    let timer = LEVEL_TIME;
+    let maxRow = ROW_START;
+    
+    let frog = null;
+    let homes = [false, false, false, false, false];
+    let lanes = [];
+    
+    let deadTimer = 0;
+    let deathCause = '';
+    
+    // Audio
+    let audioCtx = null;
+    
+    // Input
+    const keys = {};
+    let lastHop = 0;
+    const HOP_COOLDOWN = 150;
+    
+    // ==================== AUDIO ====================
+    function initAudio() {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+      }
+    }
+    
+    function playTone(freq, duration, type = 'square', vol = 0.06, slide = 0) {
+      if (!audioCtx) return;
+      try {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = type;
+        osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+        if (slide !== 0) {
+          osc.frequency.exponentialRampToValueAtTime(Math.max(20, freq + slide), audioCtx.currentTime + duration);
+        }
+        gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + duration);
+      } catch (e) {}
+    }
+    
+    function playHop() {
+      playTone(200, 0.08, 'square', 0.08, 300);
+    }
+    
+    function playDeath() {
+      playTone(300, 0.3, 'sawtooth', 0.1, -200);
+    }
+    
+    function playHome() {
+      for (let i = 0; i < 4; i++) {
+        setTimeout(() => playTone(400 + i * 100, 0.1, 'sine', 0.06), i * 60);
+      }
+    }
+    
+    function playTick() {
+      playTone(1000, 0.05, 'square', 0.03);
+    }
+    
+    // ==================== LANE CONFIG ====================
+    function createLanes() {
+      lanes = [];
+      
+      // River lanes (rows 2-6)
+      // Row 2: Short logs, slow, right
+      lanes.push(createLogLane(2, 80, 'right', 3, 80));
+      // Row 3: Turtles, medium, left
+      lanes.push(createTurtleLane(3, 100, 'left', 3, true));
+      // Row 4: Long logs, fast, right
+      lanes.push(createLogLane(4, 120, 'right', 5, 60));
+      // Row 5: Short logs, slow, left
+      lanes.push(createLogLane(5, 70, 'left', 3, 90));
+      // Row 6: Turtles, fast, right
+      lanes.push(createTurtleLane(6, 110, 'right', 2, false));
+      
+      // Road lanes (rows 8-12)
+      // Row 8: Trucks, slow, right
+      lanes.push(createVehicleLane(8, 80, 'right', 'truck', 3));
+      // Row 9: Race cars, fast, left
+      lanes.push(createVehicleLane(9, 150, 'left', 'race', 4));
+      // Row 10: Cars, medium, right
+      lanes.push(createVehicleLane(10, 100, 'right', 'car', 3));
+      // Row 11: Bulldozers, slow, left
+      lanes.push(createVehicleLane(11, 60, 'left', 'bulldozer', 2));
+      // Row 12: Cars, fast, right
+      lanes.push(createVehicleLane(12, 130, 'right', 'car', 4));
+    }
+    
+    function createLogLane(row, speed, dir, length, spacing) {
+      const lane = {
+        row: row,
+        type: 'log',
+        speed: speed * (dir === 'left' ? -1 : 1),
+        objects: []
+      };
+      
+      const count = dir === 'left' ? 4 : 3;
+      const gap = spacing * 3;
+      
+      for (let i = 0; i < count; i++) {
+        lane.objects.push({
+          x: i * gap,
+          width: length * CELL_H,
+          length: length
+        });
+      }
+      
+      return lane;
+    }
+    
+    function createTurtleLane(row, speed, dir, count, diving) {
+      const lane = {
+        row: row,
+        type: 'turtle',
+        speed: speed * (dir === 'left' ? -1 : 1),
+        diving: diving,
+        objects: []
+      };
+      
+      const groups = 3;
+      const gap = 180;
+      
+      for (let i = 0; i < groups; i++) {
+        lane.objects.push({
+          x: i * gap,
+          width: count * 35,
+          count: count,
+          diveTimer: diving ? Math.random() * 4000 : 0,
+          diveState: 0 // 0 = surfaced, 1 = submerging, 2 = submerged
+        });
+      }
+      
+      return lane;
+    }
+    
+    function createVehicleLane(row, speed, dir, type, count) {
+      const lane = {
+        row: row,
+        type: 'vehicle',
+        speed: speed * (dir === 'left' ? -1 : 1),
+        vehicleType: type,
+        objects: []
+      };
+      
+      let width;
+      switch (type) {
+        case 'truck': width = 80; break;
+        case 'race': width = 35; break;
+        case 'bulldozer': width = 50; break;
+        default: width = 40;
+      }
+      
+      const gap = W / count;
+      
+      for (let i = 0; i < count; i++) {
+        lane.objects.push({
+          x: i * gap,
+          width: width
+        });
+      }
+      
+      return lane;
+    }
+    
+    // ==================== FROG ====================
+    function createFrog() {
+      return {
+        x: W / 2,
+        y: (ROW_START - 1) * CELL_H + FROG_OFFSET,
+        row: ROW_START,
+        col: Math.floor(W / 2 / CELL_H),
+        direction: 'up',
+        riding: null,
+        animTimer: 0,
+        jumping: false
+      };
+    }
+    
+    function moveFrog(dx, dy, dir) {
+      if (frog.jumping) return;
+      
+      const newX = frog.x + dx * CELL_H;
+      const newY = frog.y + dy * CELL_H;
+      
+      // Bounds check
+      if (newX < 0 || newX > W - FROG_SIZE) return;
+      if (newY < CELL_H) {
+        // Trying to enter goal row
+        checkGoal(newX);
+        return;
+      }
+      if (newY > (ROW_START - 1) * CELL_H + FROG_OFFSET) return;
+      
+      frog.x = newX;
+      frog.y = newY;
+      frog.direction = dir;
+      frog.jumping = true;
+      frog.animTimer = 100;
+      frog.riding = null;
+      
+      // Score for forward progress
+      const newRow = frog.row - dy;
+      if (dy < 0 && newRow < maxRow) {
+        maxRow = newRow;
+        score += 10;
+      }
+      
+      frog.row = newRow;
+      
+      playHop();
+    }
+    
+    function checkGoal(x) {
+      // Check if frog landed in a home slot
+      const slotWidth = 60;
+      const slots = [45, 135, 225, 315, 405]; // X positions of slots
+      const slotCenter = 30;
+      
+      for (let i = 0; i < slots.length; i++) {
+        const slotX = slots[i];
+        if (x >= slotX && x < slotX + slotWidth) {
+          if (!homes[i]) {
+            // Success!
+            homes[i] = true;
+            score += 50 + Math.floor(timer / 100);
+            playHome();
+            
+            // Check if all filled
+            if (homes.every(h => h)) {
+              score += 1000;
+              level++;
+              timer = LEVEL_TIME;
+              homes = [false, false, false, false, false];
+              createLanes();
+            }
+            
+            resetFrog();
+          } else {
+            // Slot already filled
+            killFrog('collision');
+          }
+          return;
+        }
+      }
+      
+      // Missed all slots
+      killFrog('collision');
+    }
+    
+    function resetFrog() {
+      frog = createFrog();
+      maxRow = ROW_START;
+      timer = LEVEL_TIME;
+    }
+    
+    function killFrog(cause) {
+      if (state !== STATE_PLAYING) return;
+      
+      deathCause = cause;
+      state = STATE_DEAD;
+      deadTimer = 1000;
+      lives--;
+      
+      playDeath();
+      
+      if (lives <= 0) {
+        state = STATE_GAMEOVER;
+        if (score > highScore) {
+          highScore = score;
+          localStorage.setItem('frogger_highscore', highScore);
+        }
+      }
+    }
+    
+    // ==================== UPDATE ====================
+    function update(dt) {
+      const dtMs = dt * 1000;
+      
+      if (state === STATE_START) {
+        if (keys['Enter'] || keys['Space']) {
+          initAudio();
+          startGame();
+          keys['Enter'] = false;
+          keys['Space'] = false;
+        }
+        return;
+      }
+      
+      if (state === STATE_GAMEOVER) {
+        if (keys['Enter'] || keys['Space']) {
+          startGame();
+          keys['Enter'] = false;
+          keys['Space'] = false;
+        }
+        return;
+      }
+      
+      if (state === STATE_DEAD) {
+        deadTimer -= dtMs;
+        if (deadTimer <= 0 && lives > 0) {
+          resetFrog();
+          state = STATE_PLAYING;
+        }
+        return;
+      }
+      
+      // Timer
+      timer -= dtMs;
+      if (timer <= 0) {
+        killFrog('timeout');
+        return;
+      }
+      
+      // Timer warning tick
+      if (timer < 5000 && timer > 0) {
+        if (Math.floor(timer / 250) !== Math.floor((timer + dtMs) / 250)) {
+          playTick();
+        }
+      }
+      
+      // Input handling with cooldown
+      lastHop -= dtMs;
+      if (lastHop <= 0) {
+        if (keys['ArrowUp']) { moveFrog(0, -1, 'up'); lastHop = HOP_COOLDOWN; }
+        else if (keys['ArrowDown']) { moveFrog(0, 1, 'down'); lastHop = HOP_COOLDOWN; }
+        else if (keys['ArrowLeft']) { moveFrog(-1, 0, 'left'); lastHop = HOP_COOLDOWN; }
+        else if (keys['ArrowRight']) { moveFrog(1, 0, 'right'); lastHop = HOP_COOLDOWN; }
+      }
+      
+      // Frog animation
+      if (frog.jumping) {
+        frog.animTimer -= dtMs;
+        if (frog.animTimer <= 0) {
+          frog.jumping = false;
+        }
+      }
+      
+      // Update lanes
+      updateLanes(dt);
+      
+      // Check collisions
+      checkCollisions();
+      
+      // Update frog position if riding
+      if (frog.riding) {
+        frog.x += frog.riding.speed * dt;
+        
+        // Check if carried off screen
+        if (frog.x < -FROG_SIZE || frog.x > W) {
+          killFrog('drown');
+        }
+      }
+    }
+    
+    function updateLanes(dt) {
+      for (const lane of lanes) {
+        // Speed multiplier for level
+        const speedMult = 1 + (level - 1) * 0.1;
+        
+        for (const obj of lane.objects) {
+          obj.x += lane.speed * speedMult * dt;
+          
+          // Wrap around
+          if (lane.speed > 0 && obj.x > W) {
+            obj.x = -obj.width;
+          } else if (lane.speed < 0 && obj.x < -obj.width) {
+            obj.x = W;
+          }
+          
+          // Turtle diving
+          if (lane.type === 'turtle' && lane.diving) {
+            obj.diveTimer -= dt * 1000;
+            if (obj.diveTimer <= 0) {
+              obj.diveState = (obj.diveState + 1) % 3;
+              obj.diveTimer = obj.diveState === 0 ? 3000 : obj.diveState === 1 ? 500 : 1500;
+            }
+          }
+        }
+      }
+    }
+    
+    function checkCollisions() {
+      if (frog.row >= ROW_ROAD_START && frog.row <= ROW_ROAD_END) {
+        // Road - check vehicle collision
+        const frogRect = { x: frog.x + 5, y: frog.y + 5, w: FROG_SIZE - 10, h: FROG_SIZE - 10 };
+        
+        for (const lane of lanes) {
+          if (lane.row !== frog.row) continue;
+          
+          for (const obj of lane.objects) {
+            if (rectIntersect(frogRect, { x: obj.x, y: (lane.row - 1) * CELL_H + 5, w: obj.width, h: CELL_H - 10 })) {
+              killFrog('squash');
+              return;
+            }
+          }
+        }
+      }
+      
+      if (frog.row >= ROW_RIVER_START && frog.row <= ROW_RIVER_END) {
+        // River - check if on safe platform
+        const frogRect = { x: frog.x + 3, y: frog.y + 3, w: FROG_SIZE - 6, h: FROG_SIZE - 6 };
+        let onPlatform = false;
+        
+        for (const lane of lanes) {
+          if (lane.row !== frog.row) continue;
+          
+          for (const obj of lane.objects) {
+            // Check if turtle is safe (not submerged)
+            let safe = true;
+            if (lane.type === 'turtle') {
+              safe = obj.diveState < 2;
+            }
+            
+            if (safe && rectIntersect(frogRect, { x: obj.x, y: (lane.row - 1) * CELL_H, w: obj.width, h: CELL_H })) {
+              onPlatform = true;
+              frog.riding = { speed: lane.speed };
+              break;
+            }
+          }
+          if (onPlatform) break;
+        }
+        
+        if (!onPlatform) {
+          frog.riding = null;
+          killFrog('drown');
+        }
+      } else {
+        frog.riding = null;
+      }
+    }
+    
+    function rectIntersect(a, b) {
+      return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+    }
+    
+    // ==================== RENDER ====================
+    function render() {
+      ctx.fillStyle = COLORS.black;
+      ctx.fillRect(0, 0, W, H);
+      
+      if (state === STATE_START) {
+        drawStartScreen();
+        return;
+      }
+      
+      // Draw background layers
+      drawBackground();
+      
+      // Draw lanes
+      drawLanes();
+      
+      // Draw homes
+      drawHomes();
+      
+      // Draw frog
+      if (state !== STATE_DEAD) {
+        drawFrog();
+      } else {
+        drawDeathSprite();
+      }
+      
+      // Draw timer bar
+      drawTimer();
+      
+      // Draw HUD
+      drawHUD();
+      
+      if (state === STATE_GAMEOVER) {
+        drawGameOver();
+      }
+    }
+    
+    function drawBackground() {
+      // Goal area (row 1)
+      ctx.fillStyle = COLORS.goal;
+      ctx.fillRect(0, 0, W, CELL_H);
+      
+      // River area (rows 2-6)
+      ctx.fillStyle = COLORS.river;
+      ctx.fillRect(0, CELL_H, W, 5 * CELL_H);
+      
+      // Median (row 7)
+      ctx.fillStyle = COLORS.median;
+      ctx.fillRect(0, 6 * CELL_H, W, CELL_H);
+      
+      // Road area (rows 8-12)
+      ctx.fillStyle = COLORS.road;
+      ctx.fillRect(0, 7 * CELL_H, W, 5 * CELL_H);
+      
+      // Start area (row 13)
+      ctx.fillStyle = COLORS.grass;
+      ctx.fillRect(0, 12 * CELL_H, W, CELL_H);
+      
+      // Road lane markings
+      ctx.strokeStyle = '#555';
+      ctx.setLineDash([20, 20]);
+      for (let row = ROW_ROAD_START; row <= ROW_ROAD_END; row++) {
+        const y = (row - 1) * CELL_H + CELL_H / 2;
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(W, y);
+        ctx.stroke();
+      }
+      ctx.setLineDash([]);
+    }
+    
+    function drawLanes() {
+      for (const lane of lanes) {
+        for (const obj of lane.objects) {
+          const y = (lane.row - 1) * CELL_H;
+          
+          if (lane.type === 'log') {
+            drawLog(obj.x, y, obj.width);
+          } else if (lane.type === 'turtle') {
+            drawTurtles(obj, y, lane.speed > 0);
+          } else {
+            drawVehicle(obj.x, y, obj.width, lane.vehicleType, lane.speed > 0);
+          }
+        }
+      }
+    }
+    
+    function drawLog(x, y, width) {
+      ctx.fillStyle = COLORS.log;
+      ctx.fillRect(x, y + 5, width, CELL_H - 10);
+      
+      // Wood grain
+      ctx.fillStyle = COLORS.logLight;
+      for (let i = 0; i < width - 20; i += 30) {
+        ctx.fillRect(x + 10 + i, y + 8, 15, 4);
+        ctx.fillRect(x + 15 + i, y + CELL_H - 15, 15, 4);
+      }
+      
+      // End caps
+      ctx.fillStyle = COLORS.log;
+      ctx.beginPath();
+      ctx.arc(x + 10, y + CELL_H / 2, (CELL_H - 10) / 2, Math.PI / 2, -Math.PI / 2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(x + width - 10, y + CELL_H / 2, (CELL_H - 10) / 2, -Math.PI / 2, Math.PI / 2);
+      ctx.fill();
+    }
+    
+    function drawTurtles(obj, y, movingRight) {
+      const count = obj.count;
+      const turtleW = 32;
+      
+      // Dive state affects visibility
+      let alpha = 1;
+      if (obj.diveState === 1) alpha = 0.6;
+      if (obj.diveState === 2) alpha = 0;
+      
+      if (alpha === 0) return;
+      
+      ctx.globalAlpha = alpha;
+      
+      for (let i = 0; i < count; i++) {
+        const tx = obj.x + i * (turtleW + 3);
+        
+        // Shell
+        ctx.fillStyle = obj.diveState === 1 ? COLORS.turtleDiving : COLORS.turtle;
+        ctx.beginPath();
+        ctx.ellipse(tx + turtleW / 2, y + CELL_H / 2, turtleW / 2 - 2, CELL_H / 2 - 5, 0, 0, Math.PI * 2);
+        ctx.fill();
+        
+        // Shell pattern
+        ctx.fillStyle = COLORS.turtleShell;
+        ctx.beginPath();
+        ctx.ellipse(tx + turtleW / 2, y + CELL_H / 2, turtleW / 4, CELL_H / 4 - 2, 0, 0, Math.PI * 2);
+        ctx.fill();
+        
+        // Head
+        ctx.fillStyle = COLORS.frog;
+        ctx.beginPath();
+        ctx.arc(tx + turtleW / 2, y + CELL_H / 2 - 10, 5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      
+      ctx.globalAlpha = 1;
+    }
+    
+    function drawVehicle(x, y, width, type, movingRight) {
+      const colors = [COLORS.car1, COLORS.car2, COLORS.car3, COLORS.car4];
+      let color = COLORS.car1;
+      
+      switch (type) {
+        case 'truck':
+          color = COLORS.truck;
+          ctx.fillStyle = color;
+          ctx.fillRect(x, y + 5, width, CELL_H - 10);
+          // Cab
+          ctx.fillStyle = '#666';
+          ctx.fillRect(movingRight ? x + width - 20 : x, y + 8, 20, CELL_H - 16);
+          // Wheels
+          ctx.fillStyle = '#333';
+          ctx.fillRect(x + 5, y + CELL_H - 8, 12, 6);
+          ctx.fillRect(x + width - 17, y + CELL_H - 8, 12, 6);
+          break;
+          
+        case 'race':
+          color = COLORS.car3;
+          ctx.fillStyle = color;
+          ctx.fillRect(x, y + 10, width, CELL_H - 20);
+          // Racing stripe
+          ctx.fillStyle = COLORS.white;
+          ctx.fillRect(x + 5, y + CELL_H / 2 - 2, width - 10, 4);
+          break;
+          
+        case 'bulldozer':
+          color = COLORS.car4;
+          ctx.fillStyle = color;
+          ctx.fillRect(x, y + 5, width, CELL_H - 10);
+          // Blade
+          ctx.fillStyle = '#888';
+          ctx.fillRect(movingRight ? x + width - 5 : x, y + 2, 5, CELL_H - 4);
+          // Tracks
+          ctx.fillStyle = '#333';
+          ctx.fillRect(x + 5, y + CELL_H - 6, width - 10, 4);
+          break;
+          
+        default:
+          ctx.fillStyle = colors[Math.floor(x / 100) % colors.length];
+          ctx.fillRect(x, y + 8, width, CELL_H - 16);
+          // Windows
+          ctx.fillStyle = '#88CCFF';
+          ctx.fillRect(x + 8, y + 12, width - 16, 8);
+      }
+    }
+    
+    function drawHomes() {
+      const slotWidth = 60;
+      const slots = [45, 135, 225, 315, 405];
+      
+      // Draw the lily pad slots
+      for (let i = 0; i < slots.length; i++) {
+        const x = slots[i];
+        
+        // Slot background (cove)
+        ctx.fillStyle = COLORS.water;
+        ctx.fillRect(x, 5, slotWidth, CELL_H - 5);
+        
+        // Lily pad
+        ctx.fillStyle = '#006600';
+        ctx.beginPath();
+        ctx.ellipse(x + slotWidth / 2, CELL_H / 2 + 2, slotWidth / 2 - 5, CELL_H / 2 - 8, 0, 0, Math.PI * 2);
+        ctx.fill();
+        
+        // If filled, draw frog
+        if (homes[i]) {
+          drawStaticFrog(x + slotWidth / 2 - FROG_SIZE / 2, 8);
+        }
+      }
+    }
+    
+    function drawStaticFrog(x, y) {
+      ctx.fillStyle = COLORS.frog;
+      // Body
+      ctx.beginPath();
+      ctx.ellipse(x + FROG_SIZE / 2, y + FROG_SIZE / 2, FROG_SIZE / 2 - 3, FROG_SIZE / 2 - 2, 0, 0, Math.PI * 2);
+      ctx.fill();
+      
+      // Eyes
+      ctx.fillStyle = COLORS.white;
+      ctx.beginPath();
+      ctx.arc(x + 8, y + 8, 5, 0, Math.PI * 2);
+      ctx.arc(x + FROG_SIZE - 8, y + 8, 5, 0, Math.PI * 2);
+      ctx.fill();
+      
+      ctx.fillStyle = COLORS.black;
+      ctx.beginPath();
+      ctx.arc(x + 8, y + 8, 2, 0, Math.PI * 2);
+      ctx.arc(x + FROG_SIZE - 8, y + 8, 2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    
+    function drawFrog() {
+      ctx.save();
+      ctx.translate(frog.x + FROG_SIZE / 2, frog.y + FROG_SIZE / 2);
+      
+      // Rotate based on direction
+      const angles = { up: 0, down: Math.PI, left: -Math.PI / 2, right: Math.PI / 2 };
+      ctx.rotate(angles[frog.direction]);
+      
+      // Jump animation
+      const jumpScale = frog.jumping ? 1 + Math.sin(frog.animTimer / 100 * Math.PI) * 0.1 : 1;
+      ctx.scale(jumpScale, jumpScale);
+      
+      // Body
+      ctx.fillStyle = COLORS.frog;
+      ctx.beginPath();
+      ctx.ellipse(0, 0, FROG_SIZE / 2 - 3, FROG_SIZE / 2 - 2, 0, 0, Math.PI * 2);
+      ctx.fill();
+      
+      // Back legs
+      ctx.fillStyle = COLORS.frogDark;
+      ctx.beginPath();
+      ctx.ellipse(-10, 8, 6, 10, -0.3, 0, Math.PI * 2);
+      ctx.ellipse(10, 8, 6, 10, 0.3, 0, Math.PI * 2);
+      ctx.fill();
+      
+      // Front legs
+      ctx.fillStyle = COLORS.frog;
+      ctx.beginPath();
+      ctx.ellipse(-8, -5, 4, 6, -0.2, 0, Math.PI * 2);
+      ctx.ellipse(8, -5, 4, 6, 0.2, 0, Math.PI * 2);
+      ctx.fill();
+      
+      // Eyes
+      ctx.fillStyle = COLORS.white;
+      ctx.beginPath();
+      ctx.arc(-6, -10, 5, 0, Math.PI * 2);
+      ctx.arc(6, -10, 5, 0, Math.PI * 2);
+      ctx.fill();
+      
+      ctx.fillStyle = COLORS.black;
+      ctx.beginPath();
+      ctx.arc(-6, -10, 2, 0, Math.PI * 2);
+      ctx.arc(6, -10, 2, 0, Math.PI * 2);
+      ctx.fill();
+      
+      ctx.restore();
+    }
+    
+    function drawDeathSprite() {
+      const x = frog.x + FROG_SIZE / 2;
+      const y = frog.y + FROG_SIZE / 2;
+      
+      // Skull or death animation
+      ctx.fillStyle = '#FF6666';
+      ctx.beginPath();
+      ctx.arc(x, y, 15, 0, Math.PI * 2);
+      ctx.fill();
+      
+      // X eyes
+      ctx.strokeStyle = COLORS.black;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(x - 8, y - 5);
+      ctx.lineTo(x - 2, y + 1);
+      ctx.moveTo(x - 2, y - 5);
+      ctx.lineTo(x - 8, y + 1);
+      ctx.moveTo(x + 2, y - 5);
+      ctx.lineTo(x + 8, y + 1);
+      ctx.moveTo(x + 8, y - 5);
+      ctx.lineTo(x + 2, y + 1);
+      ctx.stroke();
+    }
+    
+    function drawTimer() {
+      const barY = H - 15;
+      const barW = W - 20;
+      const barH = 10;
+      
+      const remaining = timer / LEVEL_TIME;
+      const fillW = barW * remaining;
+      
+      // Background
+      ctx.fillStyle = '#333';
+      ctx.fillRect(10, barY, barW, barH);
+      
+      // Fill
+      ctx.fillStyle = timer < 5000 ? COLORS.timerWarn : COLORS.timer;
+      ctx.fillRect(10, barY, fillW, barH);
+      
+      // Border
+      ctx.strokeStyle = COLORS.white;
+      ctx.strokeRect(10, barY, barW, barH);
+    }
+    
+    function drawHUD() {
+      ctx.fillStyle = COLORS.text;
+      ctx.font = 'bold 18px Courier New, monospace';
+      ctx.textAlign = 'left';
+      ctx.fillText(`SCORE: ${score}`, 10, 25);
+      
+      ctx.textAlign = 'center';
+      ctx.fillStyle = COLORS.yellow;
+      ctx.fillText(`HI: ${highScore}`, W / 2, 25);
+      
+      ctx.textAlign = 'right';
+      ctx.fillStyle = COLORS.red;
+      ctx.fillText(`LIVES: ${lives}`, W - 10, 25);
+      
+      ctx.fillStyle = COLORS.yellow;
+      ctx.textAlign = 'center';
+      ctx.fillText(`LEVEL ${level}`, W / 2, 45);
+    }
+    
+    function drawStartScreen() {
+      ctx.fillStyle = COLORS.frog;
+      ctx.font = 'bold 72px Arial, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('FROGGER', W / 2, H / 2 - 80);
+      
+      ctx.fillStyle = COLORS.text;
+      ctx.font = '20px Arial, sans-serif';
+      ctx.fillText('Guide the frog across the road and river', W / 2, H / 2 - 20);
+      ctx.fillText('Avoid cars and trucks on the road', W / 2, H / 2 + 10);
+      ctx.fillText('Jump on logs and turtles to cross the river', W / 2, H / 2 + 40);
+      ctx.fillText('Fill all 5 home slots to advance', W / 2, H / 2 + 70);
+      
+      if (Math.floor(Date.now() / 500) % 2 === 0) {
+        ctx.font = 'bold 24px Arial, sans-serif';
+        ctx.fillText('Press Enter or Space to Start', W / 2, H / 2 + 140);
+      }
+      
+      ctx.fillStyle = '#888';
+      ctx.font = '14px Arial, sans-serif';
+      ctx.fillText('Arrow Keys to hop', W / 2, H / 2 + 200);
+    }
+    
+    function drawGameOver() {
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+      ctx.fillRect(0, 0, W, H);
+      
+      ctx.fillStyle = COLORS.red;
+      ctx.font = 'bold 56px Arial, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('GAME OVER', W / 2, H / 2 - 40);
+      
+      ctx.fillStyle = COLORS.text;
+      ctx.font = '24px Arial, sans-serif';
+      ctx.fillText(`Score: ${score}`, W / 2, H / 2 + 20);
+      
+      if (Math.floor(Date.now() / 500) % 2 === 0) {
+        ctx.font = '20px Arial, sans-serif';
+        ctx.fillText('Press Enter or Space to Restart', W / 2, H / 2 + 80);
+      }
+    }
+    
+    // ==================== GAME FLOW ====================
+    function startGame() {
+      score = 0;
+      lives = 3;
+      level = 1;
+      timer = LEVEL_TIME;
+      homes = [false, false, false, false, false];
+      maxRow = ROW_START;
+      
+      frog = createFrog();
+      createLanes();
+      
+      state = STATE_PLAYING;
+    }
+    
+    // ==================== GAME LOOP ====================
+    let lastTime = 0;
+    
+    function gameLoop(timestamp) {
+      const dt = Math.min((timestamp - lastTime) / 1000, 0.1);
+      lastTime = timestamp;
+      
+      update(dt);
+      render();
+      
+      requestAnimationFrame(gameLoop);
+    }
+    
+    // ==================== INPUT ====================
+    document.addEventListener('keydown', (e) => {
+      keys[e.code] = true;
+      if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) {
+        e.preventDefault();
+      }
+    });
+    
+    document.addEventListener('keyup', (e) => {
+      keys[e.code] = false;
+    });
+    
+    // Start
+    lastTime = performance.now();
+    requestAnimationFrame(gameLoop);
+  </script>
+</body>
+</html>

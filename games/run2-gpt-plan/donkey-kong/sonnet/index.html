@@ -1,0 +1,584 @@
+<!--
+  GAME:           Donkey Kong
+  RUN:            run2-gpt-plan
+  BUILDER:        anthropic/claude-sonnet-4-6
+  PLANNER:        openai/gpt-5.4
+  BUILD TIME:     95 seconds
+  TOKENS IN:      5800
+  TOKENS OUT:     9200
+  ESTIMATED COST: $0.156
+  ITERATIONS:     2
+  TOOLS USED:     write, read
+  STATUS:         complete
+  TIMESTAMP:      2026-04-11T13:45:00Z
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Donkey Kong</title>
+<style>
+  body { background: #000; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+  canvas { border: 1px solid #222; }
+</style>
+</head>
+<body>
+<canvas id="c" width="640" height="800"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const W = 640, H = 800;
+
+let state = 'start';
+let score = 0, hi = parseInt(localStorage.getItem('dk_hi')||0);
+let lives = 3, level = 1;
+let bonusTimer = 5000;
+let bonusInterval = null;
+
+// Platform definitions: {x1, x2, y, tilt: 0=flat, 1=left-down, -1=right-down}
+const PLATFORMS = [
+  { x1: 40,  x2: 600, y: 740, tilt: 0 },  // P0 start (bottom)
+  { x1: 40,  x2: 600, y: 590, tilt: 1 },  // P1
+  { x1: 40,  x2: 600, y: 440, tilt: -1 }, // P2
+  { x1: 40,  x2: 600, y: 290, tilt: 1 },  // P3
+  { x1: 40,  x2: 520, y: 140, tilt: 0 },  // P4 (top, DK)
+];
+
+// Ladders: {x, y1 (top), y2 (bottom), broken: false/true}
+const LADDERS = [
+  { x: 520, y1: 590, y2: 740, broken: false },
+  { x: 120, y1: 440, y2: 590, broken: false },
+  { x: 500, y1: 290, y2: 440, broken: true },  // broken (missing rungs at middle)
+  { x: 200, y1: 140, y2: 290, broken: false },
+  { x: 420, y1: 140, y2: 290, broken: false },
+];
+
+// Hammer pickups
+const HAMMER_DEFS = [
+  { x: 200, y: 580, active: true },
+  { x: 440, y: 430, active: true },
+];
+
+// Mario
+let mario = {
+  x: 80, y: 0,
+  vx: 0, vy: 0,
+  onGround: false,
+  onLadder: false,
+  climbing: false,
+  facing: 1,
+  frame: 0, frameTimer: 0,
+  hammerActive: false, hammerTimer: 0,
+  width: 24, height: 28,
+};
+
+// DK
+let dk = {
+  x: 100, y: 108,
+  frame: 0, frameTimer: 0,
+  beatChestTimer: 180,
+};
+
+// Pauline
+let pauline = { x: 450, y: 112 };
+
+// Barrels
+let barrels = [];
+let barrelSpawnTimer = 0;
+const BARREL_SPAWN_INTERVAL = 180;
+
+// Fireballs (level 2+)
+let fireballs = [];
+
+// Particles
+let particles = [];
+
+// Hammers
+let hammers = HAMMER_DEFS.map(h => ({...h}));
+
+let animFrame = 0;
+
+function initGame() {
+  mario.x = 80; mario.y = getPlatformY(0) - mario.height;
+  mario.vx = 0; mario.vy = 0;
+  mario.onGround = false; mario.climbing = false; mario.onLadder = false;
+  mario.hammerActive = false; mario.hammerTimer = 0;
+  mario.facing = 1;
+  barrels = [];
+  fireballs = [];
+  particles = [];
+  hammers = HAMMER_DEFS.map(h => ({...h}));
+  bonusTimer = 5000;
+  clearInterval(bonusInterval);
+  bonusInterval = setInterval(() => {
+    if (state !== 'playing') return;
+    bonusTimer -= 100;
+    if (bonusTimer <= 0) killMario();
+  }, 100);
+}
+
+function getPlatformY(idx) {
+  return PLATFORMS[idx].y;
+}
+
+function platformAt(x, y) {
+  for (let i = 0; i < PLATFORMS.length; i++) {
+    const p = PLATFORMS[i];
+    // Tilt: adjust y based on x position
+    let py = p.y;
+    if (p.tilt === 1) py += (x - p.x1) * 0.06; // left side higher
+    if (p.tilt === -1) py += (p.x2 - x) * 0.06;
+    if (x >= p.x1 && x <= p.x2 && Math.abs(y - py) < 20) {
+      return py;
+    }
+  }
+  return null;
+}
+
+function ladderAt(x, y) {
+  for (const l of LADDERS) {
+    if (Math.abs(x - l.x) < 20 && y >= l.y1 - 10 && y <= l.y2 + 10) {
+      if (l.broken && y > l.y1 + (l.y2 - l.y1) * 0.3 && y < l.y1 + (l.y2 - l.y1) * 0.7) return null;
+      return l;
+    }
+  }
+  return null;
+}
+
+const keys = {};
+document.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code === 'Enter' && state !== 'playing') { state = 'playing'; initGame(); }
+  if (e.code === 'KeyP') state = state === 'paused' ? 'playing' : 'paused';
+  e.preventDefault();
+});
+document.addEventListener('keyup', e => { keys[e.code] = false; });
+
+function spawnParticles(x, y, color) {
+  for (let i = 0; i < 8; i++) {
+    const a = (i/8)*Math.PI*2;
+    particles.push({ x, y, vx: Math.cos(a)*3, vy: Math.sin(a)*3, color, life: 20 });
+  }
+}
+
+function killMario() {
+  spawnParticles(mario.x + mario.width/2, mario.y + mario.height/2, '#FF8800');
+  lives--;
+  clearInterval(bonusInterval);
+  setTimeout(() => {
+    if (lives <= 0) {
+      state = 'gameover';
+      if (score > hi) { hi = score; localStorage.setItem('dk_hi', hi); }
+    } else {
+      initGame();
+    }
+  }, 1200);
+}
+
+function update() {
+  if (state !== 'playing') return;
+  animFrame++;
+  
+  // DK beat chest
+  dk.frameTimer++;
+  if (dk.frameTimer > dk.beatChestTimer) { dk.frame ^= 1; dk.frameTimer = 0; }
+  
+  // Barrel spawn
+  barrelSpawnTimer++;
+  const spawnInterval = Math.max(60, BARREL_SPAWN_INTERVAL - (level-1)*20);
+  if (barrelSpawnTimer >= spawnInterval) {
+    barrelSpawnTimer = 0;
+    barrels.push({
+      x: dk.x + 40, y: dk.y + 20,
+      vx: 1.5, vy: 0,
+      onGround: false,
+      platform: 4, // top platform
+      frame: 0, frameTimer: 0
+    });
+  }
+  
+  // Move player
+  const spd = 2.5;
+  mario.vx = 0;
+  if (!mario.climbing) {
+    if (keys['ArrowLeft'] || keys['KeyA']) { mario.vx = -spd; mario.facing = -1; }
+    if (keys['ArrowRight'] || keys['KeyD']) { mario.vx = spd; mario.facing = 1; }
+  }
+  
+  // Ladder logic
+  const ladder = ladderAt(mario.x + mario.width/2, mario.y + mario.height/2);
+  mario.onLadder = !!ladder;
+  
+  if (mario.onLadder && (keys['ArrowUp'] || keys['KeyW'])) {
+    mario.climbing = true;
+    mario.vy = 0;
+    mario.y -= 2;
+    mario.vx = 0;
+  } else if (mario.climbing && (keys['ArrowDown'] || keys['KeyS'])) {
+    mario.y += 2;
+    mario.vx = 0;
+  } else if (!mario.onLadder) {
+    mario.climbing = false;
+  }
+  
+  // Jump
+  if ((keys['Space']) && mario.onGround && !mario.climbing) {
+    mario.vy = -14;
+    mario.onGround = false;
+    keys['Space'] = false; // consume
+  }
+  
+  // Gravity
+  if (!mario.climbing) {
+    mario.vy += 0.6;
+    mario.y += mario.vy;
+  }
+  mario.x += mario.vx;
+  
+  // Clamp x
+  mario.x = Math.max(40, Math.min(600 - mario.width, mario.x));
+  
+  // Platform collision
+  mario.onGround = false;
+  const py = platformAt(mario.x + mario.width/2, mario.y + mario.height);
+  if (py !== null && mario.vy >= 0 && mario.y + mario.height >= py - 5 && mario.y + mario.height <= py + 20) {
+    mario.y = py - mario.height;
+    mario.vy = 0;
+    mario.onGround = true;
+    mario.climbing = false;
+  }
+  
+  // Fall off bottom
+  if (mario.y > H + 50) killMario();
+  
+  // Hammer pickup
+  if (!mario.hammerActive) {
+    for (const h of hammers) {
+      if (h.active && Math.abs(mario.x - h.x) < 24 && Math.abs(mario.y - h.y) < 28) {
+        h.active = false;
+        mario.hammerActive = true;
+        mario.hammerTimer = 360;
+      }
+    }
+  }
+  if (mario.hammerActive) {
+    mario.hammerTimer--;
+    if (mario.hammerTimer <= 0) mario.hammerActive = false;
+  }
+  
+  // Move barrels
+  for (let i = barrels.length - 1; i >= 0; i--) {
+    const b = barrels[i];
+    b.frameTimer++;
+    if (b.frameTimer > 8) { b.frame = (b.frame+1)%4; b.frameTimer = 0; }
+    
+    b.vy += 0.5;
+    b.y += b.vy;
+    b.x += b.vx;
+    
+    // Platform landing
+    const bpy = platformAt(b.x + 10, b.y + 20);
+    if (bpy !== null && b.vy >= 0 && b.y + 20 >= bpy - 5) {
+      b.y = bpy - 20;
+      b.vy = 0;
+      b.onGround = true;
+      // Change direction if at edge or randomly go down ladder
+      const pIdx = PLATFORMS.findIndex(p => Math.abs(p.y - bpy) < 30);
+      if (b.x < 50 || b.x > 590) {
+        b.vx *= -1;
+        // Try to go down a ladder
+        for (const l of LADDERS) {
+          if (Math.abs(b.x - l.x) < 30 && Math.random() < 0.3) {
+            barrels.splice(i, 1);
+            barrels.push({ x: l.x, y: bpy, vx: b.vx > 0 ? 1.5 : -1.5, vy: 0, onGround: false, ladderDrop: true, ladderTarget: l.y2, frame: 0, frameTimer: 0 });
+            break;
+          }
+        }
+      }
+    }
+    
+    // Ladder drop
+    if (b.ladderDrop) {
+      b.vy = 3;
+      b.vx = 0;
+      if (b.y >= b.ladderTarget) {
+        b.ladderDrop = false;
+        b.vx = Math.random() < 0.5 ? 1.5 : -1.5;
+      }
+    }
+    
+    // Off bottom
+    if (b.y > H + 30) { barrels.splice(i, 1); continue; }
+    
+    // Jump-over detection (score)
+    if (b.onGround && mario.onGround && Math.abs(b.x - mario.x) < 30 && Math.abs(b.y - mario.y) < 20) {
+      // They're on same level; handled below as collision
+    }
+    
+    // Collision with Mario
+    if (Math.abs(b.x + 10 - (mario.x + mario.width/2)) < 18 && Math.abs(b.y + 10 - (mario.y + mario.height/2)) < 18) {
+      if (mario.hammerActive) {
+        score += 300;
+        spawnParticles(b.x + 10, b.y + 10, '#FF4400');
+        barrels.splice(i, 1);
+      } else {
+        killMario(); return;
+      }
+    }
+    
+    // Jump over barrel: mario is jumping, barrel below mario
+    if (!mario.onGround && mario.vy > 0 &&
+        Math.abs(b.x + 10 - (mario.x + mario.width/2)) < 20 &&
+        mario.y + mario.height < b.y + 5 && mario.y + mario.height > b.y - 20) {
+      score += 100;
+      spawnParticles(mario.x + mario.width/2, mario.y + mario.height, '#FFFF00');
+    }
+  }
+  
+  // Particles
+  for (let i = particles.length-1; i>=0; i--) {
+    const p = particles[i];
+    p.x += p.vx; p.y += p.vy; p.vy += 0.2; p.life--;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+  
+  // Check reach Pauline
+  if (Math.abs(mario.x - pauline.x) < 40 && Math.abs(mario.y - pauline.y) < 40) {
+    score += 1000 + bonusTimer;
+    clearInterval(bonusInterval);
+    level++;
+    setTimeout(() => { state = 'playing'; initGame(); }, 1500);
+    state = 'levelclear';
+  }
+  
+  // Animation
+  mario.frameTimer++;
+  if (mario.frameTimer > 8) { mario.frame = (mario.frame+1)%4; mario.frameTimer = 0; }
+}
+
+function drawPlatform(p) {
+  ctx.fillStyle = '#CC8844';
+  const tiltAmount = p.tilt * 0.06;
+  ctx.beginPath();
+  ctx.moveTo(p.x1, p.y + (p.tilt === 1 ? 0 : (p.x2-p.x1)*0.06));
+  ctx.lineTo(p.x2, p.y + (p.tilt === 1 ? (p.x2-p.x1)*0.06 : 0));
+  ctx.lineTo(p.x2, p.y + (p.tilt === 1 ? (p.x2-p.x1)*0.06 : 0) + 12);
+  ctx.lineTo(p.x1, p.y + (p.tilt === 1 ? 0 : (p.x2-p.x1)*0.06) + 12);
+  ctx.closePath();
+  ctx.fill();
+  // Rivets
+  ctx.fillStyle = '#AA6622';
+  for (let x = p.x1 + 20; x < p.x2; x += 40) {
+    const yAdj = p.tilt === 1 ? (x - p.x1)*0.06 : (p.x2 - x)*0.06;
+    ctx.fillRect(x, p.y + yAdj + 4, 6, 6);
+  }
+}
+
+function drawLadder(l) {
+  ctx.strokeStyle = '#CCAA44';
+  ctx.lineWidth = 4;
+  // Side rails
+  ctx.beginPath(); ctx.moveTo(l.x - 8, l.y1); ctx.lineTo(l.x - 8, l.y2); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(l.x + 8, l.y1); ctx.lineTo(l.x + 8, l.y2); ctx.stroke();
+  // Rungs
+  ctx.lineWidth = 3;
+  const step = 20;
+  for (let y = l.y1 + 10; y < l.y2; y += step) {
+    if (l.broken && y > l.y1 + (l.y2-l.y1)*0.35 && y < l.y1 + (l.y2-l.y1)*0.65) continue;
+    ctx.beginPath(); ctx.moveTo(l.x - 8, y); ctx.lineTo(l.x + 8, y); ctx.stroke();
+  }
+}
+
+function drawMario() {
+  const x = Math.round(mario.x), y = Math.round(mario.y);
+  const f = mario.facing;
+  
+  // Cap
+  ctx.fillStyle = '#FF2200';
+  ctx.fillRect(x + (f>0?4:2), y, 18, 6);
+  ctx.fillRect(x + (f>0?2:0), y+2, 22, 4);
+  
+  // Face
+  ctx.fillStyle = '#FFAA66';
+  ctx.fillRect(x+4, y+6, 16, 8);
+  
+  // Body/overalls
+  ctx.fillStyle = '#4444FF';
+  ctx.fillRect(x+4, y+14, 16, 10);
+  
+  // Arms
+  ctx.fillStyle = '#FF2200';
+  ctx.fillRect(x + (f>0?0:18), y+14, 6, 8);
+  
+  // Legs/feet
+  ctx.fillStyle = '#4444FF';
+  const legAnim = mario.onGround ? Math.sin(animFrame*0.2)*4 : 0;
+  ctx.fillRect(x+4, y+24, 7, 4);
+  ctx.fillRect(x+13, y+24, 7, 4);
+  
+  // Hammer
+  if (mario.hammerActive && Math.floor(animFrame/8)%2===0) {
+    ctx.fillStyle = '#CC8800';
+    ctx.fillRect(x + (f>0?18:(-8)), y+4, 8, 16);
+    ctx.fillRect(x + (f>0?14:(-12)), y+2, 16, 8);
+  }
+}
+
+function drawDK() {
+  const x = dk.x, y = dk.y;
+  ctx.fillStyle = '#884400';
+  // Body
+  ctx.fillRect(x, y+20, 64, 48);
+  // Head
+  ctx.fillRect(x+10, y, 44, 28);
+  // Ears
+  ctx.fillRect(x, y+4, 14, 14);
+  ctx.fillRect(x+50, y+4, 14, 14);
+  // Face
+  ctx.fillStyle = '#CCAA66';
+  ctx.fillRect(x+16, y+8, 32, 16);
+  // Eyes
+  ctx.fillStyle = '#FFF';
+  ctx.fillRect(x+18, y+6, 8, 8);
+  ctx.fillRect(x+38, y+6, 8, 8);
+  ctx.fillStyle = '#000';
+  ctx.fillRect(x+20, y+8, 4, 4);
+  ctx.fillRect(x+40, y+8, 4, 4);
+  // Arms (beating chest when frame=1)
+  ctx.fillStyle = '#884400';
+  if (dk.frame) {
+    ctx.fillRect(x-12, y+22, 20, 16);
+    ctx.fillRect(x+56, y+22, 20, 16);
+  } else {
+    ctx.fillRect(x-6, y+26, 16, 12);
+    ctx.fillRect(x+54, y+26, 16, 12);
+  }
+  // Legs
+  ctx.fillRect(x+6, y+64, 20, 18);
+  ctx.fillRect(x+38, y+64, 20, 18);
+}
+
+function drawBarrel(b) {
+  ctx.fillStyle = '#CC4400';
+  ctx.beginPath();
+  ctx.arc(b.x + 10, b.y + 10, 10, 0, Math.PI*2);
+  ctx.fill();
+  ctx.strokeStyle = '#AA2200';
+  ctx.lineWidth = 2;
+  // Rolling lines based on frame
+  const angle = (b.frame / 4) * Math.PI * 2;
+  ctx.beginPath();
+  ctx.moveTo(b.x+10 + Math.cos(angle)*8, b.y+10 + Math.sin(angle)*8);
+  ctx.lineTo(b.x+10 + Math.cos(angle+Math.PI)*8, b.y+10 + Math.sin(angle+Math.PI)*8);
+  ctx.stroke();
+}
+
+function draw() {
+  ctx.fillStyle = '#000044';
+  ctx.fillRect(0, 0, W, H);
+  
+  // HUD
+  ctx.fillStyle = '#FFF';
+  ctx.font = '16px monospace';
+  ctx.fillText(`SCORE: ${score}`, 10, 30);
+  ctx.textAlign = 'center';
+  ctx.fillText(`BONUS: ${bonusTimer}`, W/2, 30);
+  ctx.textAlign = 'right';
+  ctx.fillText(`LIVES: ${lives}`, W-10, 30);
+  ctx.textAlign = 'left';
+  ctx.fillText(`LEVEL: ${level}`, 10, 50);
+  ctx.textAlign = 'right';
+  ctx.fillText(`HI: ${hi}`, W-10, 50);
+  ctx.textAlign = 'left';
+  
+  if (state === 'start') {
+    ctx.fillStyle = '#FF2200';
+    ctx.font = 'bold 48px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('DONKEY', W/2, 300);
+    ctx.fillText('KONG', W/2, 360);
+    ctx.fillStyle = '#FFF';
+    ctx.font = '20px monospace';
+    ctx.fillText('Press ENTER to Start', W/2, 440);
+    ctx.fillText('← → Move  ↑↓ Ladder  SPACE Jump', W/2, 480);
+    ctx.textAlign = 'left';
+    // Draw DK
+    drawDK();
+    return;
+  }
+  
+  // Platforms
+  for (const p of PLATFORMS) drawPlatform(p);
+  
+  // Ladders
+  for (const l of LADDERS) drawLadder(l);
+  
+  // Hammers
+  ctx.fillStyle = '#CC8800';
+  for (const h of hammers) {
+    if (h.active) {
+      ctx.fillRect(h.x, h.y, 8, 20);
+      ctx.fillRect(h.x - 6, h.y, 20, 10);
+    }
+  }
+  
+  // Pauline
+  ctx.fillStyle = '#FF88AA';
+  ctx.fillRect(pauline.x, pauline.y, 20, 32);
+  ctx.fillStyle = '#FFAA66';
+  ctx.fillRect(pauline.x + 4, pauline.y - 14, 12, 14);
+  ctx.fillStyle = '#884422';
+  ctx.fillRect(pauline.x + 2, pauline.y - 20, 16, 8);
+  
+  // DK
+  drawDK();
+  
+  // Barrels
+  for (const b of barrels) drawBarrel(b);
+  
+  // Particles
+  for (const p of particles) {
+    ctx.fillStyle = p.color;
+    ctx.globalAlpha = p.life / 20;
+    ctx.fillRect(p.x-2, p.y-2, 4, 4);
+  }
+  ctx.globalAlpha = 1;
+  
+  // Mario
+  drawMario();
+  
+  if (state === 'gameover') {
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#FF2200';
+    ctx.font = 'bold 48px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('GAME OVER', W/2, 350);
+    ctx.fillStyle = '#FFF';
+    ctx.font = '24px monospace';
+    ctx.fillText(`Score: ${score}`, W/2, 420);
+    ctx.fillText('Press ENTER to Restart', W/2, 470);
+    ctx.textAlign = 'left';
+    return;
+  }
+  
+  if (state === 'levelclear') {
+    ctx.fillStyle = 'rgba(0,0,200,0.5)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#FFFF00';
+    ctx.font = 'bold 40px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(`LEVEL ${level-1} CLEAR!`, W/2, 380);
+    ctx.textAlign = 'left';
+  }
+}
+
+function loop() {
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

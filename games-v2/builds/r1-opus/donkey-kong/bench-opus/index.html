@@ -1,0 +1,874 @@
+<!--
+  GAME:      Donkey Kong
+  RUN:       r1-opus
+  BUILDER:   anthropic/claude-opus-4.6
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Donkey Kong</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;display:flex;justify-content:center;align-items:center;height:100vh;overflow:hidden}
+canvas{display:block}
+</style>
+</head>
+<body>
+<canvas id="c" width="672" height="768"></canvas>
+<script>
+(function(){
+'use strict';
+const cv=document.getElementById('c'),cx=cv.getContext('2d');
+const W=672,H=768;
+
+// Girders: {lx,rx,ly,ry}
+const GIRDERS=[
+  {lx:56,rx:616,ly:640,ry:628,id:0},   // G1 bottom
+  {lx:56,rx:616,ly:544,ry:556,id:1},   // G2
+  {lx:56,rx:616,ly:460,ry:448,id:2},   // G3
+  {lx:56,rx:616,ly:364,ry:376,id:3},   // G4
+  {lx:56,rx:616,ly:280,ry:268,id:4},   // G5
+  {lx:56,rx:456,ly:188,ry:180,id:5},   // G6 DK's
+  {lx:220,rx:452,ly:98,ry:98,id:6}     // G7 Pauline
+];
+
+function girderY(g,x){
+  const t=Math.max(0,Math.min(1,(x-g.lx)/(g.rx-g.lx)));
+  return g.ly+t*(g.ry-g.ly);
+}
+
+function onGirder(g,x){return x>=g.lx-4&&x<=g.rx+4;}
+
+// Ladders: {cx,bottomG,topG,type:'full'|'broken'}
+const LADDERS=[
+  {cx:120,bG:0,tG:1,type:'full'},
+  {cx:320,bG:0,tG:1,type:'broken'},
+  {cx:540,bG:1,tG:2,type:'full'},
+  {cx:200,bG:1,tG:2,type:'broken'},
+  {cx:120,bG:2,tG:3,type:'full'},
+  {cx:420,bG:2,tG:3,type:'full'},
+  {cx:540,bG:3,tG:4,type:'full'},
+  {cx:280,bG:3,tG:4,type:'broken'},
+  {cx:120,bG:4,tG:5,type:'full'},
+  {cx:400,bG:5,tG:6,type:'full'}
+];
+
+let brokenVisible=true,brokenTimer=0;
+
+// States
+const ST_TITLE=0,ST_INTRO=1,ST_PLAYING=2,ST_PAUSED=3,ST_DEATH=4,ST_LEVEL_CLEAR=5,ST_GAME_OVER=6;
+let state=ST_TITLE,stateTimer=0;
+let score=0,hiScore=0,lives=3,level=1,extraLifeGiven=false;
+let bonusTimer=5000,bonusDrain=50;
+let globalTime=0,frameCount=0;
+
+try{const v=localStorage.getItem('donkeykong_best');if(v)hiScore=parseInt(v)||0;}catch(e){}
+function saveBest(){if(score>hiScore){hiScore=score;try{localStorage.setItem('donkeykong_best',String(hiScore));}catch(e){}}}
+
+// Audio
+let audioCtx=null;
+function initAudio(){if(audioCtx)return;try{audioCtx=new(window.AudioContext||window.webkitAudioContext)();}catch(e){}}
+function tone(f,f2,d,t,v){if(!audioCtx)return;try{const o=audioCtx.createOscillator(),g=audioCtx.createGain();o.type=t||'square';o.frequency.value=f;if(f2)o.frequency.linearRampToValueAtTime(f2,audioCtx.currentTime+d);g.gain.value=v||0.1;g.gain.linearRampToValueAtTime(0,audioCtx.currentTime+d);o.connect(g);g.connect(audioCtx.destination);o.start();o.stop(audioCtx.currentTime+d);}catch(e){}}
+function sndJump(){tone(300,500,0.08,'sine',0.15);}
+function sndLand(){tone(120,120,0.04,'square',0.12);}
+function sndDeath(){tone(400,100,0.6,'sine',0.25);}
+function sndScore(){tone(660,660,0.06,'sine',0.18);}
+function sndHammer(){tone(440,660,0.08,'square',0.2);}
+function sndSmash(){tone(200,100,0.06,'square',0.2);}
+function sndClear(){[523,659,784,1047].forEach((f,i)=>setTimeout(()=>tone(f,f,0.08,'sine',0.2),i*85));}
+function sndExtraLife(){tone(880,1100,0.08,'sine',0.18);setTimeout(()=>tone(1100,1100,0.08,'sine',0.18),90);}
+
+// Input
+const keys={},pressed={};
+window.addEventListener('keydown',e=>{if(!keys[e.code])pressed[e.code]=true;keys[e.code]=true;e.preventDefault();initAudio();});
+window.addEventListener('keyup',e=>{keys[e.code]=false;});
+function wasPressed(c){return!!pressed[c];}
+
+// Mario
+let mario={x:560,y:620,vx:0,vy:0,dir:1,airborne:false,climbing:false,
+  currentGirder:0,currentLadder:-1,alive:true,walkFrame:0,walkTimer:0,
+  climbFrame:0,climbTimer:0,hammer:false,hammerTimer:0,hammerSwing:0,
+  jumpedBarrels:[]};
+
+function resetMario(){
+  mario.x=560;mario.y=girderY(GIRDERS[0],560);mario.vx=0;mario.vy=0;
+  mario.dir=1;mario.airborne=false;mario.climbing=false;
+  mario.currentGirder=0;mario.currentLadder=-1;mario.alive=true;
+  mario.hammer=false;mario.hammerTimer=0;mario.jumpedBarrels=[];
+}
+
+// Barrels
+let barrels=[],nextBarrelTimer=3;
+
+function spawnBarrel(){
+  const spd=(80+Math.random()*40)*getSpeedMul();
+  const blue=level>=2&&Math.random()<(level>=3?0.33:0.15);
+  barrels.push({x:120,y:girderY(GIRDERS[5],120),vx:spd,girder:5,
+    state:'rolling',dir:1,vy:0,frame:0,frameTimer:0,blue,id:Math.random()});
+}
+
+function getSpeedMul(){return Math.min(1.45,1+(level-1)*0.15);}
+function getThrowInterval(){
+  const base=level>=4?1.5:level>=3?2:level>=2?2.5:3;
+  return base+Math.random()*(level>=4?1:level>=3?1:level>=2?1:1);
+}
+
+// Fireballs
+let fireballs=[];
+const MAX_FIREBALLS=[2,3,4,4];
+
+function spawnFireball(){
+  const cap=MAX_FIREBALLS[Math.min(level-1,3)];
+  if(fireballs.length>=cap)return;
+  const spd=50+(level-1)*10;
+  fireballs.push({x:56,y:girderY(GIRDERS[0],56),girder:0,dir:1,speed:spd,
+    frame:0,frameTimer:0,climbingLadder:-1,climbDir:0});
+}
+
+// Hammers
+let hammers=[{x:130,girder:2,active:true},{x:130,girder:4,active:true}];
+
+// Bonus item
+let bonusItem={active:false,x:336,y:0,timer:0,spawned:false};
+
+// Score popups
+let popups=[];
+
+// DK animation
+let dkFrame=0,dkTimer=0,dkThrowing=false,dkThrowTimer=0;
+
+function startGame(){
+  score=0;lives=3;level=1;extraLifeGiven=false;
+  startLevel();
+}
+
+function startLevel(){
+  resetMario();barrels=[];fireballs=[];popups=[];
+  nextBarrelTimer=2;
+  bonusTimer=5000+(level-1)*1000;bonusDrain=50+(level-1)*5;
+  hammers.forEach(h=>h.active=true);
+  bonusItem={active:false,x:336,y:0,timer:0,spawned:false};
+  brokenTimer=0;brokenVisible=true;
+  state=ST_INTRO;stateTimer=2;
+}
+
+// Update
+function update(dt){
+  globalTime+=dt;frameCount++;
+
+  switch(state){
+    case ST_TITLE:
+      if(wasPressed('Enter')||wasPressed('NumpadEnter')){startGame();}
+      break;
+    case ST_INTRO:
+      stateTimer-=dt;
+      if(stateTimer<=0)state=ST_PLAYING;
+      break;
+    case ST_PLAYING:
+      if(wasPressed('KeyP')||wasPressed('Escape')){state=ST_PAUSED;break;}
+      updatePlaying(dt);
+      break;
+    case ST_PAUSED:
+      if(wasPressed('KeyP')||wasPressed('Escape'))state=ST_PLAYING;
+      break;
+    case ST_DEATH:
+      stateTimer-=dt;
+      if(stateTimer<=0){
+        lives--;
+        if(lives<=0){state=ST_GAME_OVER;stateTimer=3;saveBest();}
+        else{resetMario();barrels=[];nextBarrelTimer=2;state=ST_PLAYING;}
+      }
+      break;
+    case ST_LEVEL_CLEAR:
+      stateTimer-=dt;
+      if(stateTimer>1.5){
+        // Bonus countdown
+        if(bonusTimer>0){
+          const dec=Math.min(bonusTimer,200);
+          bonusTimer-=dec;score+=dec;saveBest();
+        }
+      }
+      if(stateTimer<=0){level++;startLevel();}
+      break;
+    case ST_GAME_OVER:
+      if(wasPressed('Enter')||wasPressed('NumpadEnter'))state=ST_TITLE;
+      break;
+  }
+  // Popups
+  for(let i=popups.length-1;i>=0;i--){
+    popups[i].timer-=dt;popups[i].y-=50*dt;
+    if(popups[i].timer<=0)popups.splice(i,1);
+  }
+  for(const k in pressed)pressed[k]=false;
+}
+
+function updatePlaying(dt){
+  // Broken ladders
+  brokenTimer+=dt;
+  const onTime=level>=4?2.5:level>=3?3:level>=2?3.5:4;
+  const offTime=level>=4?2.5:level>=3?2.5:2;
+  const cycle=onTime+offTime;
+  brokenVisible=(brokenTimer%cycle)<onTime;
+
+  // DK throw
+  dkTimer+=dt;
+  if(dkTimer>0.5){dkTimer=0;dkFrame=1-dkFrame;}
+  nextBarrelTimer-=dt;
+  if(nextBarrelTimer<=0){
+    spawnBarrel();nextBarrelTimer=getThrowInterval();
+    tone(80,80,0.1,'square',0.15);
+  }
+
+  // Mario movement
+  if(mario.alive)updateMario(dt);
+
+  // Barrels
+  updateBarrels(dt);
+
+  // Fireballs
+  updateFireballs(dt);
+
+  // Bonus timer
+  bonusTimer-=bonusDrain*dt;
+  if(bonusTimer<=0){bonusTimer=0;killMario();}
+
+  // Bonus item
+  if(!bonusItem.spawned&&globalTime>20){
+    bonusItem.spawned=true;bonusItem.active=true;
+    bonusItem.y=girderY(GIRDERS[2],336)-16;bonusItem.timer=10;
+  }
+  if(bonusItem.active){
+    bonusItem.timer-=dt;
+    if(bonusItem.timer<=0)bonusItem.active=false;
+    if(Math.abs(mario.x-bonusItem.x)<20&&Math.abs(mario.y-bonusItem.y)<20){
+      const pts=[300,500,800][Math.min(level-1,2)];
+      score+=pts;bonusItem.active=false;
+      popups.push({x:bonusItem.x,y:bonusItem.y,val:pts,timer:0.6});
+      saveBest();
+    }
+  }
+
+  // Hammer
+  if(mario.hammer){
+    mario.hammerTimer-=dt;
+    mario.hammerSwing+=dt*20;
+    if(mario.hammerTimer<=0)mario.hammer=false;
+  }
+
+  // Check hammers pickup
+  for(const h of hammers){
+    if(!h.active||mario.hammer)continue;
+    const hy=girderY(GIRDERS[h.girder],h.x)-12;
+    if(Math.abs(mario.x-h.x)<20&&Math.abs(mario.y-hy)<24){
+      mario.hammer=true;mario.hammerTimer=10;mario.hammerSwing=0;
+      h.active=false;sndHammer();
+    }
+  }
+
+  // Extra life
+  if(!extraLifeGiven&&score>=10000){lives=Math.min(5,lives+1);extraLifeGiven=true;sndExtraLife();}
+
+  // Level clear
+  if(mario.y<=GIRDERS[6].ly+8&&mario.x>=GIRDERS[6].lx&&mario.x<=GIRDERS[6].rx){
+    state=ST_LEVEL_CLEAR;stateTimer=3;sndClear();
+  }
+}
+
+function updateMario(dt){
+  const spd=mario.hammer?80:100;
+
+  if(mario.climbing){
+    // Climb
+    const lad=LADDERS[mario.currentLadder];
+    if(!lad){mario.climbing=false;return;}
+    mario.x=lad.cx;
+    let climbDir=0;
+    if(keys['ArrowUp']||keys['KeyW'])climbDir=-1;
+    if(keys['ArrowDown']||keys['KeyS'])climbDir=1;
+    if(climbDir!==0){
+      mario.y+=climbDir*80*dt;
+      mario.climbTimer+=dt;
+      if(mario.climbTimer>0.15){mario.climbTimer=0;mario.climbFrame=1-mario.climbFrame;}
+    }
+    // Check top/bottom
+    const topG=GIRDERS[lad.tG],botG=GIRDERS[lad.bG];
+    const topY=girderY(topG,lad.cx);
+    const botY=girderY(botG,lad.cx);
+    if(mario.y<=topY){
+      mario.y=topY;mario.climbing=false;mario.currentGirder=lad.tG;
+    }
+    if(mario.y>=botY){
+      mario.y=botY;mario.climbing=false;mario.currentGirder=lad.bG;
+    }
+    return;
+  }
+
+  if(mario.airborne){
+    // Airborne
+    mario.vy+=700*dt;
+    if(mario.vy>400)mario.vy=400;
+    mario.y+=mario.vy*dt;
+    if(keys['ArrowLeft']||keys['KeyA']){mario.x-=spd*dt;mario.dir=-1;}
+    if(keys['ArrowRight']||keys['KeyD']){mario.x+=spd*dt;mario.dir=1;}
+    mario.x=Math.max(40,Math.min(W-40,mario.x));
+
+    // Landing check
+    for(let i=0;i<GIRDERS.length;i++){
+      const g=GIRDERS[i];
+      if(!onGirder(g,mario.x))continue;
+      const gy=girderY(g,mario.x);
+      if(mario.vy>0&&mario.y>=gy-2&&mario.y<=gy+20){
+        mario.y=gy;mario.vy=0;mario.airborne=false;mario.currentGirder=i;
+        sndLand();
+        // Score jumped barrels
+        if(mario.jumpedBarrels.length>0){
+          const pts=mario.jumpedBarrels.length>=2?300:100;
+          score+=pts;saveBest();
+          popups.push({x:mario.x,y:mario.y-30,val:pts,timer:0.6});
+          sndScore();
+        }
+        mario.jumpedBarrels=[];
+        break;
+      }
+    }
+    // Fall off screen
+    if(mario.y>700)killMario();
+
+    // Check barrel jumps
+    for(const b of barrels){
+      if(mario.jumpedBarrels.includes(b.id))continue;
+      if(Math.abs(mario.x-b.x)<18&&b.y>mario.y&&b.y-mario.y<40){
+        mario.jumpedBarrels.push(b.id);
+      }
+    }
+    return;
+  }
+
+  // Walking
+  let moving=false;
+  if(keys['ArrowLeft']||keys['KeyA']){mario.x-=spd*dt;mario.dir=-1;moving=true;}
+  if(keys['ArrowRight']||keys['KeyD']){mario.x+=spd*dt;mario.dir=1;moving=true;}
+
+  if(moving){
+    mario.walkTimer+=dt;
+    if(mario.walkTimer>0.12){mario.walkTimer=0;mario.walkFrame=1-mario.walkFrame;}
+  }
+
+  // Clamp to girder
+  const g=GIRDERS[mario.currentGirder];
+  mario.x=Math.max(g.lx,Math.min(g.rx,mario.x));
+  mario.y=girderY(g,mario.x);
+
+  // Jump
+  if(!mario.hammer||(mario.hammer)){// can jump with hammer
+    if(wasPressed('Space')){
+      mario.vy=-280;mario.airborne=true;mario.jumpedBarrels=[];
+      sndJump();
+    }
+  }
+
+  // Climb
+  if((keys['ArrowUp']||keys['KeyW'])&&!mario.hammer){
+    const lad=findLadder(mario.x,mario.currentGirder,'up');
+    if(lad>=0){mario.climbing=true;mario.currentLadder=lad;mario.climbFrame=0;}
+  }
+  if((keys['ArrowDown']||keys['KeyS'])&&!mario.hammer){
+    const lad=findLadder(mario.x,mario.currentGirder,'down');
+    if(lad>=0){mario.climbing=true;mario.currentLadder=lad;mario.climbFrame=0;}
+  }
+
+  // Check off girder edge → fall
+  if(mario.x<=g.lx||mario.x>=g.rx){
+    // Check if another girder below
+    let found=false;
+    for(let i=0;i<GIRDERS.length;i++){
+      if(i===mario.currentGirder)continue;
+      const g2=GIRDERS[i];
+      if(onGirder(g2,mario.x)){
+        const gy=girderY(g2,mario.x);
+        if(gy>mario.y&&gy-mario.y<50){
+          mario.y=gy;mario.currentGirder=i;found=true;break;
+        }
+      }
+    }
+    if(!found&&(mario.x<g.lx+2||mario.x>g.rx-2)){
+      mario.airborne=true;mario.vy=0;
+    }
+  }
+
+  // Collisions
+  checkCollisions();
+}
+
+function findLadder(x,girder,dir){
+  for(let i=0;i<LADDERS.length;i++){
+    const l=LADDERS[i];
+    if(l.type==='broken'&&!brokenVisible)continue;
+    if(Math.abs(x-l.cx)>10)continue;
+    if(dir==='up'&&l.bG===girder)return i;
+    if(dir==='down'&&l.tG===girder)return i;
+  }
+  return-1;
+}
+
+function killMario(){
+  if(!mario.alive)return;
+  mario.alive=false;state=ST_DEATH;stateTimer=1.5;sndDeath();
+}
+
+function checkCollisions(){
+  if(!mario.alive)return;
+  // Barrels
+  for(const b of barrels){
+    if(b.state==='gone')continue;
+    // Hammer check
+    if(mario.hammer&&Math.floor(mario.hammerSwing)%2===0){
+      const hx=mario.x+mario.dir*16;
+      if(Math.abs(hx-b.x)<24&&Math.abs(mario.y-16-b.y)<20){
+        b.state='gone';score+=300;saveBest();sndSmash();
+        popups.push({x:b.x,y:b.y,val:300,timer:0.6});
+        continue;
+      }
+    }
+    if(Math.abs(mario.x-b.x)<16&&Math.abs(mario.y-b.y)<24){
+      killMario();return;
+    }
+  }
+  // Fireballs
+  for(let i=fireballs.length-1;i>=0;i--){
+    const f=fireballs[i];
+    if(mario.hammer&&Math.floor(mario.hammerSwing)%2===0){
+      const hx=mario.x+mario.dir*16;
+      if(Math.abs(hx-f.x)<24&&Math.abs(mario.y-16-f.y)<20){
+        fireballs.splice(i,1);score+=500;saveBest();sndSmash();
+        popups.push({x:f.x,y:f.y,val:500,timer:0.6});
+        continue;
+      }
+    }
+    if(Math.abs(mario.x-f.x)<14&&Math.abs(mario.y-f.y)<20){
+      killMario();return;
+    }
+  }
+}
+
+function updateBarrels(dt){
+  for(let i=barrels.length-1;i>=0;i--){
+    const b=barrels[i];
+    if(b.state==='gone'){barrels.splice(i,1);continue;}
+
+    b.frameTimer+=dt;
+    if(b.frameTimer>0.1){b.frameTimer=0;b.frame=1-b.frame;}
+
+    if(b.state==='rolling'){
+      const g=GIRDERS[b.girder];
+      // Direction based on slope
+      const slope=g.ry-g.ly;
+      b.dir=slope>0?1:(slope<0?-1:b.dir);// roll downhill
+      b.x+=b.vx*b.dir*dt;
+      b.y=girderY(g,b.x);
+
+      // Edge check
+      if(b.x<=g.lx-4||b.x>=g.rx+4){
+        // Oil drum check (left side of G1)
+        if(b.girder===0&&b.x<=g.lx+10){
+          barrels.splice(i,1);spawnFireball();continue;
+        }
+        // Try ladder
+        let tookLadder=false;
+        const chance=b.blue?1:0.2;
+        for(const l of LADDERS){
+          if(l.type==='broken'&&!brokenVisible)continue;
+          if(l.tG===b.girder&&Math.abs(b.x-l.cx)<25){
+            if(Math.random()<chance){
+              b.state='ladder';b.ladderIdx=LADDERS.indexOf(l);b.x=l.cx;
+              tookLadder=true;break;
+            }
+          }
+        }
+        if(!tookLadder){
+          // Fall
+          if(b.girder>0){
+            b.state='falling';b.vy=0;b.fallVx=b.dir*b.vx*0.3;
+          }else{
+            // Off bottom
+            barrels.splice(i,1);
+          }
+        }
+      }
+    }else if(b.state==='falling'){
+      b.vy+=700*dt;if(b.vy>400)b.vy=400;
+      b.y+=b.vy*dt;b.x+=b.fallVx*dt;
+      // Land on girder
+      for(let gi=0;gi<GIRDERS.length;gi++){
+        const g=GIRDERS[gi];
+        if(gi>=b.girder)continue;// only below (actually check gi that's below)
+        if(!onGirder(g,b.x))continue;
+        const gy=girderY(g,b.x);
+        if(b.y>=gy-4){
+          b.y=gy;b.girder=gi;b.state='rolling';b.vy=0;
+          break;
+        }
+      }
+      // Also check girders with higher index (lower on screen)
+      if(b.state==='falling'){
+        for(let gi=b.girder-1;gi>=0;gi--){
+          const g=GIRDERS[gi];
+          if(!onGirder(g,b.x))continue;
+          const gy=girderY(g,b.x);
+          if(b.y>=gy-4&&gy>GIRDERS[b.girder].ly){
+            b.y=gy;b.girder=gi;b.state='rolling';b.vy=0;break;
+          }
+        }
+      }
+      if(b.y>700){barrels.splice(i,1);}
+    }else if(b.state==='ladder'){
+      const l=LADDERS[b.ladderIdx];
+      b.y+=100*dt;
+      const botG=GIRDERS[l.bG];
+      const botY=girderY(botG,l.cx);
+      if(b.y>=botY){
+        b.y=botY;b.x=l.cx;b.girder=l.bG;b.state='rolling';
+      }
+    }
+  }
+}
+
+function updateFireballs(dt){
+  for(const f of fireballs){
+    f.frameTimer+=dt;
+    if(f.frameTimer>0.12){f.frameTimer=0;f.frame=1-f.frame;}
+
+    if(f.climbingLadder>=0){
+      const l=LADDERS[f.climbingLadder];
+      f.y+=f.climbDir*f.speed*dt;
+      f.x=l.cx;
+      const targetG=f.climbDir<0?l.tG:l.bG;
+      const targetY=girderY(GIRDERS[targetG],l.cx);
+      if((f.climbDir<0&&f.y<=targetY)||(f.climbDir>0&&f.y>=targetY)){
+        f.y=targetY;f.girder=targetG;f.climbingLadder=-1;
+        f.dir=mario.x>f.x?1:-1;
+      }
+      return;
+    }
+
+    const g=GIRDERS[f.girder];
+    f.x+=f.dir*f.speed*dt;
+    f.y=girderY(g,f.x)+Math.sin(globalTime*10)*3;
+
+    // Edge reversal
+    if(f.x<=g.lx+5||f.x>=g.rx-5)f.dir*=-1;
+
+    // Ladder chance
+    for(let li=0;li<LADDERS.length;li++){
+      const l=LADDERS[li];
+      if(l.type==='broken'&&!brokenVisible)continue;
+      if(Math.abs(f.x-l.cx)<8){
+        if((l.bG===f.girder||l.tG===f.girder)&&Math.random()<0.005){
+          f.climbingLadder=li;
+          const towardMario=mario.y<f.y?-1:1;
+          f.climbDir=Math.random()<0.6?towardMario:(towardMario*-1);
+          if(l.bG===f.girder&&f.climbDir>0)continue;// can't go down from bottom
+          if(l.tG===f.girder&&f.climbDir<0)continue;// can't go up from top
+          break;
+        }
+      }
+    }
+
+    // Bias toward mario
+    if(Math.random()<0.01)f.dir=mario.x>f.x?1:-1;
+  }
+}
+
+// Rendering
+function render(){
+  cx.fillStyle='#000';cx.fillRect(0,0,W,H);
+
+  switch(state){
+    case ST_TITLE:
+      drawGirders();drawLadders();drawDK();drawPauline();
+      cx.fillStyle='#FF4400';cx.font='bold 42px monospace';cx.textAlign='center';
+      cx.fillText('DONKEY KONG',W/2,350);
+      cx.fillStyle='#AAA';cx.font='18px monospace';
+      if(Math.floor(globalTime*2)%2)cx.fillText('Press Enter to Start',W/2,500);
+      cx.fillStyle='#555';cx.font='14px monospace';
+      cx.fillText('Best: '+hiScore,W/2,540);
+      break;
+    case ST_INTRO:
+      drawGirders();drawLadders();drawDK();drawPauline();
+      cx.fillStyle='#FF0';cx.font='bold 24px monospace';cx.textAlign='center';
+      cx.fillText('STAGE '+level,W/2,400);
+      cx.fillText('READY',W/2,440);
+      drawHUD();break;
+    case ST_PLAYING:
+    case ST_DEATH:
+      drawGame();break;
+    case ST_PAUSED:
+      drawGame();
+      cx.fillStyle='rgba(0,0,0,0.6)';cx.fillRect(0,0,W,H);
+      cx.fillStyle='#FFF';cx.font='36px monospace';cx.textAlign='center';
+      cx.fillText('PAUSED',W/2,H/2);
+      cx.font='14px monospace';cx.fillText('P to resume',W/2,H/2+30);
+      break;
+    case ST_LEVEL_CLEAR:
+      drawGame();
+      cx.fillStyle='#FF0';cx.font='bold 28px monospace';cx.textAlign='center';
+      cx.fillText('LEVEL CLEAR!',W/2,400);
+      break;
+    case ST_GAME_OVER:
+      drawGirders();drawLadders();drawHUD();
+      cx.fillStyle='#F00';cx.font='40px monospace';cx.textAlign='center';
+      cx.fillText('GAME OVER',W/2,320);
+      cx.fillStyle='#FFF';cx.font='24px monospace';
+      cx.fillText('Score: '+score,W/2,370);
+      if(score>=hiScore&&score>0){
+        const a=0.5+0.5*Math.sin(globalTime*6);
+        cx.globalAlpha=a;cx.fillStyle='#FFD700';cx.font='18px monospace';
+        cx.fillText('HIGH SCORE!',W/2,405);cx.globalAlpha=1;
+      }
+      cx.fillStyle='#AAA';cx.font='16px monospace';
+      cx.fillText('Level: '+level,W/2,435);
+      if(Math.floor(globalTime*2)%2){cx.fillStyle='#888';cx.fillText('Enter to play again',W/2,480);}
+      break;
+  }
+}
+
+function drawGame(){
+  drawGirders();drawLadders();
+  drawOilDrum();
+  drawDK();drawPauline();
+  // Hammers
+  for(const h of hammers){
+    if(!h.active)continue;
+    const hx=h.x,hy=girderY(GIRDERS[h.girder],h.x)-20;
+    cx.fillStyle='#8B4513';cx.fillRect(hx-2,hy,4,16);
+    cx.fillStyle='#AAA';cx.fillRect(hx-7,hy-10,14,10);
+  }
+  // Bonus item
+  if(bonusItem.active){
+    const cols=['#FF69B4','#FF44FF','#FF0000'];
+    cx.fillStyle=cols[Math.min(level-1,2)];
+    cx.fillRect(bonusItem.x-8,bonusItem.y-8,16,16);
+  }
+  // Barrels
+  for(const b of barrels){
+    if(b.state==='gone')continue;
+    cx.save();cx.translate(b.x,b.y-8);
+    cx.fillStyle=b.blue?'#4488FF':'#CD853F';
+    cx.fillRect(-10,-8,20,16);
+    cx.fillStyle=b.blue?'#2266CC':'#8B4513';
+    cx.fillRect(-10,-4,20,3);cx.fillRect(-10,3,20,3);
+    cx.restore();
+  }
+  // Fireballs
+  for(const f of fireballs){
+    cx.fillStyle=f.frame?'#FF4400':'#FF8800';
+    cx.beginPath();cx.arc(f.x,f.y-8,8,0,Math.PI*2);cx.fill();
+    cx.fillStyle='#FFCC00';
+    cx.beginPath();cx.arc(f.x,f.y-10,4,0,Math.PI*2);cx.fill();
+  }
+  // Mario
+  if(mario.alive||state===ST_DEATH){
+    drawMario();
+  }
+  // Popups
+  for(const p of popups){
+    cx.globalAlpha=Math.max(0,p.timer/0.6);
+    cx.fillStyle='#FFF';cx.font='12px monospace';cx.textAlign='center';
+    cx.fillText(String(p.val),p.x,p.y);
+    cx.globalAlpha=1;
+  }
+  drawHUD();
+}
+
+function drawGirders(){
+  for(const g of GIRDERS){
+    cx.save();
+    cx.beginPath();
+    cx.moveTo(g.lx,g.ly);cx.lineTo(g.rx,g.ry);
+    cx.lineTo(g.rx,g.ry+8);cx.lineTo(g.lx,g.ly+8);
+    cx.closePath();
+    cx.fillStyle='#CC4400';cx.fill();
+    // Segments
+    const segs=Math.ceil((g.rx-g.lx)/16);
+    for(let s=0;s<segs;s++){
+      const sx=g.lx+s*16;
+      const sy=girderY(g,sx);
+      cx.fillStyle=s%2?'#FF6600':'#CC4400';
+      cx.fillRect(sx,sy,16,8);
+    }
+    cx.restore();
+  }
+}
+
+function drawLadders(){
+  for(const l of LADDERS){
+    if(l.type==='broken'&&!brokenVisible)continue;
+    const topG=GIRDERS[l.tG],botG=GIRDERS[l.bG];
+    const topY=girderY(topG,l.cx);
+    const botY=girderY(botG,l.cx);
+    cx.strokeStyle='#66CCFF';cx.lineWidth=2;
+    // Rails
+    cx.beginPath();cx.moveTo(l.cx-6,topY);cx.lineTo(l.cx-6,botY);cx.stroke();
+    cx.beginPath();cx.moveTo(l.cx+6,topY);cx.lineTo(l.cx+6,botY);cx.stroke();
+    // Rungs
+    for(let ry=topY+10;ry<botY;ry+=10){
+      cx.beginPath();cx.moveTo(l.cx-6,ry);cx.lineTo(l.cx+6,ry);cx.stroke();
+    }
+  }
+}
+
+function drawDK(){
+  const dx=80,dy=124;
+  // Body
+  cx.fillStyle='#8B4513';
+  cx.beginPath();cx.ellipse(dx,dy+16,28,28,0,0,Math.PI*2);cx.fill();
+  // Chest
+  cx.fillStyle='#CD853F';
+  cx.beginPath();cx.ellipse(dx,dy+20,16,14,0,0,Math.PI*2);cx.fill();
+  // Face
+  cx.fillStyle='#5C2D0A';
+  cx.beginPath();cx.ellipse(dx,dy-4,14,12,0,0,Math.PI*2);cx.fill();
+  // Eyes
+  cx.fillStyle='#FFD700';
+  cx.fillRect(dx-8,dy-8,6,5);cx.fillRect(dx+2,dy-8,6,5);
+  // Mouth
+  cx.fillStyle='#FFD700';cx.fillRect(dx-6,dy+2,12,4);
+  // Arms
+  cx.fillStyle='#8B4513';
+  const armOff=dkFrame?-8:8;
+  cx.fillRect(dx-36,dy+armOff,12,20);
+  cx.fillRect(dx+24,dy-armOff,12,20);
+  // Barrel stack
+  cx.fillStyle='#CD853F';
+  for(let b=0;b<3;b++){
+    cx.fillRect(dx-40+b*14,dy+32,12,10);
+    cx.fillStyle='#8B4513';
+    cx.fillRect(dx-40+b*14,dy+36,12,2);
+    cx.fillStyle='#CD853F';
+  }
+}
+
+function drawPauline(){
+  const px=336,py=72;
+  // Dress
+  cx.fillStyle='#FF69B4';
+  cx.fillRect(px-8,py,16,24);
+  // Head
+  cx.fillStyle='#FFAA77';
+  cx.beginPath();cx.arc(px,py-4,7,0,Math.PI*2);cx.fill();
+  // Hair
+  cx.fillStyle='#8B0000';
+  cx.beginPath();cx.arc(px,py-7,7,Math.PI,0);cx.fill();
+  // HELP text
+  cx.fillStyle=Math.floor(globalTime*2)%2?'#FF69B4':'#00FFFF';
+  cx.font='12px monospace';cx.textAlign='center';
+  cx.fillText('HELP!',px,py-20);
+}
+
+function drawMario(){
+  const mx=mario.x,my=mario.y;
+  cx.save();cx.translate(mx,my);
+
+  if(state===ST_DEATH){
+    // Death spin
+    const spin=stateTimer*8;
+    cx.rotate(spin);
+    cx.globalAlpha=stateTimer/1.5;
+  }
+
+  // Hat
+  cx.fillStyle='#CC0000';
+  cx.fillRect(-8,-32,16,6);
+  // Head
+  cx.fillStyle='#FFAA77';
+  cx.beginPath();cx.arc(0,-22,6,0,Math.PI*2);cx.fill();
+  // Body
+  cx.fillStyle='#0000AA';
+  cx.fillRect(-8,-16,16,18);
+  // Legs
+  cx.fillStyle='#0000AA';
+  if(mario.climbing){
+    cx.fillRect(-8,-2+mario.climbFrame*4,7,6);
+    cx.fillRect(1,-2-mario.climbFrame*4+4,7,6);
+  }else if(mario.airborne){
+    cx.fillRect(-10,-4,8,4);cx.fillRect(2,-4,8,4);
+  }else{
+    const f=mario.walkFrame;
+    cx.fillRect(-8+f*4,-2,7,6);cx.fillRect(1-f*4,-2,7,6);
+  }
+
+  // Hammer
+  if(mario.hammer){
+    const swingUp=Math.floor(mario.hammerSwing)%2===0;
+    cx.fillStyle='#8B4513';
+    if(swingUp){
+      cx.fillRect(mario.dir*6,-44,4,20);
+      cx.fillStyle='#AAA';cx.fillRect(mario.dir*4-4,-48,12,8);
+    }else{
+      cx.fillRect(mario.dir*10,-26,4,16);
+      cx.fillStyle='#AAA';cx.fillRect(mario.dir*10-2,-30,12,8);
+    }
+    // Flash warning
+    if(mario.hammerTimer<2&&Math.floor(globalTime*8)%2){
+      cx.globalAlpha=0.4;
+    }
+  }
+
+  cx.restore();
+}
+
+function drawOilDrum(){
+  cx.fillStyle='#333';
+  cx.fillRect(42,612,24,28);
+  // Flame
+  const ff=Math.floor(globalTime*8)%2;
+  cx.fillStyle=ff?'#FF4400':'#FF8800';
+  cx.beginPath();
+  cx.moveTo(46,612);cx.lineTo(54,596+ff*4);cx.lineTo(62,612);
+  cx.fill();
+}
+
+function drawHUD(){
+  cx.fillStyle='#F00';cx.font='12px monospace';cx.textAlign='left';
+  cx.fillText('SCORE',20,14);
+  cx.fillStyle='#FFF';cx.font='16px monospace';
+  cx.fillText(String(score).padStart(6,'0'),20,30);
+
+  cx.fillStyle='#F00';cx.font='12px monospace';cx.textAlign='center';
+  cx.fillText('HIGH SCORE',W/2,14);
+  cx.fillStyle='#FFF';cx.font='16px monospace';
+  cx.fillText(String(hiScore).padStart(6,'0'),W/2,30);
+
+  cx.fillStyle='#0CF';cx.font='12px monospace';cx.textAlign='left';
+  cx.fillText('BONUS',520,14);
+  cx.fillStyle=bonusTimer<1000?'#F44':'#FFF';cx.font='16px monospace';
+  cx.fillText(String(Math.max(0,Math.floor(bonusTimer))),520,30);
+
+  cx.fillStyle='#AAA';cx.font='14px monospace';cx.textAlign='right';
+  cx.fillText('L='+level,W-16,30);
+
+  // Lives
+  for(let i=0;i<Math.min(4,lives-1);i++){
+    const lx=24+i*20,ly=754;
+    cx.fillStyle='#CC0000';cx.fillRect(lx-4,ly-10,8,4);
+    cx.fillStyle='#0000AA';cx.fillRect(lx-5,ly-6,10,10);
+  }
+}
+
+// Main loop
+let lastTime=0;
+function loop(now){
+  requestAnimationFrame(loop);
+  if(!lastTime){lastTime=now;return;}
+  let dt=(now-lastTime)/1000;
+  lastTime=now;
+  if(dt>0.05)dt=0.05;
+  update(dt);
+  render();
+}
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

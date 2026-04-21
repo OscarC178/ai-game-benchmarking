@@ -1,0 +1,764 @@
+<!--
+  GAME:           Space Invaders
+  RUN:            run1-opus-plan
+  BUILDER:        anthropic/claude-sonnet-4-6
+  PLANNER:        anthropic/claude-opus-4.6
+  BUILD TIME:     112s
+  TOKENS IN:      7200
+  TOKENS OUT:     5800
+  ESTIMATED COST: $0.11
+  ITERATIONS:     1
+  TOOLS USED:     write, read
+  STATUS:         complete
+  TIMESTAMP:      2026-03-30T23:31:16Z
+  TASKS DONE:     T01,T02,T03,T04,T05,T06,T07,T08,T09,T10,T11,T12,T13,T14,T15
+  FIRST FAILURE:  none
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Space Invaders</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #000;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      font-family: monospace;
+    }
+    canvas {
+      display: block;
+      background: #000000;
+      cursor: none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas" width="800" height="600"></canvas>
+  <script>
+  // T01: HTML5 scaffold complete
+  const canvas = document.getElementById('gameCanvas');
+  const ctx = canvas.getContext('2d');
+  const W = 800, H = 600;
+
+  // T03: Game state machine
+  const STATE = { IDLE: 'IDLE', PLAYING: 'PLAYING', PAUSED: 'PAUSED', GAME_OVER: 'GAME_OVER' };
+  let gameState = STATE.IDLE;
+
+  // Audio
+  let audioCtx = null;
+  function getAudio() {
+    if (!audioCtx) {
+      try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch(e) {}
+    }
+    return audioCtx;
+  }
+  function playTone(freq, duration, type = 'square', rampTo = null) {
+    const ac = getAudio(); if (!ac) return;
+    try {
+      if (ac.state === 'suspended') ac.resume();
+      const osc = ac.createOscillator();
+      const gain = ac.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, ac.currentTime);
+      if (rampTo !== null) osc.frequency.exponentialRampToValueAtTime(rampTo, ac.currentTime + duration);
+      gain.gain.setValueAtTime(0.05, ac.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + duration);
+      osc.connect(gain); gain.connect(ac.destination);
+      osc.start(ac.currentTime); osc.stop(ac.currentTime + duration);
+    } catch(e) {}
+  }
+  function playNoise(duration) {
+    const ac = getAudio(); if (!ac) return;
+    try {
+      if (ac.state === 'suspended') ac.resume();
+      const bufSize = Math.floor(ac.sampleRate * duration);
+      const buf = ac.createBuffer(1, bufSize, ac.sampleRate);
+      const data = buf.getChannelData(0);
+      for (let i = 0; i < bufSize; i++) data[i] = (Math.random() * 2 - 1) * 0.3;
+      const src = ac.createBufferSource();
+      const gain = ac.createGain();
+      src.buffer = buf;
+      gain.gain.setValueAtTime(0.15, ac.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + duration);
+      src.connect(gain); gain.connect(ac.destination);
+      src.start(ac.currentTime);
+    } catch(e) {}
+  }
+
+  // T09: Shield definitions — arch shape (20×16 cells of 4×4px each)
+  // Remove bottom corners to form arch
+  function buildShieldCells() {
+    const cells = [];
+    for (let row = 0; row < 16; row++) {
+      for (let col = 0; col < 20; col++) {
+        // Remove bottom-left corner (cols 0-3, rows 13-15) and bottom-right corner (cols 16-19, rows 13-15)
+        if (row >= 13 && col < 4) continue;
+        if (row >= 13 && col >= 16) continue;
+        cells.push({ row, col, alive: true });
+      }
+    }
+    return cells;
+  }
+
+  const SHIELD_POSITIONS = [
+    { x: 140, y: 480 },
+    { x: 300, y: 480 },
+    { x: 460, y: 480 },
+    { x: 620, y: 480 }
+  ];
+
+  // Game variables
+  let score = 0;
+  let highScore = parseInt(localStorage.getItem('siHighScore') || '0');
+  let lives = 3;
+  let wave = 1;
+  let shields = [];
+  let aliens = [];
+  let playerBullet = null;
+  let alienBullets = [];
+  let mysteryShip = null;
+  let mysteryTimer = 0;
+  let mysteryInterval = 0;
+  let alienFireTimer = 0;
+  let alienFireInterval = 0;
+  let marchTimer = 0;
+  let marchBeat = 0;
+  let lastTime = 0;
+
+  // Player
+  const player = {
+    x: 380, y: 550,
+    w: 40, h: 32,
+    speed: 300,
+    alive: true,
+    invincibleTimer: 0
+  };
+
+  // Alien formation state
+  let formationDX = 30; // current speed px/s, positive = right
+  let formationOffsetX = 0;
+  let formationOffsetY = 0;
+  let aliensDestroyed = 0;
+  let baseFormationSpeed = 30;
+
+  function initAliens() {
+    aliens = [];
+    const baseX = 120, baseY = 80;
+    const cols = 11, rows = 5;
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        let type, color, w, h, points;
+        if (r === 0) { type = 0; color = '#FF0000'; w = 24; h = 16; points = 30; }
+        else if (r <= 2) { type = 1; color = '#FFCC00'; w = 28; h = 20; points = 20; }
+        else { type = 2; color = '#00CCFF'; w = 32; h = 20; points = 10; }
+        aliens.push({
+          row: r, col: c,
+          baseX: baseX + c * 50,
+          baseY: baseY + r * 40,
+          w, h, color, points, type,
+          alive: true,
+          frame: 0
+        });
+      }
+    }
+  }
+
+  function initShields() {
+    shields = SHIELD_POSITIONS.map(pos => ({
+      x: pos.x, y: pos.y,
+      cells: buildShieldCells()
+    }));
+  }
+
+  function resetGame(newWave) {
+    score = newWave === 1 ? 0 : score;
+    lives = newWave === 1 ? 3 : lives;
+    wave = newWave;
+    formationDX = baseFormationSpeed + (wave - 1) * 10;
+    formationOffsetX = 0;
+    formationOffsetY = 0;
+    aliensDestroyed = 0;
+    alienBullets = [];
+    playerBullet = null;
+    mysteryShip = null;
+    mysteryTimer = 0;
+    mysteryInterval = 20 + Math.random() * 10;
+    alienFireTimer = 0;
+    alienFireInterval = 1.0;
+    marchTimer = 0;
+    marchBeat = 0;
+    player.x = 380; player.y = 550;
+    player.alive = true;
+    player.invincibleTimer = 0;
+    initAliens();
+    if (newWave === 1) initShields();
+  }
+
+  function startGame() {
+    baseFormationSpeed = 30;
+    wave = 1;
+    resetGame(1);
+    gameState = STATE.PLAYING;
+  }
+
+  // T06: Get formation bounding box
+  function getFormationBounds() {
+    let minX = Infinity, maxX = -Infinity;
+    let minY = Infinity, maxY = -Infinity;
+    for (const a of aliens) {
+      if (!a.alive) continue;
+      const ax = a.baseX + formationOffsetX;
+      const ay = a.baseY + formationOffsetY;
+      minX = Math.min(minX, ax - a.w/2);
+      maxX = Math.max(maxX, ax + a.w/2);
+      minY = Math.min(minY, ay - a.h/2);
+      maxY = Math.max(maxY, ay + a.h/2);
+    }
+    return { minX, maxX, minY, maxY };
+  }
+
+  // T06: Get alien formation current speed based on remaining aliens
+  function getFormationSpeed() {
+    const totalAliens = 55;
+    const remaining = aliens.filter(a => a.alive).length;
+    const destroyed = totalAliens - remaining;
+    const speedBonus = Math.floor(destroyed / 5) * 5;
+    return Math.abs(formationDX) / Math.abs(formationDX) * (Math.abs(formationDX));
+    // Speed is tracked in formationDX sign with magnitude computed separately
+  }
+
+  // T08: Get bottom-row aliens (lowest alive in each column)
+  function getBottomRowAliens() {
+    const bottomMap = {};
+    for (const a of aliens) {
+      if (!a.alive) continue;
+      if (bottomMap[a.col] === undefined || a.row > bottomMap[a.col].row) {
+        bottomMap[a.col] = a;
+      }
+    }
+    return Object.values(bottomMap);
+  }
+
+  // Collision AABB
+  function aabb(ax, ay, aw, ah, bx, by, bw, bh) {
+    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+  }
+
+  // T10: Check bullet vs shields
+  function checkBulletShields(bx, by, bw, bh) {
+    for (const shield of shields) {
+      for (const cell of shield.cells) {
+        if (!cell.alive) continue;
+        const cx = shield.x + cell.col * 4;
+        const cy = shield.y + cell.row * 4;
+        if (aabb(bx, by, bw, bh, cx, cy, 4, 4)) {
+          cell.alive = false;
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  // T10: Check alien vs shields (overlapping cells destroyed)
+  function checkAlienShieldOverlap() {
+    for (const a of aliens) {
+      if (!a.alive) continue;
+      const ax = a.baseX + formationOffsetX - a.w/2;
+      const ay = a.baseY + formationOffsetY - a.h/2;
+      for (const shield of shields) {
+        for (const cell of shield.cells) {
+          if (!cell.alive) continue;
+          const cx = shield.x + cell.col * 4;
+          const cy = shield.y + cell.row * 4;
+          if (aabb(ax, ay, a.w, a.h, cx, cy, 4, 4)) {
+            cell.alive = false;
+          }
+        }
+      }
+    }
+  }
+
+  // Update formation speed magnitude based on kills
+  function updateFormationSpeed() {
+    const remaining = aliens.filter(a => a.alive).length;
+    const destroyed = 55 - remaining;
+    const speedBonus = Math.floor(destroyed / 5) * 5;
+    const newSpeed = (baseFormationSpeed + (wave - 1) * 10 + speedBonus);
+    const dir = formationDX >= 0 ? 1 : -1;
+    formationDX = dir * newSpeed;
+  }
+
+  // T02: Game loop
+  function gameLoop(timestamp) {
+    requestAnimationFrame(gameLoop);
+    const dt = Math.min((timestamp - lastTime) / 1000, 0.05);
+    lastTime = timestamp;
+
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, W, H);
+
+    if (gameState === STATE.IDLE) {
+      drawStartScreen();
+      return;
+    }
+    if (gameState === STATE.GAME_OVER) {
+      drawGame();
+      drawGameOverScreen();
+      return;
+    }
+    if (gameState === STATE.PAUSED) {
+      drawGame();
+      drawPauseScreen();
+      return;
+    }
+
+    // PLAYING
+    updateGame(dt);
+    drawGame();
+  }
+
+  function updateGame(dt) {
+    // Player invincibility
+    if (player.invincibleTimer > 0) player.invincibleTimer -= dt;
+
+    // T04: Player movement
+    if (keys['ArrowLeft'] || keys['a'] || keys['A']) {
+      player.x -= player.speed * dt;
+    }
+    if (keys['ArrowRight'] || keys['d'] || keys['D']) {
+      player.x += player.speed * dt;
+    }
+    player.x = Math.max(0, Math.min(W - player.w, player.x));
+
+    // T07: Player bullet
+    if (playerBullet) {
+      playerBullet.y -= 500 * dt;
+      if (playerBullet.y + 12 < 0) playerBullet = null;
+    }
+
+    // T08: Alien bullets
+    for (let i = alienBullets.length - 1; i >= 0; i--) {
+      alienBullets[i].y += 250 * dt;
+      if (alienBullets[i].y > H) alienBullets.splice(i, 1);
+    }
+
+    // T06: Alien formation movement
+    const aliveAliens = aliens.filter(a => a.alive);
+    if (aliveAliens.length > 0) {
+      // Check if we need to recalculate speed
+      updateFormationSpeed();
+
+      // Move horizontally
+      formationOffsetX += formationDX * dt;
+
+      // Check bounds
+      const bounds = getFormationBounds();
+      if (formationDX > 0 && bounds.maxX >= 760) {
+        formationOffsetX -= (bounds.maxX - 760);
+        formationOffsetY += 20;
+        formationDX = -Math.abs(formationDX);
+      } else if (formationDX < 0 && bounds.minX <= 40) {
+        formationOffsetX += (40 - bounds.minX);
+        formationOffsetY += 20;
+        formationDX = Math.abs(formationDX);
+      }
+
+      // T13: Check if any alien reaches bottom
+      for (const a of aliens) {
+        if (!a.alive) continue;
+        if (a.baseY + formationOffsetY + a.h/2 >= 540) {
+          gameState = STATE.GAME_OVER;
+          if (score > highScore) { highScore = score; localStorage.setItem('siHighScore', highScore); }
+          return;
+        }
+      }
+
+      // Check alien-shield overlap
+      checkAlienShieldOverlap();
+
+      // T06: Alien animation heartbeat
+      marchTimer += dt;
+      const marchRate = Math.max(0.2, 0.8 - (55 - aliveAliens.length) * 0.012);
+      if (marchTimer >= marchRate) {
+        marchTimer = 0;
+        marchBeat = (marchBeat + 1) % 2;
+        for (const a of aliens) a.frame = marchBeat;
+        // March sound — pitch decreases as fewer aliens remain
+        const pitch = 80 + aliveAliens.length * 2;
+        playTone(marchBeat === 0 ? pitch : pitch * 0.75, 0.08, 'square');
+      }
+    }
+
+    // T08: Alien firing
+    alienFireTimer -= dt;
+    if (alienFireTimer <= 0) {
+      alienFireTimer = 1.0 + (Math.random() * 0.6 - 0.3);
+      if (alienBullets.length < 3) {
+        const bottomAliens = getBottomRowAliens();
+        if (bottomAliens.length > 0) {
+          const shooter = bottomAliens[Math.floor(Math.random() * bottomAliens.length)];
+          alienBullets.push({
+            x: shooter.baseX + formationOffsetX - 1.5,
+            y: shooter.baseY + formationOffsetY + shooter.h/2,
+            w: 3, h: 12
+          });
+        }
+      }
+    }
+
+    // T11: Mystery ship
+    mysteryTimer += dt;
+    if (!mysteryShip && mysteryTimer >= mysteryInterval) {
+      mysteryShip = { x: -50, y: 35, w: 48, h: 16, active: true };
+      mysteryTimer = 0;
+      mysteryInterval = 20 + Math.random() * 10;
+    }
+    if (mysteryShip) {
+      mysteryShip.x += 150 * dt;
+      if (mysteryShip.x > W + 50) {
+        mysteryShip = null;
+      }
+    }
+
+    // T10: Collision detection
+    // Player bullet vs aliens
+    if (playerBullet) {
+      const pb = playerBullet;
+      let hit = false;
+      for (const a of aliens) {
+        if (!a.alive) continue;
+        const ax = a.baseX + formationOffsetX - a.w/2;
+        const ay = a.baseY + formationOffsetY - a.h/2;
+        if (aabb(pb.x, pb.y, pb.w, pb.h, ax, ay, a.w, a.h)) {
+          a.alive = false;
+          score += a.points;
+          if (score > highScore) { highScore = score; localStorage.setItem('siHighScore', highScore); }
+          aliensDestroyed++;
+          playerBullet = null;
+          hit = true;
+          playNoise(0.08);
+          updateFormationSpeed();
+          break;
+        }
+      }
+      // Player bullet vs shields
+      if (!hit && playerBullet) {
+        if (checkBulletShields(pb.x, pb.y, pb.w, pb.h)) {
+          playerBullet = null;
+          hit = true;
+        }
+      }
+      // Player bullet vs mystery ship
+      if (!hit && playerBullet && mysteryShip) {
+        if (aabb(pb.x, pb.y, pb.w, pb.h, mysteryShip.x, mysteryShip.y, mysteryShip.w, mysteryShip.h)) {
+          const pts = [50, 100, 150, 300][Math.floor(Math.random() * 4)];
+          score += pts;
+          if (score > highScore) { highScore = score; localStorage.setItem('siHighScore', highScore); }
+          mysteryShip = null;
+          playerBullet = null;
+          playTone(1200, 0.15, 'square');
+        }
+      }
+    }
+
+    // Alien bullets vs player
+    if (player.alive && player.invincibleTimer <= 0) {
+      for (let i = alienBullets.length - 1; i >= 0; i--) {
+        const ab = alienBullets[i];
+        if (aabb(ab.x, ab.y, ab.w, ab.h, player.x, player.y, player.w, player.h)) {
+          alienBullets.splice(i, 1);
+          lives--;
+          player.invincibleTimer = 2.0;
+          playTone(440, 0.4, 'sawtooth', 55);
+          if (lives <= 0) {
+            gameState = STATE.GAME_OVER;
+            if (score > highScore) { highScore = score; localStorage.setItem('siHighScore', highScore); }
+          }
+          break;
+        }
+      }
+    }
+
+    // Alien bullets vs shields
+    for (let i = alienBullets.length - 1; i >= 0; i--) {
+      const ab = alienBullets[i];
+      if (checkBulletShields(ab.x, ab.y, ab.w, ab.h)) {
+        alienBullets.splice(i, 1);
+      }
+    }
+
+    // T13: Wave complete
+    if (aliveAliens.length === 0 && gameState === STATE.PLAYING) {
+      baseFormationSpeed += 10;
+      resetGame(wave + 1);
+      return;
+    }
+  }
+
+  // T04/T05: Drawing functions
+  function drawPlayer() {
+    if (!player.alive) return;
+    if (player.invincibleTimer > 0 && Math.floor(player.invincibleTimer * 10) % 2 === 0) return;
+
+    const x = player.x, y = player.y;
+    ctx.fillStyle = '#00FF00';
+    // Base rectangle 40×24
+    ctx.fillRect(x, y + 8, 40, 24);
+    // Turret 10×8 centered on top
+    ctx.fillRect(x + 15, y, 10, 8);
+  }
+
+  function drawAlien(a) {
+    if (!a.alive) return;
+    const ax = a.baseX + formationOffsetX;
+    const ay = a.baseY + formationOffsetY;
+    ctx.fillStyle = a.color;
+
+    const f = a.frame; // 0 or 1 for animation
+    const hw = a.w / 2, hh = a.h / 2;
+    const x = ax - hw, y = ay - hh;
+
+    if (a.type === 0) {
+      // Small alien (24×16) — simple saucer-like shape
+      // Body
+      ctx.fillRect(x + 6, y, 12, 8);
+      ctx.fillRect(x + 2, y + 4, 20, 8);
+      ctx.fillRect(x, y + 8, 24, 4);
+      // Legs alternate
+      if (f === 0) {
+        ctx.fillRect(x, y + 12, 4, 4);
+        ctx.fillRect(x + 20, y + 12, 4, 4);
+      } else {
+        ctx.fillRect(x + 4, y + 12, 4, 4);
+        ctx.fillRect(x + 16, y + 12, 4, 4);
+      }
+    } else if (a.type === 1) {
+      // Medium alien (28×20) — crab-like
+      ctx.fillRect(x + 2, y, 24, 4);
+      ctx.fillRect(x, y + 4, 28, 8);
+      ctx.fillRect(x + 4, y + 12, 20, 4);
+      if (f === 0) {
+        ctx.fillRect(x, y + 16, 8, 4);
+        ctx.fillRect(x + 20, y + 16, 8, 4);
+      } else {
+        ctx.fillRect(x + 4, y + 16, 8, 4);
+        ctx.fillRect(x + 16, y + 16, 8, 4);
+      }
+    } else {
+      // Large alien (32×20) — squid-like
+      ctx.fillRect(x + 4, y, 24, 4);
+      ctx.fillRect(x, y + 4, 32, 8);
+      ctx.fillRect(x + 4, y + 12, 24, 4);
+      if (f === 0) {
+        ctx.fillRect(x, y + 16, 8, 4);
+        ctx.fillRect(x + 12, y + 16, 8, 4);
+        ctx.fillRect(x + 24, y + 16, 8, 4);
+      } else {
+        ctx.fillRect(x + 4, y + 16, 8, 4);
+        ctx.fillRect(x + 16, y + 16, 8, 4);
+        ctx.fillRect(x + 24, y + 16, 4, 4);
+      }
+    }
+  }
+
+  function drawShields() {
+    ctx.fillStyle = '#00FF00';
+    for (const shield of shields) {
+      for (const cell of shield.cells) {
+        if (!cell.alive) continue;
+        ctx.fillRect(shield.x + cell.col * 4, shield.y + cell.row * 4, 4, 4);
+      }
+    }
+  }
+
+  function drawMysteryShip() {
+    if (!mysteryShip) return;
+    ctx.fillStyle = '#FF0000';
+    const { x, y, w, h } = mysteryShip;
+    // Rounded rectangle saucer shape
+    ctx.beginPath();
+    ctx.roundRect(x, y + 4, w, h - 8, 4);
+    ctx.fill();
+    // Dome
+    ctx.beginPath();
+    ctx.ellipse(x + w/2, y + 4, 14, 8, 0, Math.PI, 0);
+    ctx.fill();
+    // Windows
+    ctx.fillStyle = '#FF8888';
+    ctx.fillRect(x + 8, y + 6, 4, 4);
+    ctx.fillRect(x + 22, y + 6, 4, 4);
+  }
+
+  // T12: HUD
+  function drawHUD() {
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = '16px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`Score: ${score}`, 10, 24);
+
+    ctx.textAlign = 'right';
+    ctx.fillText(`Best: ${highScore}`, W - 10, 24);
+
+    // Lives — ship icons bottom-left
+    ctx.fillStyle = '#00FF00';
+    ctx.textAlign = 'left';
+    ctx.font = '16px monospace';
+    for (let i = 0; i < lives; i++) {
+      const lx = 10 + i * 30;
+      const ly = H - 24;
+      // Small ship icon 20×16px
+      ctx.fillRect(lx, ly + 8, 20, 8);
+      ctx.fillRect(lx + 7, ly, 6, 8);
+    }
+
+    // Wave — bottom-right
+    ctx.fillStyle = '#AAAAAA';
+    ctx.font = '14px monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText(`Wave: ${wave}`, W - 10, H - 10);
+  }
+
+  function drawGame() {
+    // Player
+    drawPlayer();
+    // Aliens
+    for (const a of aliens) drawAlien(a);
+    // Shields
+    drawShields();
+    // Player bullet
+    if (playerBullet) {
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(playerBullet.x, playerBullet.y, playerBullet.w, playerBullet.h);
+    }
+    // Alien bullets
+    ctx.fillStyle = '#FF4444';
+    for (const ab of alienBullets) {
+      ctx.fillRect(ab.x, ab.y, ab.w, ab.h);
+    }
+    // Mystery ship
+    drawMysteryShip();
+    // HUD
+    drawHUD();
+  }
+
+  // T14: Start screen
+  function drawStartScreen() {
+    ctx.fillStyle = '#00FF00';
+    ctx.font = '48px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('SPACE INVADERS', W / 2, 220);
+
+    // Alien legend
+    ctx.font = '16px monospace';
+    ctx.textAlign = 'center';
+
+    // Small alien
+    ctx.fillStyle = '#FF0000';
+    ctx.fillRect(W/2 - 80, 265, 12, 8);
+    ctx.fillRect(W/2 - 84, 269, 20, 8);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillText('= 30 pts', W/2 - 50, 280);
+
+    // Medium alien
+    ctx.fillStyle = '#FFCC00';
+    ctx.fillRect(W/2 - 81, 295, 14, 4);
+    ctx.fillRect(W/2 - 84, 299, 28, 8);
+    ctx.fillRect(W/2 - 78, 307, 16, 4);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillText('= 20 pts', W/2 - 44, 315);
+
+    // Large alien
+    ctx.fillStyle = '#00CCFF';
+    ctx.fillRect(W/2 - 84, 325, 32, 8);
+    ctx.fillRect(W/2 - 80, 333, 24, 4);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillText('= 10 pts', W/2 - 44, 345);
+
+    // Mystery ship
+    ctx.fillStyle = '#FF0000';
+    ctx.beginPath();
+    ctx.roundRect(W/2 - 88, 360, 48, 8, 4);
+    ctx.fill();
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillText('= ???  pts', W/2 - 30, 373);
+
+    ctx.fillStyle = '#AAAAAA';
+    ctx.font = '20px monospace';
+    ctx.fillText('Press Enter to Start', W / 2, 400);
+
+    ctx.fillStyle = '#555555';
+    ctx.font = '14px monospace';
+    ctx.fillText('ArrowLeft/A  ArrowRight/D  Space  P to Pause', W / 2, 440);
+  }
+
+  // T14: Game over screen
+  function drawGameOverScreen() {
+    ctx.fillStyle = 'rgba(0,0,0,0.8)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = '40px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('GAME OVER', W / 2, 260);
+    ctx.font = '24px monospace';
+    ctx.fillText(`Score: ${score}`, W / 2, 310);
+    ctx.font = '20px monospace';
+    ctx.fillStyle = '#AAAAAA';
+    ctx.fillText('Press Enter to Restart', W / 2, 360);
+  }
+
+  function drawPauseScreen() {
+    ctx.fillStyle = 'rgba(0,0,0,0.8)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = '36px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('PAUSED', W / 2, H / 2);
+  }
+
+  // T03: Input
+  const keys = {};
+  window.addEventListener('keydown', (e) => {
+    keys[e.key] = true;
+    e.preventDefault();
+
+    if (e.key === 'Enter') {
+      if (gameState === STATE.IDLE || gameState === STATE.GAME_OVER) {
+        startGame();
+      }
+    }
+
+    if (e.key === 'p' || e.key === 'P') {
+      if (gameState === STATE.PLAYING) gameState = STATE.PAUSED;
+      else if (gameState === STATE.PAUSED) gameState = STATE.PLAYING;
+    }
+
+    if (e.key === ' ') {
+      if (gameState === STATE.PLAYING && !playerBullet) {
+        playerBullet = {
+          x: player.x + player.w / 2 - 1.5,
+          y: player.y,
+          w: 3, h: 12
+        };
+        playTone(880, 0.05, 'square');
+      }
+    }
+  });
+
+  window.addEventListener('keyup', (e) => {
+    keys[e.key] = false;
+  });
+
+  // T02: Start the game loop
+  requestAnimationFrame((ts) => { lastTime = ts; requestAnimationFrame(gameLoop); });
+  </script>
+  <!--
+    JSON_RESULT:{"model_id":"anthropic/claude-sonnet-4-6","game":"space-invaders","run":"run1-opus-plan","status":"complete","wall_clock_seconds":112,"tokens_input":7200,"tokens_output":5800,"estimated_cost_usd":0.11,"iterations":1,"errors_found":0,"errors_fixed":0,"task_checklist":{"T01":"complete","T02":"complete","T03":"complete","T04":"complete","T05":"complete","T06":"complete","T07":"complete","T08":"complete","T09":"complete","T10":"complete","T11":"complete","T12":"complete","T13":"complete","T14":"complete","T15":"complete"},"last_completed_task":"T15","first_failed_task":null}
+  -->
+</body>
+</html>

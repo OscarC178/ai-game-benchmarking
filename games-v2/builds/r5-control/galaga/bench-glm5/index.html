@@ -1,0 +1,604 @@
+<!--
+  GAME:      Galaga
+  RUN:       r5-control
+  BUILDER:   z-ai/glm-5
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Galaga</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      background: #000;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      overflow: hidden;
+    }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <script>
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    
+    const W = 480;
+    const H = 640;
+    canvas.width = W;
+    canvas.height = H;
+    
+    const STATE_TITLE = 0;
+    const STATE_PLAYING = 1;
+    const STATE_PAUSED = 2;
+    const STATE_GAMEOVER = 3;
+    const STATE_LEVEL_CLEAR = 4;
+    
+    let state = STATE_TITLE;
+    let score = 0;
+    let highScore = parseInt(localStorage.getItem('galaga_highscore') || '0');
+    let lives = 3;
+    let stage = 1;
+    
+    // Player
+    const playerW = 40;
+    const playerH = 30;
+    let player = { x: W / 2 - playerW / 2, y: H - 70, speed: 6 };
+    let bullets = [];
+    let canShoot = true;
+    let shootCooldown = 200;
+    
+    // Enemies
+    let enemies = [];
+    let enemyBullets = [];
+    let formations = [];
+    let entranceTimer = 0;
+    let entranceComplete = false;
+    
+    // Stars background
+    let stars = [];
+    for (let i = 0; i < 100; i++) {
+      stars.push({
+        x: Math.random() * W,
+        y: Math.random() * H,
+        speed: 0.5 + Math.random() * 1.5,
+        size: Math.random() * 2 + 0.5
+      });
+    }
+    
+    const keys = {};
+    let levelClearTimer = 0;
+    
+    const ENEMY_TYPES = [
+      { points: 100, color: '#FF0000', name: 'zako' },      // Red - bottom rows
+      { points: 150, color: '#00FF00', name: 'goei' },      // Green - middle rows
+      { points: 200, color: '#FFFF00', name: 'boss' }       // Yellow - top row (boss)
+    ];
+    
+    function initGame() {
+      score = 0;
+      lives = 3;
+      stage = 1;
+      initStage();
+    }
+    
+    function initStage() {
+      player.x = W / 2 - playerW / 2;
+      bullets = [];
+      enemies = [];
+      enemyBullets = [];
+      formations = [];
+      entranceComplete = false;
+      entranceTimer = 0;
+      
+      // Create enemy formation
+      const rows = [
+        { type: 2, count: 4, y: 60 },   // Boss row
+        { type: 1, count: 8, y: 100 },  // Goei row
+        { type: 1, count: 8, y: 140 },  // Goei row
+        { type: 0, count: 10, y: 180 }, // Zako row
+        { type: 0, count: 10, y: 220 }  // Zako row
+      ];
+      
+      let enemyIndex = 0;
+      rows.forEach(row => {
+        const startX = (W - row.count * 40) / 2;
+        for (let i = 0; i < row.count; i++) {
+          enemies.push({
+            x: startX + i * 40,
+            y: -50 - enemyIndex * 20,
+            targetX: startX + i * 40,
+            targetY: row.y,
+            type: row.type,
+            state: 'entrance',
+            alive: true,
+            angle: 0,
+            entrancePath: generateEntrancePath(enemyIndex),
+            entranceStep: 0,
+            diveTimer: Math.random() * 5000 + 5000,
+            firing: false
+          });
+          enemyIndex++;
+        }
+      });
+    }
+    
+    function generateEntrancePath(index) {
+      const paths = [];
+      const startSide = index % 2 === 0 ? -1 : 1;
+      
+      // Spiral entrance path
+      paths.push({ type: 'move', x: W / 2 + startSide * 200, y: 100, duration: 60 });
+      paths.push({ type: 'arc', cx: W / 2, cy: 150, radius: 100, startAngle: startSide > 0 ? 0 : Math.PI, duration: 40 });
+      paths.push({ type: 'move', x: enemies ? enemies[index]?.targetX || W/2 : W/2, y: enemies ? enemies[index]?.targetY || 100 : 100, duration: 30 });
+      
+      return paths;
+    }
+    
+    function update(dt) {
+      if (state === STATE_LEVEL_CLEAR) {
+        levelClearTimer -= dt * 1000;
+        if (levelClearTimer <= 0) {
+          stage++;
+          initStage();
+          state = STATE_PLAYING;
+        }
+        return;
+      }
+      
+      if (state !== STATE_PLAYING) return;
+      
+      // Update stars
+      for (const star of stars) {
+        star.y += star.speed;
+        if (star.y > H) {
+          star.y = 0;
+          star.x = Math.random() * W;
+        }
+      }
+      
+      // Player movement
+      if (keys.left) player.x -= player.speed;
+      if (keys.right) player.x += player.speed;
+      player.x = Math.max(0, Math.min(W - playerW, player.x));
+      
+      // Player shooting
+      if (keys.space && canShoot) {
+        bullets.push({
+          x: player.x + playerW / 2 - 2,
+          y: player.y,
+          width: 4,
+          height: 15
+        });
+        canShoot = false;
+        setTimeout(() => canShoot = true, shootCooldown);
+      }
+      
+      // Update player bullets
+      for (let i = bullets.length - 1; i >= 0; i--) {
+        bullets[i].y -= 10;
+        if (bullets[i].y < 0) bullets.splice(i, 1);
+      }
+      
+      // Update enemies
+      updateEnemies(dt);
+      
+      // Update enemy bullets
+      for (let i = enemyBullets.length - 1; i >= 0; i--) {
+        enemyBullets[i].y += 5;
+        if (enemyBullets[i].y > H) enemyBullets.splice(i, 1);
+      }
+      
+      // Collision: player bullets vs enemies
+      for (let i = bullets.length - 1; i >= 0; i--) {
+        for (const enemy of enemies) {
+          if (!enemy.alive) continue;
+          if (bullets[i] && rectCollide(bullets[i], { x: enemy.x - 15, y: enemy.y - 15, width: 30, height: 30 })) {
+            enemy.alive = false;
+            bullets.splice(i, 1);
+            score += ENEMY_TYPES[enemy.type].points * (enemy.state === 'dive' ? 2 : 1);
+            break;
+          }
+        }
+      }
+      
+      // Collision: enemy bullets vs player
+      for (let i = enemyBullets.length - 1; i >= 0; i--) {
+        if (rectCollide(enemyBullets[i], { x: player.x, y: player.y, width: playerW, height: playerH })) {
+          enemyBullets.splice(i, 1);
+          killPlayer();
+          return;
+        }
+      }
+      
+      // Collision: enemies vs player
+      for (const enemy of enemies) {
+        if (enemy.alive && enemy.state !== 'entrance') {
+          if (rectCollide({ x: enemy.x - 15, y: enemy.y - 15, width: 30, height: 30 },
+                          { x: player.x, y: player.y, width: playerW, height: playerH })) {
+            killPlayer();
+            return;
+          }
+        }
+      }
+      
+      // Level clear
+      if (enemies.every(e => !e.alive) && entranceComplete) {
+        state = STATE_LEVEL_CLEAR;
+        levelClearTimer = 2000;
+      }
+    }
+    
+    function updateEnemies(dt) {
+      const aliveEnemies = enemies.filter(e => e.alive);
+      
+      for (const enemy of enemies) {
+        if (!enemy.alive) continue;
+        
+        if (enemy.state === 'entrance') {
+          // Entrance animation
+          enemy.entranceStep += dt * 60;
+          
+          const path = enemy.entrancePath[0];
+          if (path) {
+            const progress = Math.min(enemy.entranceStep / path.duration, 1);
+            
+            if (path.type === 'move') {
+              enemy.x += (path.x - enemy.x) * 0.1;
+              enemy.y += (path.y - enemy.y) * 0.1;
+            } else if (path.type === 'arc') {
+              const angle = path.startAngle + progress * Math.PI * 2;
+              enemy.x = path.cx + Math.cos(angle) * path.radius;
+              enemy.y = path.cy + Math.sin(angle) * path.radius;
+            }
+            
+            if (progress >= 1) {
+              enemy.entrancePath.shift();
+              enemy.entranceStep = 0;
+              
+              if (enemy.entrancePath.length === 0) {
+                enemy.state = 'formation';
+                enemy.x = enemy.targetX;
+                enemy.y = enemy.targetY;
+              }
+            }
+          }
+        } else if (enemy.state === 'formation') {
+          // Slight movement in formation
+          enemy.angle += 0.05;
+          const offsetX = Math.sin(enemy.angle) * 3;
+          enemy.x = enemy.targetX + offsetX;
+          
+          // Dive attack
+          enemy.diveTimer -= dt * 1000;
+          if (enemy.diveTimer <= 0 && aliveEnemies.length > 0 && Math.random() < 0.3) {
+            enemy.state = 'dive';
+            enemy.diveTimer = Math.random() * 5000 + 8000;
+            enemy.diveAngle = Math.atan2(player.y - enemy.y, player.x - enemy.x);
+            enemy.divePhase = 0;
+          }
+        } else if (enemy.state === 'dive') {
+          // Diving attack
+          enemy.divePhase += dt * 2;
+          
+          // Swooping dive pattern
+          const speed = 4;
+          const swoop = Math.sin(enemy.divePhase * 3) * 2;
+          
+          enemy.x += Math.cos(enemy.diveAngle) * speed + swoop;
+          enemy.y += Math.sin(enemy.diveAngle) * speed * 0.5 + 2;
+          
+          // Shoot during dive
+          if (Math.random() < 0.02) {
+            enemyBullets.push({
+              x: enemy.x - 2,
+              y: enemy.y + 15,
+              width: 4,
+              height: 12
+            });
+          }
+          
+          // Return to formation or die
+          if (enemy.y > H + 50) {
+            // Respawn at top
+            enemy.y = -50;
+            enemy.state = 'entrance';
+            enemy.entrancePath = [{ type: 'move', x: enemy.targetX, y: enemy.targetY, duration: 60 }];
+            enemy.entranceStep = 0;
+          }
+        }
+      }
+      
+      // Check if entrance phase complete
+      if (!entranceComplete && enemies.every(e => e.state !== 'entrance')) {
+        entranceComplete = true;
+      }
+      
+      // Enemies shooting from formation
+      if (entranceComplete && Math.random() < 0.02 + stage * 0.005) {
+        const shooters = enemies.filter(e => e.alive && e.state === 'formation');
+        if (shooters.length > 0) {
+          const shooter = shooters[Math.floor(Math.random() * shooters.length)];
+          enemyBullets.push({
+            x: shooter.x - 2,
+            y: shooter.y + 15,
+            width: 4,
+            height: 12
+          });
+        }
+      }
+    }
+    
+    function killPlayer() {
+      lives--;
+      if (lives <= 0) {
+        state = STATE_GAMEOVER;
+        if (score > highScore) {
+          highScore = score;
+          localStorage.setItem('galaga_highscore', highScore);
+        }
+      } else {
+        // Reset player position
+        player.x = W / 2 - playerW / 2;
+        bullets = [];
+        enemyBullets = [];
+      }
+    }
+    
+    function rectCollide(a, b) {
+      return a.x < b.x + b.width &&
+             a.x + a.width > b.x &&
+             a.y < b.y + b.height &&
+             a.y + a.height > b.y;
+    }
+    
+    function render() {
+      // Background
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, W, H);
+      
+      // Stars
+      ctx.fillStyle = '#FFF';
+      for (const star of stars) {
+        ctx.beginPath();
+        ctx.arc(star.x, star.y, star.size, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      
+      if (state === STATE_TITLE) {
+        ctx.fillStyle = '#FF0';
+        ctx.font = 'bold 56px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText('GALAGA', W / 2, 200);
+        
+        ctx.fillStyle = '#FFF';
+        ctx.font = '24px Arial';
+        ctx.fillText('Press SPACE to start', W / 2, 320);
+        
+        ctx.font = '18px Arial';
+        ctx.fillStyle = '#888';
+        ctx.fillText('Arrow Keys or A/D to move', W / 2, 420);
+        ctx.fillText('SPACE to shoot', W / 2, 450);
+        ctx.fillText('P to pause', W / 2, 480);
+        
+        ctx.fillStyle = '#FFD700';
+        ctx.font = '20px Arial';
+        ctx.fillText('High Score: ' + highScore, W / 2, 560);
+        return;
+      }
+      
+      // Draw enemies
+      for (const enemy of enemies) {
+        if (!enemy.alive) continue;
+        drawEnemy(enemy);
+      }
+      
+      // Draw enemy bullets
+      ctx.fillStyle = '#F0F';
+      for (const b of enemyBullets) {
+        ctx.fillRect(b.x, b.y, b.width, b.height);
+      }
+      
+      // Draw player
+      ctx.fillStyle = '#0FF';
+      ctx.beginPath();
+      ctx.moveTo(player.x + playerW / 2, player.y);
+      ctx.lineTo(player.x, player.y + playerH);
+      ctx.lineTo(player.x + playerW, player.y + playerH);
+      ctx.closePath();
+      ctx.fill();
+      
+      // Player cockpit
+      ctx.fillStyle = '#0AA';
+      ctx.beginPath();
+      ctx.moveTo(player.x + playerW / 2, player.y + 8);
+      ctx.lineTo(player.x + 8, player.y + playerH - 5);
+      ctx.lineTo(player.x + playerW - 8, player.y + playerH - 5);
+      ctx.closePath();
+      ctx.fill();
+      
+      // Draw player bullets
+      ctx.fillStyle = '#FF0';
+      for (const b of bullets) {
+        ctx.fillRect(b.x, b.y, b.width, b.height);
+      }
+      
+      // HUD
+      ctx.fillStyle = '#FFF';
+      ctx.font = 'bold 16px Arial';
+      ctx.textAlign = 'left';
+      ctx.fillText('SCORE: ' + score, 10, 25);
+      ctx.textAlign = 'right';
+      ctx.fillText('STAGE: ' + stage, W - 10, 25);
+      
+      // Lives
+      ctx.fillStyle = '#0FF';
+      for (let i = 0; i < lives; i++) {
+        ctx.beginPath();
+        ctx.moveTo(W - 30 - i * 25, 50);
+        ctx.lineTo(W - 40 - i * 25, 65);
+        ctx.lineTo(W - 20 - i * 25, 65);
+        ctx.closePath();
+        ctx.fill();
+      }
+      
+      if (state === STATE_PAUSED) {
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = '#FFF';
+        ctx.font = 'bold 48px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText('PAUSED', W / 2, H / 2 - 20);
+        ctx.font = '24px Arial';
+        ctx.fillText('Press P to resume', W / 2, H / 2 + 30);
+      }
+      
+      if (state === STATE_GAMEOVER) {
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
+        ctx.fillRect(0, 0, W, H);
+        
+        ctx.fillStyle = '#F00';
+        ctx.font = 'bold 48px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText('GAME OVER', W / 2, H / 2 - 80);
+        
+        ctx.fillStyle = '#FFF';
+        ctx.font = '28px Arial';
+        ctx.fillText('Score: ' + score, W / 2, H / 2 - 20);
+        
+        if (score >= highScore && score > 0) {
+          ctx.fillStyle = '#FFD700';
+          ctx.font = 'bold 24px Arial';
+          ctx.fillText('NEW HIGH SCORE!', W / 2, H / 2 + 30);
+        }
+        
+        ctx.fillStyle = '#FFF';
+        ctx.font = '20px Arial';
+        ctx.fillText('Press R to play again', W / 2, H / 2 + 90);
+        ctx.fillText('Press ESC for title', W / 2, H / 2 + 120);
+      }
+      
+      if (state === STATE_LEVEL_CLEAR) {
+        ctx.fillStyle = '#0F0';
+        ctx.font = 'bold 36px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText('STAGE ' + stage + ' CLEAR!', W / 2, H / 2);
+      }
+    }
+    
+    function drawEnemy(enemy) {
+      const type = ENEMY_TYPES[enemy.type];
+      const x = enemy.x;
+      const y = enemy.y;
+      
+      ctx.save();
+      ctx.translate(x, y);
+      
+      if (enemy.state === 'dive') {
+        ctx.rotate(Math.atan2(player.y - y, player.x - x) + Math.PI / 2);
+      }
+      
+      if (enemy.type === 2) {
+        // Boss Galaga - butterfly shape
+        ctx.fillStyle = type.color;
+        ctx.beginPath();
+        ctx.moveTo(0, -15);
+        ctx.lineTo(-20, 0);
+        ctx.lineTo(-15, 15);
+        ctx.lineTo(0, 5);
+        ctx.lineTo(15, 15);
+        ctx.lineTo(20, 0);
+        ctx.closePath();
+        ctx.fill();
+        
+        ctx.fillStyle = '#F00';
+        ctx.beginPath();
+        ctx.arc(0, -5, 5, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (enemy.type === 1) {
+        // Goei - oval with wings
+        ctx.fillStyle = type.color;
+        ctx.beginPath();
+        ctx.ellipse(0, 0, 12, 15, 0, 0, Math.PI * 2);
+        ctx.fill();
+        
+        ctx.fillStyle = '#0A0';
+        ctx.fillRect(-18, -5, 8, 10);
+        ctx.fillRect(10, -5, 8, 10);
+      } else {
+        // Zako - simple ship
+        ctx.fillStyle = type.color;
+        ctx.beginPath();
+        ctx.moveTo(0, -15);
+        ctx.lineTo(-12, 10);
+        ctx.lineTo(0, 5);
+        ctx.lineTo(12, 10);
+        ctx.closePath();
+        ctx.fill();
+        
+        ctx.fillStyle = '#800';
+        ctx.fillRect(-3, -10, 6, 10);
+      }
+      
+      ctx.restore();
+    }
+    
+    document.addEventListener('keydown', (e) => {
+      keys[e.code] = true;
+      keys[e.key] = true;
+      
+      if (state === STATE_TITLE && e.code === 'Space') {
+        initGame();
+        state = STATE_PLAYING;
+        e.preventDefault();
+      }
+      
+      if ((e.code === 'KeyP' || e.code === 'Escape') && state !== STATE_TITLE && state !== STATE_GAMEOVER) {
+        state = state === STATE_PAUSED ? STATE_PLAYING : STATE_PAUSED;
+        e.preventDefault();
+      }
+      
+      if (e.code === 'KeyR' && state !== STATE_TITLE) {
+        initGame();
+        state = STATE_PLAYING;
+        e.preventDefault();
+      }
+      
+      if (state === STATE_GAMEOVER && e.code === 'Escape') {
+        state = STATE_TITLE;
+        e.preventDefault();
+      }
+      
+      if (['ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) {
+        e.preventDefault();
+      }
+    });
+    
+    document.addEventListener('keyup', (e) => {
+      keys[e.code] = false;
+      keys[e.key] = false;
+    });
+    
+    Object.defineProperty(keys, 'left', { get() { return this['ArrowLeft'] || this['a'] || this['A']; } });
+    Object.defineProperty(keys, 'right', { get() { return this['ArrowRight'] || this['d'] || this['D']; } });
+    Object.defineProperty(keys, 'space', { get() { return this['Space']; } });
+    
+    let lastTime = 0;
+    function gameLoop(t) {
+      const dt = Math.min((t - lastTime) / 1000, 0.1);
+      lastTime = t;
+      update(dt);
+      render();
+      requestAnimationFrame(gameLoop);
+    }
+    
+    requestAnimationFrame(gameLoop);
+  </script>
+</body>
+</html>

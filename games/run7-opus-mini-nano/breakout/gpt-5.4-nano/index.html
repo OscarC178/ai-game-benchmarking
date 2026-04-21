@@ -1,0 +1,673 @@
+<!-- breakout | spec:run7-opus-mini-nano | built-by:gpt-5.4-nano -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Breakout</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #000;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+    .wrap {
+      width: 800px;
+      height: 600px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    canvas {
+      width: 800px;
+      height: 600px;
+      display: block;
+      background: #000;
+      cursor: none;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <canvas id="c" width="800" height="600" aria-label="Breakout canvas"></canvas>
+  </div>
+
+  <script>
+    (() => {
+      const canvas = document.getElementById('c');
+      const ctx = canvas.getContext('2d', { alpha: false });
+
+      const W = canvas.width;
+      const H = canvas.height;
+
+      // Audio (optional)
+      function playTone(freq, durationMs, type='square', volume=0.05, ramp=true, glideEnd=null) {
+        try {
+          const AudioContext = window.AudioContext || window.webkitAudioContext;
+          const ac = playTone._ac || (playTone._ac = new AudioContext());
+          if (ac.state === 'suspended') ac.resume().catch(()=>{});
+          const t0 = ac.currentTime;
+          const osc = ac.createOscillator();
+          const gain = ac.createGain();
+          osc.type = type;
+          osc.frequency.setValueAtTime(freq, t0);
+
+          if (ramp) {
+            // quick envelope
+            gain.gain.setValueAtTime(0.0001, t0);
+            gain.gain.exponentialRampToValueAtTime(Math.max(0.0002, volume), t0 + 0.01);
+            const t1 = t0 + durationMs/1000;
+            gain.gain.exponentialRampToValueAtTime(0.0001, t1);
+          } else {
+            gain.gain.setValueAtTime(volume, t0);
+          }
+
+          if (glideEnd != null) {
+            osc.frequency.linearRampToValueAtTime(glideEnd, t0 + durationMs/1000);
+          }
+
+          osc.connect(gain);
+          gain.connect(ac.destination);
+          osc.start(t0);
+          osc.stop(t0 + durationMs/1000 + 0.02);
+        } catch (e) {}
+      }
+
+      // Spec scoring
+      const rowPoints = [7, 5, 4, 3, 2, 1];
+      const brickColors = ['#FF0000', '#FF6600', '#FFCC00', '#00CC00', '#0088FF', '#8800FF'];
+
+      // Paddle
+      const paddle = {
+        w: 100,
+        h: 14,
+        x: 350, // top-left
+        y: 560,
+        speed: 500
+      };
+
+      // Ball
+      const ball = {
+        r: 8,
+        x: 400, // center
+        y: 550, // center
+        vx: 0,
+        vy: 0,
+        speed: 350,
+        attached: true
+      };
+
+      // Bricks
+      const bricks = {
+        cols: 10,
+        rows: 6,
+        bw: 70,
+        bh: 20,
+        sx: 19,
+        sy: 50,
+        gapX: 6,
+        gapY: 4,
+        alive: [] // {x,y,row,col,alive,points,color}
+      };
+
+      // Game state machine
+      const State = {
+        IDLE: 'IDLE',
+        PLAYING: 'PLAYING',
+        PAUSED: 'PAUSED',
+        GAME_OVER: 'GAME_OVER'
+      };
+
+      let state = State.IDLE;
+      let level = 1;
+      let lives = 3;
+      let score = 0;
+      let highScore = 0;
+
+      // Input
+      const keys = new Set();
+      let mouseX = W / 2;
+
+      window.addEventListener('keydown', (e) => {
+        const k = e.key;
+        if (['ArrowLeft','ArrowRight',' '].includes(k) || e.code === 'Space') {
+          // prevent page scroll on space
+          if (k === ' ') e.preventDefault();
+        }
+        if (k === 'ArrowLeft' || k === 'ArrowRight' || k === 'a' || k === 'd' || k === 'A' || k === 'D' || k === ' ') {
+          // handled below
+        }
+        if (k === 'Enter') {
+          if (state === State.IDLE || state === State.GAME_OVER) {
+            startNewGame();
+          } else if (state === State.PAUSED) {
+            // optionally ignore; spec only says P toggles pause
+          }
+        }
+        if (k === 'p' || k === 'P') {
+          if (state === State.PLAYING) setPaused(true);
+          else if (state === State.PAUSED) setPaused(false);
+        }
+        if (k === ' ') {
+          if (state === State.PLAYING && ball.attached) {
+            launchBall();
+          }
+        }
+        if (k === 'ArrowLeft' || k === 'a' || k === 'A') keys.add('left');
+        if (k === 'ArrowRight' || k === 'd' || k === 'D') keys.add('right');
+      });
+
+      window.addEventListener('keyup', (e) => {
+        const k = e.key;
+        if (k === 'ArrowLeft' || k === 'a' || k === 'A') keys.delete('left');
+        if (k === 'ArrowRight' || k === 'd' || k === 'D') keys.delete('right');
+      });
+
+      canvas.addEventListener('mousemove', (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const x = (e.clientX - rect.left) * (canvas.width / rect.width);
+        mouseX = Math.max(0, Math.min(W, x));
+        // If playing, mouse tracks paddle center
+        if (state === State.PLAYING) {
+          paddle.x = mouseX - paddle.w / 2;
+          paddle.x = Math.max(0, Math.min(W - paddle.w, paddle.x));
+        }
+      });
+
+      canvas.addEventListener('mouseleave', () => {
+        // no-op; keep last mouse x
+      });
+
+      canvas.addEventListener('click', () => {
+        // Allow click-to-focus behavior; doesn't start game automatically.
+        canvas.focus?.();
+      });
+
+      function setPaused(p) {
+        if (p) state = State.PAUSED;
+        else state = State.PLAYING;
+      }
+
+      function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+      function randRange(a, b) { return a + Math.random() * (b - a); }
+
+      function resetBricks() {
+        bricks.alive.length = 0;
+        for (let r = 0; r < bricks.rows; r++) {
+          for (let c = 0; c < bricks.cols; c++) {
+            const x = bricks.sx + c * (bricks.bw + bricks.gapX);
+            const y = bricks.sy + r * (bricks.bh + bricks.gapY);
+            bricks.alive.push({
+              x, y,
+              w: bricks.bw, h: bricks.bh,
+              alive: true,
+              row: r,
+              col: c,
+              points: rowPoints[r],
+              color: brickColors[r]
+            });
+          }
+        }
+      }
+
+      function countBricksAlive() {
+        let n = 0;
+        for (const b of bricks.alive) if (b.alive) n++;
+        return n;
+      }
+
+      function attachBallToPaddle() {
+        ball.attached = true;
+        ball.speed = Math.min(500, 350 + (level - 1) * 20);
+        // ball should track paddle center exactly
+        ball.x = paddle.x + paddle.w / 2;
+        ball.y = paddle.y - ball.r - 0; // "resting above paddle center"
+        ball.vx = 0;
+        ball.vy = -ball.speed; // not used while attached
+      }
+
+      function launchBall() {
+        ball.attached = false;
+        const angleDeg = randRange(225, 315); // upper half
+        const ang = angleDeg * Math.PI / 180;
+        const spd = ball.speed;
+        ball.vx = Math.cos(ang) * spd;
+        ball.vy = Math.sin(ang) * spd;
+        // Ensure goes upward initially (vy should be negative)
+        if (ball.vy > 0) {
+          ball.vx = -ball.vx;
+          ball.vy = -ball.vy;
+        }
+      }
+
+      function loseLife() {
+        lives--;
+        if (lives < 0) lives = 0;
+
+        playTone(440, 300, 'square', 0.06, true, 110);
+
+        if (lives <= 0) {
+          state = State.GAME_OVER;
+          if (score > highScore) {
+            highScore = score;
+            try { localStorage.setItem('breakout_highScore', String(highScore)); } catch (e) {}
+          }
+          // Keep ball attached for clean restart prompt
+          ball.attached = true;
+        } else {
+          // reattach ball to paddle for relaunch
+          ball.attached = true;
+          attachBallToPaddle();
+        }
+      }
+
+      function startNewGame() {
+        lives = 3;
+        score = 0;
+        level = 1;
+        resetBricks();
+        paddle.x = 350;
+        ball.speed = 350; // level 1
+        ball.attached = true;
+        attachBallToPaddle();
+
+        state = State.PLAYING;
+      }
+
+      function loadHighScore() {
+        try {
+          const v = localStorage.getItem('breakout_highScore');
+          const n = v ? parseInt(v, 10) : 0;
+          highScore = Number.isFinite(n) ? n : 0;
+        } catch (e) { highScore = 0; }
+      }
+
+      loadHighScore();
+      resetBricks();
+      attachBallToPaddle();
+
+      // Collision helpers
+      function circleRectCollision(circleX, circleY, r, rectX, rectY, rectW, rectH) {
+        const closestX = clamp(circleX, rectX, rectX + rectW);
+        const closestY = clamp(circleY, rectY, rectY + rectH);
+        const dx = circleX - closestX;
+        const dy = circleY - closestY;
+        return (dx*dx + dy*dy) <= r*r;
+      }
+
+      // For brick collision face determination (don't just invert both)
+      function resolveBallVsBrick(brick, dt) {
+        // Compute AABB expanded by ball radius; then determine penetration axis using overlap along x/y.
+        // We'll move/reflect velocities without repositioning too aggressively; then allow next frame.
+        const bx = brick.x, by = brick.y, bw = brick.w, bh = brick.h;
+
+        // Ball position (center)
+        const cx = ball.x, cy = ball.y, r = ball.r;
+
+        // Find closest point on rect to circle center
+        const closestX = clamp(cx, bx, bx + bw);
+        const closestY = clamp(cy, by, by + bh);
+
+        const diffX = cx - closestX;
+        const diffY = cy - closestY;
+
+        // If not colliding, return false
+        if (diffX*diffX + diffY*diffY > r*r) return false;
+
+        // Determine hit side:
+        // If closest point lies on vertical side (left/right), reflect x.
+        // Otherwise reflect y.
+        // Also handle corner by comparing absolute distances to sides based on penetration distances.
+        let reflectX = false, reflectY = false;
+
+        // Compute overlaps with sides along x and y using expanded rect technique
+        // expanded AABB:
+        const left = bx - r;
+        const right = bx + bw + r;
+        const top = by - r;
+        const bottom = by + bh + r;
+
+        const prevX = cx - ball.vx * dt;
+        const prevY = cy - ball.vy * dt;
+
+        // Overlap distances (how far ball center is beyond expanded bounds)
+        // We'll infer which axis to reflect based on whether the collision likely occurred with x slab or y slab.
+        const collidedFromX = (prevX <= right && cx >= bx) || (prevX >= left && cx <= right); // heuristic
+        const collidedFromY = (prevY <= bottom && cy >= by) || (prevY >= top && cy <= bottom); // heuristic
+
+        // More robust: decide based on which component is larger magnitude at closest point.
+        // If closest point is on left/right side: diffX magnitude is likely driving collision.
+        // If closest point is on top/bottom: diffY magnitude is driving collision.
+        const onLeft = closestX === bx;
+        const onRight = closestX === bx + bw;
+        const onTop = closestY === by;
+        const onBottom = closestY === by + bh;
+
+        if (onLeft || onRight) reflectX = true;
+        if (onTop || onBottom) reflectY = true;
+
+        // Corner case: if both, choose larger penetration component using distance to closest point
+        if (reflectX && reflectY) {
+          if (Math.abs(diffX) > Math.abs(diffY)) {
+            reflectY = false;
+          } else {
+            reflectX = false;
+          }
+        } else if (!reflectX && !reflectY) {
+          // Shouldn't happen, but fallback by comparing which axis is larger
+          if (Math.abs(diffX) > Math.abs(diffY)) reflectX = true;
+          else reflectY = true;
+        }
+
+        // Reflect velocities
+        if (reflectX) ball.vx = -ball.vx;
+        if (reflectY) ball.vy = -ball.vy;
+
+        // Destroy brick
+        brick.alive = false;
+
+        // Score
+        score += brick.points;
+        playTone(660, 30, 'square', 0.045);
+
+        return true;
+      }
+
+      function advanceLevel() {
+        level++;
+        if (level < 1) level = 1;
+
+        resetBricks();
+        // Increase speed by +20 each level, cap 500
+        ball.speed = Math.min(500, 350 + (level - 1) * 20);
+        attachBallToPaddle();
+      }
+
+      // Rendering
+      function drawPaddle() {
+        ctx.fillStyle = '#FFFFFF';
+        // rounded rectangle effect: using radius within rect
+        const r = 4;
+        const x = paddle.x, y = paddle.y, w = paddle.w, h = paddle.h;
+        ctx.beginPath();
+        ctx.moveTo(x + r, y);
+        ctx.arcTo(x + w, y, x + w, y + h, r);
+        ctx.arcTo(x + w, y + h, x, y + h, r);
+        ctx.arcTo(x, y + h, x, y, r);
+        ctx.arcTo(x, y, x + w, y, r);
+        ctx.closePath();
+        ctx.fill();
+      }
+
+      function drawBall() {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.beginPath();
+        ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      function drawBricks() {
+        for (const b of bricks.alive) {
+          if (!b.alive) continue;
+          ctx.fillStyle = b.color;
+          ctx.fillRect(b.x, b.y, b.w, b.h);
+        }
+      }
+
+      function drawHUD() {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '16px monospace';
+        ctx.textBaseline = 'top';
+        ctx.fillText(`Score: ${score}`, 10, 24);
+
+        const hs = highScore;
+        ctx.textAlign = 'right';
+        ctx.fillText(`High: ${hs}`, W - 10, 24);
+        ctx.textAlign = 'left';
+
+        ctx.font = '18px monospace';
+        ctx.fillStyle = '#FF0000';
+        ctx.textBaseline = 'top';
+        ctx.fillText('♥'.repeat(lives), W - 10 - ('♥'.repeat(3).length * 12), 8);
+
+        ctx.fillStyle = '#AAAAAA';
+        ctx.font = '16px monospace';
+        ctx.textBaseline = 'top';
+        ctx.textAlign = 'center';
+        ctx.fillText(`Level: ${level}`, W / 2, 24);
+        ctx.textAlign = 'left';
+      }
+
+      function drawOverlay(textTop, textBottom) {
+        ctx.fillStyle = 'rgba(0,0,0,0.8)';
+        ctx.fillRect(0,0,W,H);
+        if (textTop) {
+          ctx.fillStyle = '#FFFFFF';
+          ctx.font = '56px monospace';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'alphabetic';
+          if (textTop.size) ctx.font = textTop.size + 'px monospace';
+          ctx.fillText(textTop, W/2, 250);
+        }
+        if (textBottom) {
+          ctx.fillStyle = '#FFFFFF';
+          ctx.font = '20px monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText(textBottom, W/2, 330);
+        }
+        ctx.textAlign = 'left';
+      }
+
+      function drawStartScreen() {
+        // Spec: BREAKOUT centered y=250 56px #FFFFFF monospace
+        ctx.fillStyle = '#000000';
+        ctx.fillRect(0,0,W,H);
+
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '56px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'alphabetic';
+        ctx.fillText('BREAKOUT', W/2, 250);
+
+        ctx.fillStyle = '#AAAAAA';
+        ctx.font = '20px monospace';
+        ctx.fillText('Press Enter to Start', W/2, 330);
+        ctx.textAlign = 'left';
+      }
+
+      function drawGameOverScreen() {
+        ctx.fillStyle = '#000000CC';
+        ctx.fillRect(0,0,W,H);
+
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '40px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'alphabetic';
+        ctx.fillText('GAME OVER', W/2, 240);
+
+        ctx.font = '16px monospace';
+        ctx.fillText(`Final score: ${score}`, W/2, 280);
+
+        ctx.font = '20px monospace';
+        ctx.fillText('Press Enter to Restart', W/2, 320);
+
+        ctx.textAlign = 'left';
+      }
+
+      function drawPausedScreen() {
+        ctx.fillStyle = '#000000CC';
+        ctx.fillRect(0,0,W,H);
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '36px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'alphabetic';
+        ctx.fillText('PAUSED', W/2, 270);
+        ctx.textAlign = 'left';
+      }
+
+      function render() {
+        // Always clear
+        ctx.fillStyle = '#000000';
+        ctx.fillRect(0, 0, W, H);
+
+        // Draw bricks/paddle/ball only if relevant (still ok for start)
+        if (state === State.IDLE) {
+          drawStartScreen();
+          // Still draw subtle HUD? Spec doesn't mention; keep minimal.
+          return;
+        }
+
+        drawBricks();
+        drawPaddle();
+        if (ball.attached || state === State.PLAYING) drawBall();
+        else drawBall();
+
+        drawHUD();
+
+        if (state === State.PAUSED) {
+          drawPausedScreen();
+        } else if (state === State.GAME_OVER) {
+          drawGameOverScreen();
+        }
+      }
+
+      // Physics / update
+      let last = performance.now();
+
+      function update(dt) {
+        if (state !== State.PLAYING) return;
+
+        // Paddle controls
+        const left = keys.has('left');
+        const right = keys.has('right');
+
+        let dir = 0;
+        if (left) dir -= 1;
+        if (right) dir += 1;
+
+        if (dir !== 0) {
+          paddle.x += dir * paddle.speed * dt;
+          paddle.x = clamp(paddle.x, 0, W - paddle.w);
+          // mouse may also update paddle; but we only set with mouse on mousemove.
+        } else {
+          // mouse tracks when not pressing keys (already updated on mousemove)
+          // keep paddle centered if ball is attached and user is not moving paddle? Not required.
+        }
+
+        // Ball attach tracking
+        if (ball.attached) {
+          ball.x = paddle.x + paddle.w / 2;
+          ball.y = paddle.y - ball.r;
+          return; // no movement while attached
+        }
+
+        // Step movement with some substeps to reduce tunneling
+        const maxStep = 1/240; // 4 substeps per frame at 60fps
+        const steps = Math.max(1, Math.ceil(dt / maxStep));
+        const stepDt = dt / steps;
+
+        for (let s = 0; s < steps; s++) {
+          // Move
+          ball.x += ball.vx * stepDt;
+          ball.y += ball.vy * stepDt;
+
+          // Wall collisions: left/right/top
+          if (ball.x - ball.r <= 0) {
+            ball.x = ball.r;
+            ball.vx = Math.abs(ball.vx);
+          } else if (ball.x + ball.r >= W) {
+            ball.x = W - ball.r;
+            ball.vx = -Math.abs(ball.vx);
+          }
+          if (ball.y - ball.r <= 0) {
+            ball.y = ball.r;
+            ball.vy = Math.abs(ball.vy);
+          }
+
+          // Paddle collision (circle-rect)
+          if (circleRectCollision(ball.x, ball.y, ball.r, paddle.x, paddle.y, paddle.w, paddle.h)) {
+            // Reflect y-velocity and adjust angle based on offset from paddle center
+            const paddleCenterX = paddle.x + paddle.w / 2;
+            const offset = (ball.x - paddleCenterX) / (paddle.w / 2); // -1..1
+            const angle = offset * (60 * Math.PI / 180); // Pong formula
+            const speed = Math.hypot(ball.vx, ball.vy) || ball.speed;
+
+            // Ball should go upward after hit: vy negative
+            const newVx = speed * Math.sin(angle);
+            const newVy = -Math.abs(speed * Math.cos(angle));
+
+            ball.vx = newVx;
+            ball.vy = newVy;
+
+            // Avoid sticking: nudge out above paddle
+            ball.y = paddle.y - ball.r - 0.1;
+
+            playTone(440, 30, 'square', 0.05);
+          }
+
+          // Brick collision: first collision per frame (within substeps too; we stop after first hit in this substep)
+          let hit = false;
+          for (const b of bricks.alive) {
+            if (!b.alive) continue;
+            // AABB circle collision
+            if (!circleRectCollision(ball.x, ball.y, ball.r, b.x, b.y, b.w, b.h)) continue;
+
+            // determine hit face based on penetration axis heuristic
+            hit = resolveBallVsBrick(b, stepDt);
+            if (hit) break;
+          }
+          if (hit) {
+            // keep going with remaining substeps but spec says one brick per frame;
+            // Since we can still collide again after reflection in same frame, limit:
+            // We'll end substeps early for this frame.
+            // To follow spec more strictly, break the substep loop.
+            s = steps; // exit
+          }
+
+          // Bottom loss
+          if (ball.y - ball.r > H) {
+            loseLife();
+            break;
+          }
+        }
+
+        // Level clear
+        if (countBricksAlive() === 0 && state === State.PLAYING) {
+          // Level clear should advance
+          playTone(440, 120, 'square', 0.05, true, 880);
+          // Small delay? spec doesn't require; advance immediately.
+          advanceLevel();
+          // after level clear, state remains PLAYING
+        }
+      }
+
+      function loop(now) {
+        const dt = Math.min(0.05, (now - last) / 1000);
+        last = now;
+
+        update(dt);
+        render();
+
+        requestAnimationFrame(loop);
+      }
+
+      requestAnimationFrame(loop);
+
+      // Make sure Enter starts while idle even if focus outside
+      window.addEventListener('blur', () => {
+        if (state === State.PLAYING) setPaused(true);
+      });
+
+      // Start with idle render
+      state = State.IDLE;
+      resetBricks();
+      attachBallToPaddle();
+      render();
+    })();
+  </script>
+</body>
+</html>

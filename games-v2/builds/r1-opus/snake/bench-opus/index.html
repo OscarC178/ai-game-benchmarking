@@ -1,0 +1,714 @@
+<!--
+  GAME:      Snake
+  RUN:       r1-opus
+  BUILDER:   anthropic/claude-opus-4.6
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Snake</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0a;display:flex;justify-content:center;align-items:center;height:100vh;overflow:hidden}
+canvas{display:block}
+</style>
+</head>
+<body>
+<canvas id="c" width="660" height="700"></canvas>
+<script>
+(function(){
+'use strict';
+const canvas=document.getElementById('c'),ctx=canvas.getContext('2d');
+const CW=660,CH=700,COLS=20,ROWS=20,CELL=31;
+const AREA_X=20,AREA_Y=40,AREA_W=620,AREA_H=620;
+const HUD_H=40;
+
+// Directions
+const UP={x:0,y:-1},DOWN={x:0,y:1},LEFT={x:-1,y:0},RIGHT={x:1,y:0};
+function opposite(a,b){return a.x===-b.x&&a.y===-b.y}
+
+// Speed levels
+const LEVELS=[
+  {score:0,tps:7},{score:50,tps:8},{score:100,tps:9},{score:180,tps:10},
+  {score:280,tps:11},{score:420,tps:12},{score:600,tps:13},{score:800,tps:14},{score:1100,tps:15}
+];
+
+// States
+const TITLE=0,COUNTDOWN=1,PLAYING=2,PAUSED=3,DYING=4,GAME_OVER=5;
+
+// Game vars
+let state,score,bestScore,foodEaten,growthPending,level,tickInterval;
+let snake,heading,dirQueue,food,bonus;
+let accumulator,tickProgress,lastTime;
+let countdownPhase,countdownTimer;
+let dyingTimer,dyingPhase;
+let newBestAchieved;
+
+// Per-segment prev/curr for interpolation
+let segPrev,segCurr;
+let headTurnedThisTick;
+
+// Bonus
+let bonusTimer,bonusActive;
+
+// Demo snake (title)
+let demoSnake,demoDir,demoFood,demoDeadTimer,demoGrowth;
+
+// Audio
+let audioCtx=null,audioReady=false;
+function initAudio(){
+  if(audioReady)return;
+  try{audioCtx=new(window.AudioContext||window.webkitAudioContext)();audioReady=true;}catch(e){}
+}
+function playTone(freq,dur,gain,type,bendTo){
+  if(!audioCtx)return;
+  try{
+    const o=audioCtx.createOscillator(),g=audioCtx.createGain();
+    o.type=type||'square';o.frequency.value=freq;
+    g.gain.value=gain||0.2;
+    if(bendTo!=null)o.frequency.linearRampToValueAtTime(bendTo,audioCtx.currentTime+dur);
+    o.connect(g);g.connect(audioCtx.destination);
+    o.start(audioCtx.currentTime);o.stop(audioCtx.currentTime+dur);
+  }catch(e){}
+}
+function sndEat(){playTone(600,0.055,0.2,'square');}
+function sndBonus(){
+  playTone(600,0.045,0.2);
+  setTimeout(()=>playTone(800,0.045,0.2),50);
+  setTimeout(()=>playTone(1050,0.045,0.2),100);
+}
+function sndTurn(){playTone(140,0.012,0.06,'triangle');}
+function sndLevelUp(){playTone(350,0.2,0.18,'sawtooth',700);}
+function sndDeath(){playTone(200,0.45,0.3,'square',55);}
+function sndHighScore(){
+  const notes=[523,659,784,1047];
+  notes.forEach((f,i)=>setTimeout(()=>playTone(f,0.065,0.2,'square'),i*70));
+}
+
+// Keys
+const keys={};
+const pressed={};
+window.addEventListener('keydown',e=>{
+  if(!keys[e.code])pressed[e.code]=true;
+  keys[e.code]=true;
+  e.preventDefault();
+  handleInput(e.code);
+});
+window.addEventListener('keyup',e=>{keys[e.code]=false;});
+
+function handleInput(code){
+  if(state===PLAYING||state===COUNTDOWN){
+    let dir=null;
+    if(code==='ArrowUp'||code==='KeyW')dir=UP;
+    else if(code==='ArrowDown'||code==='KeyS')dir=DOWN;
+    else if(code==='ArrowLeft'||code==='KeyA')dir=LEFT;
+    else if(code==='ArrowRight'||code==='KeyD')dir=RIGHT;
+    if(dir&&state===PLAYING||dir&&state===COUNTDOWN){
+      if(dirQueue.length>=2)return;
+      const ref=dirQueue.length>0?dirQueue[dirQueue.length-1]:heading;
+      if(!opposite(dir,ref)){
+        dirQueue.push(dir);
+        if(state===PLAYING)sndTurn();
+      }
+    }
+  }
+  if(code==='KeyP'||code==='Escape'){
+    if(state===PLAYING){state=PAUSED;return;}
+    if(state===PAUSED){state=PLAYING;return;}
+  }
+  if(code==='Enter'||code==='NumpadEnter'){
+    initAudio();
+    if(state===TITLE){startGame();return;}
+    if(state===GAME_OVER){state=TITLE;initDemo();return;}
+  }
+}
+
+// Grid ↔ Pixel
+function g2px(gx){return gx*CELL+AREA_X;}
+function g2py(gy){return gy*CELL+AREA_Y;}
+
+// Random empty cell
+function randomEmpty(snk,fd,bn){
+  const occ=new Set();
+  snk.forEach(s=>occ.add(s.x+','+s.y));
+  if(fd)occ.add(fd.x+','+fd.y);
+  if(bn)occ.add(bn.x+','+bn.y);
+  const empty=[];
+  for(let x=0;x<COLS;x++)for(let y=0;y<ROWS;y++)
+    if(!occ.has(x+','+y))empty.push({x,y});
+  if(empty.length===0)return null;
+  return empty[Math.floor(Math.random()*empty.length)];
+}
+
+function spawnFood(){food=randomEmpty(snake,null,bonusActive?bonus:null);}
+function spawnBonus(){
+  bonus=randomEmpty(snake,food,null);
+  if(bonus){bonusTimer=8000;bonusActive=true;}
+}
+
+function computeLevel(){
+  let l=0;
+  for(let i=LEVELS.length-1;i>=0;i--){if(score>=LEVELS[i].score){l=i;break;}}
+  if(l>level){level=l;sndLevelUp();}
+  else level=l;
+  tickInterval=1000/LEVELS[level].tps;
+}
+
+// Start game
+function startGame(){
+  state=COUNTDOWN;
+  score=0;foodEaten=0;growthPending=0;
+  level=0;tickInterval=1000/7;
+  accumulator=0;tickProgress=0;
+  dirQueue=[];heading=RIGHT;
+  headTurnedThisTick=false;
+  newBestAchieved=false;
+  snake=[{x:10,y:10},{x:9,y:10},{x:8,y:10}];
+  segPrev=snake.map(s=>({x:s.x,y:s.y}));
+  segCurr=snake.map(s=>({x:s.x,y:s.y}));
+  food=null;bonus=null;bonusActive=false;bonusTimer=0;
+  spawnFood();
+  countdownPhase=0;countdownTimer=0;
+}
+
+// Game tick
+function gameTick(){
+  // Dequeue direction
+  headTurnedThisTick=false;
+  if(dirQueue.length>0){
+    const candidate=dirQueue.shift();
+    if(!opposite(candidate,heading)){
+      if(candidate!==heading)headTurnedThisTick=true;
+      heading=candidate;
+    }
+  }
+
+  // Compute new head
+  const head=snake[0];
+  const nh={x:head.x+heading.x,y:head.y+heading.y};
+
+  // Wall collision
+  if(nh.x<0||nh.x>=COLS||nh.y<0||nh.y>=ROWS){die();return;}
+
+  // Self collision (with tail-chase exception)
+  const willGrow=growthPending>0;
+  for(let i=1;i<snake.length;i++){
+    if(!willGrow&&i===snake.length-1)continue;
+    if(snake[i].x===nh.x&&snake[i].y===nh.y){die();return;}
+  }
+
+  // Store prev positions
+  segPrev=snake.map(s=>({x:s.x,y:s.y}));
+
+  // Eat food?
+  let ate=false;
+  if(food&&nh.x===food.x&&nh.y===food.y){
+    score+=10;foodEaten++;growthPending++;ate=true;
+    sndEat();
+    checkBest();
+    computeLevel();
+    if(foodEaten%5===0)spawnBonus();
+    spawnFood();
+  }
+
+  // Eat bonus?
+  if(bonusActive&&bonus&&nh.x===bonus.x&&nh.y===bonus.y){
+    score+=50;bonusActive=false;bonus=null;
+    sndBonus();checkBest();computeLevel();
+  }
+
+  // Move snake
+  snake.unshift({x:nh.x,y:nh.y});
+  if(growthPending>0){growthPending--;}
+  else{snake.pop();}
+
+  // Update segCurr
+  segCurr=snake.map(s=>({x:s.x,y:s.y}));
+  // Pad segPrev if snake grew
+  while(segPrev.length<segCurr.length){
+    segPrev.push({...segPrev[segPrev.length-1]});
+  }
+}
+
+function die(){
+  sndDeath();
+  state=DYING;dyingTimer=0;dyingPhase=0;
+}
+
+function checkBest(){
+  if(score>bestScore){
+    if(!newBestAchieved){newBestAchieved=true;sndHighScore();}
+    bestScore=score;
+    try{localStorage.setItem('snake_best',String(bestScore));}catch(e){}
+  }
+}
+
+// Demo snake AI
+function initDemo(){
+  demoSnake=[{x:10,y:10},{x:9,y:10},{x:8,y:10}];
+  demoDir=RIGHT;demoGrowth=0;demoDeadTimer=0;
+  demoFood=randomEmpty(demoSnake,null,null);
+}
+function demoTick(){
+  if(demoDeadTimer>0)return;
+  const h=demoSnake[0];
+  // Try to move toward food
+  let dirs=[UP,DOWN,LEFT,RIGHT];
+  // Prefer direction toward food
+  let best=null,bestDist=Infinity;
+  for(const d of dirs){
+    if(opposite(d,demoDir))continue;
+    const nx=h.x+d.x,ny=h.y+d.y;
+    if(nx<0||nx>=COLS||ny<0||ny>=ROWS)continue;
+    let selfHit=false;
+    for(let i=0;i<demoSnake.length-(demoGrowth>0?0:1);i++){
+      if(demoSnake[i].x===nx&&demoSnake[i].y===ny){selfHit=true;break;}
+    }
+    if(selfHit)continue;
+    if(demoFood){
+      const dist=Math.abs(nx-demoFood.x)+Math.abs(ny-demoFood.y);
+      if(dist<bestDist){bestDist=dist;best=d;}
+    }else{
+      best=d;break;
+    }
+  }
+  if(!best){demoDeadTimer=1;return;} // die
+  demoDir=best;
+  const nh={x:h.x+demoDir.x,y:h.y+demoDir.y};
+  demoSnake.unshift(nh);
+  let ate=false;
+  if(demoFood&&nh.x===demoFood.x&&nh.y===demoFood.y){
+    ate=true;demoGrowth++;
+  }
+  if(demoGrowth>0&&!ate){demoGrowth--;} 
+  else if(!ate){demoSnake.pop();}
+  if(ate){demoFood=randomEmpty(demoSnake,null,null);}
+}
+
+// Load best score
+bestScore=0;
+try{const v=localStorage.getItem('snake_best');if(v)bestScore=parseInt(v)||0;}catch(e){}
+
+// Init
+state=TITLE;
+initDemo();
+let demoAccum=0;
+const DEMO_INTERVAL=120;
+
+// Drawing helpers
+function roundRect(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r);
+  ctx.closePath();
+}
+
+function drawSegment(px,py,color,isHead,dir){
+  const inset=2;
+  const size=CELL-inset*2; // 27
+  const sx=px+inset,sy=py+inset;
+  ctx.fillStyle=color;
+  roundRect(sx,sy,size,size,5);
+  ctx.fill();
+  if(isHead){
+    // Eyes
+    const eyeSize=5,pupilSize=2;
+    let e1x,e1y,e2x,e2y,p1x,p1y,p2x,p2y;
+    const cx=sx+size/2,cy=sy+size/2;
+    if(!dir)dir=RIGHT;
+    if(dir===RIGHT||dir===LEFT){
+      const ex=dir===RIGHT?sx+size-3-eyeSize:sx+3;
+      e1x=ex;e1y=sy+4;e2x=ex;e2y=sy+size-4-eyeSize;
+      p1x=e1x+(dir===RIGHT?eyeSize-pupilSize-1:1);
+      p1y=e1y+1;
+      p2x=e2x+(dir===RIGHT?eyeSize-pupilSize-1:1);
+      p2y=e2y+eyeSize-pupilSize-1;
+    }else{
+      const ey=dir===UP?sy+3:sy+size-3-eyeSize;
+      e1x=sx+4;e1y=ey;e2x=sx+size-4-eyeSize;e2y=ey;
+      p1x=e1x+1;p1y=e1y+(dir===UP?1:eyeSize-pupilSize-1);
+      p2x=e2x+eyeSize-pupilSize-1;p2y=e2y+(dir===UP?1:eyeSize-pupilSize-1);
+    }
+    ctx.fillStyle='#fff';
+    roundRect(e1x,e1y,eyeSize,eyeSize,1);ctx.fill();
+    roundRect(e2x,e2y,eyeSize,eyeSize,1);ctx.fill();
+    ctx.fillStyle='#1a1a1a';
+    ctx.fillRect(p1x,p1y,pupilSize,pupilSize);
+    ctx.fillRect(p2x,p2y,pupilSize,pupilSize);
+  }
+}
+
+function drawGrid(alpha){
+  ctx.save();
+  ctx.globalAlpha=alpha||1;
+  // Background
+  ctx.fillStyle='#111111';
+  ctx.fillRect(AREA_X,AREA_Y,AREA_W,AREA_H);
+  // Grid lines
+  ctx.fillStyle='#1a1a1a';
+  for(let i=1;i<COLS;i++){
+    ctx.fillRect(AREA_X+i*CELL,AREA_Y,1,AREA_H);
+  }
+  for(let i=1;i<ROWS;i++){
+    ctx.fillRect(AREA_X,AREA_Y+i*CELL,AREA_W,1);
+  }
+  // Border
+  ctx.strokeStyle='#333333';ctx.lineWidth=2;
+  ctx.strokeRect(AREA_X,AREA_Y,AREA_W,AREA_H);
+  ctx.restore();
+}
+
+function drawHUD(){
+  // Background
+  ctx.fillStyle='#0a0a0a';
+  ctx.fillRect(0,0,CW,HUD_H);
+  // Score
+  ctx.fillStyle='#ffffff';ctx.font='17px monospace';ctx.textAlign='left';ctx.textBaseline='middle';
+  ctx.fillText('Score: '+score,24,27);
+  // Best
+  ctx.fillStyle='#555555';ctx.textAlign='right';
+  ctx.fillText('Best: '+bestScore,636,27);
+  // Speed dots
+  ctx.textAlign='center';
+  const dotY=27,dotSpacing=12,dotRadius=3;
+  const startX=CW/2-(LEVELS.length-1)*dotSpacing/2;
+  for(let i=0;i<LEVELS.length;i++){
+    ctx.beginPath();
+    ctx.arc(startX+i*dotSpacing,dotY,dotRadius,0,Math.PI*2);
+    ctx.fillStyle=i<=level?'#4caf50':'#2a2a2a';
+    ctx.fill();
+  }
+  // Divider
+  ctx.fillStyle='#222222';
+  ctx.fillRect(0,39,CW,1);
+}
+
+function drawFood(){
+  if(!food)return;
+  const cx=g2px(food.x)+CELL/2,cy=g2py(food.y)+CELL/2;
+  // Glow
+  const grad=ctx.createRadialGradient(cx,cy,0,cx,cy,20);
+  grad.addColorStop(0,'rgba(244,67,54,0.2)');
+  grad.addColorStop(1,'rgba(244,67,54,0)');
+  ctx.fillStyle=grad;
+  ctx.beginPath();ctx.arc(cx,cy,20,0,Math.PI*2);ctx.fill();
+  // Food
+  ctx.fillStyle='#f44336';
+  ctx.beginPath();ctx.arc(cx,cy,12,0,Math.PI*2);ctx.fill();
+}
+
+function drawBonus(time){
+  if(!bonusActive||!bonus)return;
+  const cx=g2px(bonus.x)+CELL/2,cy=g2py(bonus.y)+CELL/2;
+  const remaining=bonusTimer;
+  // Shrinking ring
+  const ringR=14*(remaining/8000);
+  ctx.strokeStyle='#ffd740';ctx.lineWidth=2;
+  ctx.beginPath();ctx.arc(cx,cy,Math.max(0,ringR),0,Math.PI*2);ctx.stroke();
+  // Blink last 2s
+  let visible=true;
+  if(remaining<2000){
+    visible=Math.floor(time/83)%2===0; // ~6Hz
+  }
+  if(visible){
+    // Diamond
+    ctx.fillStyle='#ffd740';
+    ctx.save();ctx.translate(cx,cy);ctx.rotate(Math.PI/4);
+    ctx.fillRect(-5,-5,10,10);
+    ctx.restore();
+  }
+}
+
+function drawSnakeInterpolated(progress){
+  if(!segPrev||!segCurr)return;
+  const len=snake.length;
+  // Draw from tail to head so head is on top
+  for(let i=len-1;i>=0;i--){
+    let px,py;
+    const prev=segPrev[i]||segCurr[i];
+    const curr=segCurr[i];
+    if(i===0&&headTurnedThisTick){
+      // Snap head on turn
+      px=g2px(curr.x);py=g2py(curr.y);
+    }else{
+      px=g2px(prev.x)+(g2px(curr.x)-g2px(prev.x))*progress;
+      py=g2py(prev.y)+(g2py(curr.y)-g2py(prev.y))*progress;
+    }
+    let color;
+    if(i===0)color='#4caf50';
+    else color=i%2===1?'#388e3c':'#2e7d32';
+    drawSegment(px,py,color,i===0,heading);
+  }
+  // Tail fade-out (if not growing, show departing tail fading)
+  if(segPrev.length>segCurr.length){
+    const tailPrev=segPrev[segPrev.length-1];
+    const alpha=1-progress;
+    if(alpha>0.01){
+      ctx.globalAlpha=alpha;
+      const px=g2px(tailPrev.x),py=g2py(tailPrev.y);
+      const color=segPrev.length%2===1?'#388e3c':'#2e7d32';
+      drawSegment(px,py,color,false,null);
+      ctx.globalAlpha=1;
+    }
+  }
+}
+
+function drawSnakeStatic(snk,dir){
+  for(let i=snk.length-1;i>=0;i--){
+    const s=snk[i];
+    let color;
+    if(i===0)color='#4caf50';
+    else color=i%2===1?'#388e3c':'#2e7d32';
+    drawSegment(g2px(s.x),g2py(s.y),color,i===0,dir);
+  }
+}
+
+function drawDyingSnake(timer){
+  const len=snake.length;
+  const phase1End=500,phase2End=600,phase3End=800;
+  for(let i=len-1;i>=0;i--){
+    const s=snake[i];
+    let color;
+    if(timer<phase1End){
+      const segTime=phase1End/len;
+      const segStart=i*segTime;
+      if(timer>=segStart){
+        const t=Math.min(1,(timer-segStart)/50);
+        // Lerp from original to red
+        const origR=i===0?0x4c:(i%2===1?0x38:0x2e);
+        const origG=i===0?0xaf:(i%2===1?0x8e:0x7d);
+        const origB=i===0?0x50:(i%2===1?0x3c:0x32);
+        const r=Math.round(origR+(0xf4-origR)*t);
+        const g=Math.round(origG+(0x43-origG)*t);
+        const b=Math.round(origB+(0x36-origB)*t);
+        color=`rgb(${r},${g},${b})`;
+      }else{
+        if(i===0)color='#4caf50';
+        else color=i%2===1?'#388e3c':'#2e7d32';
+      }
+    }else if(timer<phase2End){
+      color='#ffffff';
+    }else{
+      const t=Math.min(1,(timer-phase2End)/(phase3End-phase2End));
+      const r=Math.round(255-(255-0x44)*t);
+      const g=Math.round(255-(255-0x44)*t);
+      const b=Math.round(255-(255-0x44)*t);
+      color=`rgb(${r},${g},${b})`;
+    }
+    drawSegment(g2px(s.x),g2py(s.y),color,i===0,heading);
+  }
+}
+
+function centerText(text,y,size,color,alpha){
+  ctx.save();
+  ctx.globalAlpha=alpha!=null?alpha:1;
+  ctx.fillStyle=color||'#fff';
+  ctx.font=size+'px monospace';
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillText(text,CW/2,y);
+  ctx.restore();
+}
+
+// Main loop
+lastTime=0;
+let globalTime=0;
+
+function loop(now){
+  requestAnimationFrame(loop);
+  if(!lastTime){lastTime=now;return;}
+  let dt=now-lastTime;
+  lastTime=now;
+  if(dt>500)dt=500;
+  globalTime+=dt;
+
+  update(dt);
+  render();
+  // Clear pressed
+  for(const k in pressed)pressed[k]=false;
+}
+
+function update(dt){
+  switch(state){
+    case TITLE:updateTitle(dt);break;
+    case COUNTDOWN:updateCountdown(dt);break;
+    case PLAYING:updatePlaying(dt);break;
+    case PAUSED:break;
+    case DYING:updateDying(dt);break;
+    case GAME_OVER:break;
+  }
+}
+
+function updateTitle(dt){
+  demoAccum+=dt;
+  if(demoDeadTimer>0){
+    demoDeadTimer-=dt/1000;
+    if(demoDeadTimer<=0){
+      demoSnake=[{x:Math.floor(Math.random()*14)+3,y:Math.floor(Math.random()*14)+3}];
+      demoSnake.push({x:demoSnake[0].x-1,y:demoSnake[0].y});
+      demoSnake.push({x:demoSnake[0].x-2,y:demoSnake[0].y});
+      demoDir=RIGHT;demoGrowth=0;
+      demoFood=randomEmpty(demoSnake,null,null);
+    }
+    return;
+  }
+  while(demoAccum>=DEMO_INTERVAL){
+    demoAccum-=DEMO_INTERVAL;
+    demoTick();
+  }
+}
+
+function updateCountdown(dt){
+  countdownTimer+=dt;
+  const phases=[650,650,650,450];
+  let total=0;
+  let newPhase=0;
+  for(let i=0;i<phases.length;i++){
+    total+=phases[i];
+    if(countdownTimer<total){newPhase=i;break;}
+    if(i===phases.length-1)newPhase=4;
+  }
+  if(newPhase>=4){
+    state=PLAYING;accumulator=0;
+  }else{
+    countdownPhase=newPhase;
+  }
+}
+
+function updatePlaying(dt){
+  // Bonus timer
+  if(bonusActive){
+    bonusTimer-=dt;
+    if(bonusTimer<=0){bonusActive=false;bonus=null;}
+  }
+  accumulator+=dt;
+  let ticks=0;
+  while(accumulator>=tickInterval&&ticks<2){
+    gameTick();
+    if(state!==PLAYING)return;
+    accumulator-=tickInterval;
+    ticks++;
+  }
+  tickProgress=Math.min(accumulator/tickInterval,1);
+}
+
+function updateDying(dt){
+  dyingTimer+=dt;
+  if(dyingTimer>=800){
+    state=GAME_OVER;
+  }
+}
+
+function render(){
+  ctx.fillStyle='#0a0a0a';
+  ctx.fillRect(0,0,CW,CH);
+
+  switch(state){
+    case TITLE:renderTitle();break;
+    case COUNTDOWN:renderCountdown();break;
+    case PLAYING:renderPlaying();break;
+    case PAUSED:renderPlaying();renderPause();break;
+    case DYING:renderDying();break;
+    case GAME_OVER:renderGameOver();break;
+  }
+}
+
+function renderTitle(){
+  drawGrid(0.3);
+  // Demo snake
+  if(demoDeadTimer<=0){
+    ctx.save();ctx.globalAlpha=0.3;
+    drawSnakeStatic(demoSnake,demoDir);
+    if(demoFood){
+      const cx=g2px(demoFood.x)+CELL/2,cy=g2py(demoFood.y)+CELL/2;
+      ctx.fillStyle='#f44336';ctx.beginPath();ctx.arc(cx,cy,10,0,Math.PI*2);ctx.fill();
+    }
+    ctx.restore();
+  }
+  // Title text
+  ctx.font='bold 48px monospace';ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillStyle='#4caf50';
+  ctx.fillText('SNAKE',CW/2,250);
+  // Pulsing "Press Enter"
+  const alpha=0.3+0.7*(0.5+0.5*Math.sin(globalTime/1000*Math.PI));
+  centerText('Press Enter',400,18,'#888888',alpha);
+  centerText('Best: '+bestScore,440,15,'#555555',1);
+
+  // HUD area
+  ctx.fillStyle='#222222';ctx.fillRect(0,39,CW,1);
+}
+
+function renderCountdown(){
+  drawGrid(1);
+  drawSnakeStatic(snake,heading);
+  drawFood();
+  // Countdown text
+  const labels=['3','2','1','GO!'];
+  const phases=[650,650,650,450];
+  let elapsed=countdownTimer;
+  let phaseStart=0;
+  for(let i=0;i<countdownPhase;i++)phaseStart+=phases[i];
+  const phaseElapsed=elapsed-phaseStart;
+  const phaseDur=phases[countdownPhase]||450;
+  const t=Math.min(phaseElapsed/phaseDur,1);
+  const scale=1.2-0.2*t;
+  const label=labels[countdownPhase];
+  const color=countdownPhase===3?'#4caf50':'#ffffff';
+  ctx.save();
+  ctx.translate(CW/2,AREA_Y+AREA_H/2);
+  ctx.scale(scale,scale);
+  ctx.font='60px monospace';ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillStyle=color;
+  ctx.fillText(label,0,0);
+  ctx.restore();
+  drawHUD();
+}
+
+function renderPlaying(){
+  drawGrid(1);
+  drawFood();
+  drawBonus(globalTime);
+  drawSnakeInterpolated(tickProgress||0);
+  drawHUD();
+}
+
+function renderPause(){
+  ctx.fillStyle='rgba(0,0,0,0.7)';
+  ctx.fillRect(AREA_X,AREA_Y,AREA_W,AREA_H);
+  centerText('PAUSED',AREA_Y+AREA_H/2-10,36,'#ffffff',1);
+  centerText('P to resume',AREA_Y+AREA_H/2+30,14,'#888888',1);
+}
+
+function renderDying(){
+  drawGrid(1);
+  drawDyingSnake(dyingTimer);
+  drawHUD();
+}
+
+function renderGameOver(){
+  drawGrid(1);
+  // Dead snake in grey
+  for(let i=snake.length-1;i>=0;i--){
+    drawSegment(g2px(snake[i].x),g2py(snake[i].y),'#444444',i===0,heading);
+  }
+  centerText('GAME OVER',270,38,'#f44336',1);
+  centerText('Score: '+score,320,22,'#ffffff',1);
+  if(newBestAchieved){
+    const a=0.5+0.5*Math.sin(globalTime/500*Math.PI);
+    centerText('NEW BEST!',350,16,'#ffd740',a);
+  }
+  centerText('Length: '+snake.length,380,14,'#888888',1);
+  const blink=Math.floor(globalTime/250)%2===0;
+  if(blink)centerText('Enter to play again',430,14,'#666666',1);
+  drawHUD();
+}
+
+// Start
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

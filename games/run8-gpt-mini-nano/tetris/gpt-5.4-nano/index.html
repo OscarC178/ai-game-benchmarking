@@ -1,0 +1,957 @@
+<!-- tetris | spec:run8-gpt-mini-nano | built-by:gpt-5.4-nano -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Tetris</title>
+  <style>
+    html, body { height: 100%; margin: 0; background:#000; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    #wrap { width: 800px; margin: 0 auto; }
+    canvas { display:block; margin: 0 auto; background:#111111; }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="game" width="800" height="600" aria-label="Tetris"></canvas>
+  </div>
+
+  <script>
+    (() => {
+      "use strict";
+
+      // ===== Metadata / Helpers =====
+      const canvas = document.getElementById('game');
+      const ctx = canvas.getContext('2d');
+      const W = canvas.width, H = canvas.height;
+
+      const GRID_W = 10, GRID_H = 20;
+      const CELL = 28;
+
+      const PLAY_X = 240, PLAY_Y = 20; // well top-left
+      const WELL_W = GRID_W * CELL;  // 280
+      const WELL_H = GRID_H * CELL;  // 560
+
+      const NEXT_X = 560, NEXT_Y = 60;
+      const NEXT_W = 112, NEXT_H = 112;
+
+      const FPS = 60;
+
+      const COLORS = {
+        I: '#00FFFF',
+        O: '#FFFF00',
+        T: '#AA00FF',
+        S: '#00FF00',
+        Z: '#FF0000',
+        J: '#0000FF',
+        L: '#FF8800'
+      };
+
+      // Tetromino definitions in spawn rotation state.
+      // Using 4x4 matrices with 1s. Rotation clockwise handled by matrix rotate.
+      const PIECES_BASE = {
+        I: [
+          [0,0,0,0],
+          [1,1,1,1],
+          [0,0,0,0],
+          [0,0,0,0]
+        ],
+        O: [
+          [0,0,0,0],
+          [0,1,1,0],
+          [0,1,1,0],
+          [0,0,0,0]
+        ],
+        T: [
+          [0,0,0,0],
+          [1,1,1,0],
+          [0,1,0,0],
+          [0,0,0,0]
+        ],
+        S: [
+          [0,0,0,0],
+          [0,1,1,0],
+          [1,1,0,0],
+          [0,0,0,0]
+        ],
+        Z: [
+          [0,0,0,0],
+          [1,1,0,0],
+          [0,1,1,0],
+          [0,0,0,0]
+        ],
+        J: [
+          [0,0,0,0],
+          [1,1,1,0],
+          [0,0,1,0],
+          [0,0,0,0]
+        ],
+        L: [
+          [0,0,0,0],
+          [1,1,1,0],
+          [1,0,0,0],
+          [0,0,0,0]
+        ]
+      };
+
+      const PIECE_KEYS = ['I','O','T','S','Z','J','L'];
+
+      function cloneMatrix(m) { return m.map(r => r.slice()); }
+      function rotateCW(mat) {
+        const n = mat.length;
+        const res = Array.from({length:n}, () => Array(n).fill(0));
+        for (let y=0;y<n;y++){
+          for (let x=0;x<n;x++){
+            res[x][n-1-y] = mat[y][x];
+          }
+        }
+        return res;
+      }
+
+      function getBlocksFromMatrix(mat) {
+        // Returns list of {x,y} for all 1 cells in mat (4x4).
+        const blocks = [];
+        for (let y=0;y<mat.length;y++){
+          for (let x=0;x<mat[y].length;x++){
+            if (mat[y][x]) blocks.push({x,y});
+          }
+        }
+        return blocks;
+      }
+
+      // SRS-like wall kicks approximated by practical attempts:
+      // Try offsets around pivot for rotation success near walls/blocks.
+      const KICK_TESTS = [
+        {x: 0, y: 0},
+        {x:-1, y: 0},{x: 1, y: 0},
+        {x:-2, y: 0},{x: 2, y: 0},
+        {x: 0, y:-1},{x: 0, y: 1},
+        {x:-1, y:-1},{x: 1, y:-1},
+        {x:-1, y: 1},{x: 1, y: 1},
+        {x:-2, y:-1},{x: 2, y:-1},
+        {x:-2, y: 1},{x: 2, y: 1}
+      ];
+
+      // ===== Audio (optional bonus) =====
+      let audioCtx = null;
+      function beep(freq=440, duration=0.06, type='sine', gain=0.08) {
+        try {
+          if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          const t0 = audioCtx.currentTime;
+          const osc = audioCtx.createOscillator();
+          const g = audioCtx.createGain();
+          osc.type = type;
+          osc.frequency.value = freq;
+          g.gain.value = 0.0001;
+          osc.connect(g);
+          g.connect(audioCtx.destination);
+          osc.start(t0);
+          g.gain.setValueAtTime(0.0001, t0);
+          g.gain.linearRampToValueAtTime(gain, t0 + 0.01);
+          g.gain.exponentialRampToValueAtTime(0.0001, t0 + duration);
+          osc.stop(t0 + duration + 0.02);
+        } catch (e) {}
+      }
+      function beepMove() { beep(220, 0.04, 'square', 0.04); }
+      function beepHard() { beep(80, 0.08, 'triangle', 0.05); }
+      function beepSoft() { beep(180, 0.03, 'sine', 0.03); }
+      function beepLineClear(lines=1) {
+        // ascending 440 -> 880
+        const steps = Math.max(1, Math.min(4, lines));
+        for (let i=0;i<steps;i++){
+          const f = 440 + (i/(steps-1 || 1))*440;
+          beep(f, 0.06, 'sine', 0.06);
+        }
+      }
+      function beepGameOver() {
+        const seq = [220, 180, 140, 110];
+        seq.forEach((f,i)=>beep(f, 0.08, 'sawtooth', 0.05));
+      }
+
+      // ===== Game State =====
+      const State = { IDLE:'IDLE', PLAYING:'PLAYING', PAUSED:'PAUSED', GAME_OVER:'GAME_OVER' };
+      let state = State.IDLE;
+
+      // Grid holds null or color char key
+      // We'll store the piece letter in each cell for color retrieval.
+      let board = null; // 2D [y][x] with null or 'I'...'L'
+
+      // Active piece
+      let active = null; // {type, mat, x, y, blocks, movedCount?}
+      let ghost = null;  // {x,y, mat, blocks}
+      let nextTypes = []; // next piece queue from bag
+
+      // Scoring / meta
+      let score = 0;
+      let highScore = 0;
+      let level = 1;
+      let totalLines = 0;
+
+      // Gravity and timing
+      // Spec: Gravity starts at 1000ms per row.
+      let gravityMs = 1000;
+      let lastDropAccum = 0;
+
+      // Lock delay
+      let lockStart = null; // timestamp in ms since performance start
+      const LOCK_DELAY_MS = 500;
+      let lockMoveResets = 0; // up to 3 successful grounded moves/rotations may reset lock delay
+      const LOCK_MOVE_RESET_LIMIT = 3;
+
+      // Render helpers
+      function drawCell(x, y, color, alpha=1) {
+        const px = PLAY_X + x*CELL;
+        const py = PLAY_Y + y*CELL;
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = color;
+        ctx.fillRect(px+1, py+1, CELL-2, CELL-2);
+        // simple bevel
+        ctx.globalAlpha = alpha;
+        ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(px+3, py+CELL-5);
+        ctx.lineTo(px+3, py+3);
+        ctx.lineTo(px+CELL-5, py+3);
+        ctx.stroke();
+        ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(px+CELL-5, py+CELL-4);
+        ctx.lineTo(px+3, py+CELL-4);
+        ctx.lineTo(px+CELL-4, py+3);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      function computeBlocks(piece) {
+        return getBlocksFromMatrix(piece.mat).map(b => ({x: piece.x + b.x, y: piece.y + b.y}));
+      }
+
+      function isInside(x,y){ return x>=0 && x<GRID_W && y>=0 && y<GRID_H; }
+
+      function collidesFor(typeMat, px, py) {
+        // Check each filled cell against boundaries and placed blocks.
+        const blocks = getBlocksFromMatrix(typeMat);
+        for (const b of blocks) {
+          const x = px + b.x;
+          const y = py + b.y;
+          if (x < 0 || x >= GRID_W || y >= GRID_H) return true;
+          if (y >= 0) {
+            if (board[y][x] !== null) return true;
+          }
+        }
+        return false;
+      }
+
+      function pieceAtLandingY(piece) {
+        // Starting from active piece y, move down until collision.
+        let testY = piece.y;
+        while (!collidesFor(piece.mat, piece.x, testY + 1)) testY++;
+        return testY;
+      }
+
+      function spawnNextPiece() {
+        if (nextTypes.length < 7) {
+          // refill by 7-bag when empty or short; maintain exact bag property (one each in a bag)
+          // We'll just push a full bag when queue length is low.
+          while (nextTypes.length < 7) {
+            const bag = PIECE_KEYS.slice();
+            // shuffle
+            for (let i=bag.length-1;i>0;i--){
+              const j = Math.floor(Math.random()*(i+1));
+              [bag[i], bag[j]] = [bag[j], bag[i]];
+            }
+            nextTypes.push(...bag);
+          }
+        }
+        const type = nextTypes.shift();
+        const mat = cloneMatrix(PIECES_BASE[type]);
+        const blocks = getBlocksFromMatrix(mat);
+        // Spawn centered at top of well.
+        // Use bounding box width to center.
+        let minX=4, maxX=-1;
+        for (const b of blocks){ minX=Math.min(minX,b.x); maxX=Math.max(maxX,b.x); }
+        const pieceW = (maxX-minX+1);
+        const x = Math.floor((GRID_W - pieceW)/2) - minX;
+        const y = -1; // allow matrix to extend above; top feel
+        const p = { type, mat, x, y };
+        // But ensure current legal position (if any block in row<0 ignore collisions above).
+        if (collidesFor(p.mat, p.x, p.y)) {
+          return false; // game over
+        }
+        active = p;
+        lockStart = null;
+        lockMoveResets = 0;
+        updateGhost();
+        return true;
+      }
+
+      function updateGhost() {
+        if (!active) { ghost = null; return; }
+        const landingY = pieceAtLandingY(active);
+        ghost = { type: active.type, mat: active.mat, x: active.x, y: landingY };
+      }
+
+      function tryMove(dx, dy) {
+        if (state !== State.PLAYING) return;
+        const p = active;
+        const nx = p.x + dx, ny = p.y + dy;
+        if (!collidesFor(p.mat, nx, ny)) {
+          p.x = nx; p.y = ny;
+          active = p;
+          // If grounded (meaning moving down would collide) handle lock reset only for successful grounded moves/rotations.
+          if (isGrounded()) {
+            // only reset when the successful move/rotation is while already grounded
+            if (lockStart !== null) {
+              if (lockMoveResets < LOCK_MOVE_RESET_LIMIT) {
+                lockStart = performance.now();
+                lockMoveResets++;
+              }
+            } else {
+              // lock delay starts on grounded: ensure lockStart is set if grounded after move
+              lockStart = performance.now();
+              lockMoveResets = 0; // counts resets, first grounded move doesn't consume reset in typical implementations.
+            }
+          }
+          updateGhost();
+          beepMove();
+          return true;
+        }
+        return false;
+      }
+
+      function isGrounded() {
+        if (!active) return false;
+        // grounded if there is collision directly below
+        return collidesFor(active.mat, active.x, active.y + 1);
+      }
+
+      function hardDrop() {
+        if (state !== State.PLAYING) return;
+        const p = active;
+        // count how many rows we can descend
+        let dist = 0;
+        while (!collidesFor(p.mat, p.x, p.y + 1)) {
+          p.y++;
+          dist++;
+        }
+        active = p;
+        score += 2 * dist;
+        beepHard();
+        updateGhost();
+        lockStart = null;
+        lockMoveResets = 0;
+        placeActiveAndResolve();
+      }
+
+      function rotateCWWithKicks() {
+        if (state !== State.PLAYING) return;
+        const p = active;
+        const rotated = rotateCW(p.mat);
+        // practical wall-kick attempts: try a set of offsets.
+        for (const kt of KICK_TESTS) {
+          const nx = p.x + kt.x;
+          const ny = p.y + kt.y;
+          if (!collidesFor(rotated, nx, ny)) {
+            // grounded reset rules
+            const wasGrounded = isGrounded();
+            p.mat = rotated;
+            p.x = nx; p.y = ny;
+            active = p;
+            updateGhost();
+            beepMove();
+
+            if (wasGrounded) {
+              // successful grounded move/rotation may reset lock delay
+              if (lockStart !== null && lockMoveResets < LOCK_MOVE_RESET_LIMIT) {
+                lockStart = performance.now();
+                lockMoveResets++;
+              } else if (lockStart === null) {
+                lockStart = performance.now();
+                lockMoveResets = 0;
+              }
+            }
+            return true;
+          }
+        }
+        return false;
+      }
+
+      function softDropTick() {
+        if (state !== State.PLAYING) return;
+        const p = active;
+        if (!collidesFor(p.mat, p.x, p.y + 1)) {
+          p.y++;
+          active = p;
+          score += 1;
+          // Optional tiny feedback:
+          beepSoft();
+          updateGhost();
+        } else {
+          // If can't move down, grounded logic will trigger lock delay in loop.
+        }
+      }
+
+      // ===== Locking + Line Clear =====
+      let clearFlash = null; // {cells:[{x,y}], until:ms}
+
+      function placeActiveAndResolve() {
+        const p = active;
+        const blocks = computeBlocks(p);
+        for (const b of blocks) {
+          if (b.y >= 0 && b.y < GRID_H && b.x >= 0 && b.x < GRID_W) {
+            board[b.y][b.x] = p.type;
+          }
+        }
+        active = null;
+        ghost = null;
+        // resolve line clears
+        resolveLines();
+        // spawn next
+        if (state === State.PLAYING) {
+          if (!spawnNextPiece()) {
+            state = State.GAME_OVER;
+            console.log("State -> GAME_OVER (spawn blocked)");
+            beepGameOver();
+            if (score > highScore) { highScore = score; localStorage.setItem('tetris_high_score', String(highScore)); }
+          }
+        }
+      }
+
+      function resolveLines() {
+        // check complete rows
+        const fullRows = [];
+        for (let y=0;y<GRID_H;y++){
+          let full = true;
+          for (let x=0;x<GRID_W;x++){
+            if (board[y][x] === null) { full=false; break; }
+          }
+          if (full) fullRows.push(y);
+        }
+        if (fullRows.length === 0) return;
+
+        // Flash them quickly then clear
+        const now = performance.now();
+        clearFlash = { rows: fullRows.slice(), until: now + 120 };
+
+        // Score increment and level after clear
+        const lines = fullRows.length;
+        const add = [0,100,300,500,800][lines] * level;
+        score += add;
+        totalLines += lines;
+
+        const newLevel = 1 + Math.floor(totalLines / 10);
+        level = newLevel;
+        gravityMs = Math.max(100, 1000 - 75*(level-1));
+
+        beepLineClear(lines);
+
+        // schedule clear
+        setTimeout(() => {
+          // Might have already changed due to restart; guard:
+          if (state !== State.PLAYING) return;
+          // Clear rows and collapse
+          for (const ry of fullRows) {
+            board[ry].fill(null);
+          }
+          // collapse: remove cleared rows and re-add empty at top
+          const remaining = [];
+          for (let y=0;y<GRID_H;y++){
+            if (!fullRows.includes(y)) remaining.push(board[y]);
+          }
+          while (remaining.length < GRID_H) remaining.unshift(Array.from({length:GRID_W}, ()=>null));
+          board = remaining;
+
+          clearFlash = null;
+
+          // No additional score beyond above; done.
+        }, 120);
+      }
+
+      // ===== Rendering =====
+      function drawGridFrame() {
+        // Background inside well
+        ctx.fillStyle = '#000000';
+        ctx.fillRect(PLAY_X, PLAY_Y, WELL_W, WELL_H);
+
+        // Borders
+        ctx.strokeStyle = '#555555';
+        ctx.lineWidth = 3;
+        ctx.strokeRect(PLAY_X, PLAY_Y, WELL_W, WELL_H);
+
+        // grid lines
+        ctx.strokeStyle = '#333333';
+        ctx.lineWidth = 1;
+        for (let x=1;x<GRID_W;x++){
+          const px = PLAY_X + x*CELL;
+          ctx.beginPath();
+          ctx.moveTo(px, PLAY_Y);
+          ctx.lineTo(px, PLAY_Y + WELL_H);
+          ctx.stroke();
+        }
+        for (let y=1;y<GRID_H;y++){
+          const py = PLAY_Y + y*CELL;
+          ctx.beginPath();
+          ctx.moveTo(PLAY_X, py);
+          ctx.lineTo(PLAY_X + WELL_W, py);
+          ctx.stroke();
+        }
+      }
+
+      function drawBoard() {
+        for (let y=0;y<GRID_H;y++){
+          for (let x=0;x<GRID_W;x++){
+            const t = board[y][x];
+            if (t) {
+              drawCell(x,y,COLORS[t],1);
+            } else {
+              // optional: leave empty
+            }
+          }
+        }
+        if (clearFlash) {
+          const now = performance.now();
+          if (now < clearFlash.until) {
+            for (const ry of clearFlash.rows) {
+              for (let x=0;x<GRID_W;x++) {
+                drawCell(x, ry, '#FFFFFF', 0.12);
+              }
+            }
+          }
+        }
+      }
+
+      function drawPiece(piece, alpha=1, ghostMode=false) {
+        if (!piece) return;
+        const blocks = getBlocksFromMatrix(piece.mat);
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        for (const b of blocks) {
+          const x = piece.x + b.x;
+          const y = piece.y + b.y;
+          if (y < 0) continue;
+          if (x < 0 || x >= GRID_W || y >= GRID_H) continue;
+          drawCell(x, y, COLORS[piece.type], ghostMode ? 0.3 : alpha);
+          if (!ghostMode) {
+            // subtle edge
+            ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+          }
+        }
+        ctx.restore();
+      }
+
+      function drawGhost() {
+        if (!ghost || state !== State.PLAYING) return;
+        drawPiece(ghost, 1, true);
+      }
+
+      function drawNextBox() {
+        ctx.save();
+        // box
+        ctx.strokeStyle = '#555555';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(NEXT_X, NEXT_Y, NEXT_W, NEXT_H);
+
+        ctx.fillStyle = '#111111';
+        ctx.fillRect(NEXT_X+1, NEXT_Y+1, NEXT_W-2, NEXT_H-2);
+
+        // label
+        ctx.fillStyle = '#AAAAAA';
+        ctx.font = '16px monospace';
+        ctx.fillText('NEXT', NEXT_X + 10, NEXT_Y + 22);
+
+        // Draw next piece in 4x4 grid centered in 112 box (approx)
+        const nextType = nextTypes.length ? nextTypes[0] : null;
+        if (nextType) {
+          const mat = PIECES_BASE[nextType];
+          // find bounds
+          const blocks = getBlocksFromMatrix(mat);
+          let minX=4, maxX=-1, minY=4, maxY=-1;
+          for (const b of blocks) { minX=Math.min(minX,b.x); maxX=Math.max(maxX,b.x); minY=Math.min(minY,b.y); maxY=Math.max(maxY,b.y); }
+          const bw = (maxX-minX+1);
+          const bh = (maxY-minY+1);
+
+          const cell = 22; // preview cell size
+          const gridW = bw*cell;
+          const gridH = bh*cell;
+          const ox = NEXT_X + Math.floor((NEXT_W - gridW)/2);
+          const oy = NEXT_Y + 36 + Math.floor((NEXT_H-36 - gridH)/2);
+
+          for (const b of blocks) {
+            const px = ox + (b.x - minX)*cell;
+            const py = oy + (b.y - minY)*cell;
+            ctx.fillStyle = COLORS[nextType];
+            ctx.globalAlpha = 0.95;
+            ctx.fillRect(px+1, py+1, cell-2, cell-2);
+            ctx.globalAlpha = 1;
+          }
+        }
+        ctx.restore();
+      }
+
+      function drawTextHud() {
+        // Right panel score/level
+        ctx.save();
+        const panelX = 520; // starts under/around next area
+        const panelY = 20;
+
+        ctx.fillStyle = '#111111';
+        // No full panel fill; rely on background
+
+        // Score top-left on panel region (spec: right panel)
+        ctx.fillStyle = '#AAAAAA';
+        ctx.font = '14px monospace';
+        ctx.fillText('SCORE', panelX + 0, panelY + 38);
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '20px monospace';
+        ctx.fillText(String(score).padStart(6,'0'), panelX + 0, panelY + 66);
+
+        // High score top-right
+        const rightX = 760;
+        ctx.textAlign = 'right';
+        ctx.fillStyle = '#AAAAAA';
+        ctx.font = '14px monospace';
+        ctx.fillText('HIGH', rightX, panelY + 38);
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '20px monospace';
+        ctx.fillText(String(highScore).padStart(6,'0'), rightX, panelY + 66);
+        ctx.textAlign = 'left';
+
+        // Level and lines
+        ctx.fillStyle = '#AAAAAA';
+        ctx.font = '14px monospace';
+        ctx.fillText('LEVEL', panelX + 0, panelY + 112);
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '20px monospace';
+        ctx.fillText(String(level).padStart(2,'0'), panelX + 0, panelY + 140);
+
+        ctx.fillStyle = '#AAAAAA';
+        ctx.font = '14px monospace';
+        ctx.fillText('LINES', panelX + 0, panelY + 164);
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '20px monospace';
+        ctx.fillText(String(totalLines).padStart(3,'0'), panelX + 0, panelY + 192);
+
+        // Lives/health (spec says render lives/health indicator; not applicable but requirement T11 says decrement and game over triggers at 0)
+        // We'll implement a single life system: start at 3 lives; decremented when a piece locks above certain threshold on spawn? We'll use "cannot spawn legally" as game over per spec anyway.
+        // However to satisfy spec T11, we will interpret "hit" as attempting to spawn when game nearly filled: we will decrement lives when a spawned piece would collide immediately.
+        // But spec says game over occurs if a new piece cannot spawn. We'll reflect that with lives: lives decremented then game over when lives==0, otherwise attempt restart spawn by clearing top two rows partially.
+        // We'll maintain lives and show it; collisions at spawn reduce lives.
+        ctx.fillStyle = '#AAAAAA';
+        ctx.font = '14px monospace';
+        ctx.fillText('LIVES', panelX + 0, panelY + 218);
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '20px monospace';
+        ctx.fillText(String(lives).padStart(2,'0'), panelX + 0, panelY + 246);
+
+        ctx.restore();
+      }
+
+      function drawStartScreen() {
+        ctx.save();
+        // Title centered over the well
+        ctx.fillStyle = 'rgba(0,0,0,0.35)';
+        ctx.fillRect(PLAY_X-10, PLAY_Y-10, WELL_W+20, WELL_H+20);
+
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '64px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('TETRIS', PLAY_X + WELL_W/2, PLAY_Y + 110);
+
+        ctx.fillStyle = '#AAAAAA';
+        ctx.font = '20px monospace';
+        ctx.fillText('Press Enter to Start', PLAY_X + WELL_W/2, PLAY_Y + 160);
+
+        // seven-piece preview art (small thumbnails)
+        const artY = PLAY_Y + 200;
+        const artX = PLAY_X + WELL_W/2;
+        const cell = 10;
+        const gap = 3;
+
+        const rows = 2;
+        const cols = 4; // will place 7 pieces
+        let idx = 0;
+        for (const key of PIECE_KEYS) {
+          const mat = PIECES_BASE[key];
+          const blocks = getBlocksFromMatrix(mat);
+          let minX=4,maxX=-1,minY=4,maxY=-1;
+          for (const b of blocks) { minX=Math.min(minX,b.x); maxX=Math.max(maxX,b.x); minY=Math.min(minY,b.y); maxY=Math.max(maxY,b.y); }
+          const bw=(maxX-minX+1), bh=(maxY-minY+1);
+
+          const r = Math.floor(idx/cols);
+          const c = idx%cols;
+          if (r>=rows) break;
+
+          const originX = artX - (cols* (cell*3 + gap)) /2 + c*(cell*3 + gap);
+          const originY = artY + r*(cell*3 + gap);
+
+          // outline/thumbnail
+          ctx.strokeStyle = 'rgba(85,85,85,0.9)';
+          ctx.lineWidth = 1;
+          ctx.strokeRect(originX-1, originY-1, bw*(cell+1)+2, bh*(cell+1)+2);
+
+          for (const b of blocks) {
+            const x = originX + (b.x-minX)*(cell+1);
+            const y = originY + (b.y-minY)*(cell+1);
+            ctx.fillStyle = COLORS[key];
+            ctx.globalAlpha = 0.9;
+            ctx.fillRect(x, y, cell+1, cell+1);
+            ctx.globalAlpha = 1;
+          }
+          idx++;
+        }
+
+        ctx.restore();
+      }
+
+      function drawPausedOverlay() {
+        ctx.save();
+        ctx.fillStyle = 'rgba(0,0,0,0.45)';
+        ctx.fillRect(0,0,W,H);
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '48px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('PAUSED', W/2, H/2 - 10);
+        ctx.fillStyle = '#AAAAAA';
+        ctx.font = '18px monospace';
+        ctx.fillText('Press P to Unpause', W/2, H/2 + 30);
+        ctx.restore();
+      }
+
+      function drawGameOverOverlay() {
+        ctx.save();
+        ctx.fillStyle = 'rgba(0,0,0,0.55)';
+        ctx.fillRect(0,0,W,H);
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '60px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('GAME OVER', W/2, H/2 - 30);
+        ctx.fillStyle = '#AAAAAA';
+        ctx.font = '22px monospace';
+        ctx.fillText('Score: ' + score, W/2, H/2 + 20);
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '18px monospace';
+        ctx.fillText('Press Enter to restart', W/2, H/2 + 55);
+        ctx.restore();
+      }
+
+      // ===== Controls =====
+      const keys = new Set();
+      let lastKeyEventTime = 0;
+
+      function onKeyDown(e) {
+        const k = e.key;
+        if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown',' '].includes(k)) e.preventDefault();
+        if (k === 'a' || k === 'd' || k === 'w' || k === 's') e.preventDefault();
+
+        if (k === 'Enter') {
+          e.preventDefault();
+          if (state === State.IDLE) {
+            startGame();
+          } else if (state === State.GAME_OVER) {
+            startGame();
+          } else if (state === State.PAUSED) {
+            // optional: enter to resume? spec doesn't mention; keep pause toggle
+          }
+        }
+
+        if (k === 'p' || k === 'P') {
+          if (state === State.PLAYING) {
+            state = State.PAUSED;
+            console.log("State -> PAUSED");
+          } else if (state === State.PAUSED) {
+            state = State.PLAYING;
+            lastDropAccum = 0;
+            lockStart = null; // avoid weirdness after long pause
+            console.log("State -> PLAYING (unpause)");
+          }
+        }
+
+        if (state !== State.PLAYING) return;
+
+        const now = performance.now();
+        // prevent excessive repeats for rotations/moves
+        if (now - lastKeyEventTime < 8) {} // just allow
+
+        if (k === 'ArrowLeft' || k === 'a' || k === 'A') tryMove(-1,0);
+        else if (k === 'ArrowRight' || k === 'd' || k === 'D') tryMove(1,0);
+        else if (k === 'ArrowUp' || k === 'w' || k === 'W') rotateCWWithKicks();
+        else if (k === 'ArrowDown' || k === 's' || k === 'S') { softDropTick(); }
+        else if (k === ' ') { hardDrop(); }
+      }
+
+      window.addEventListener('keydown', onKeyDown, {passive:false});
+
+      // ===== Start / Restart =====
+      function resetBoard() {
+        board = Array.from({length:GRID_H}, ()=>Array.from({length:GRID_W}, ()=>null));
+        score = 0;
+        level = 1;
+        totalLines = 0;
+        gravityMs = 1000;
+        lastDropAccum = 0;
+        lockStart = null;
+        lockMoveResets = 0;
+        clearFlash = null;
+        lives = 3;
+        nextTypes = [];
+        active = null;
+        ghost = null;
+      }
+
+      function startGame() {
+        resetBoard();
+        // high score load
+        try { highScore = parseInt(localStorage.getItem('tetris_high_score') || '0', 10) || 0; } catch(e) {}
+        // spawn first piece
+        state = State.PLAYING;
+        console.log("State -> PLAYING (start)");
+        spawnNextPiece();
+      }
+
+      // Lives/health logic (T11)
+      let lives = 3;
+      // We'll reduce lives if spawn is blocked; but per spec game over occurs if cannot spawn legally.
+      // So we will attempt one "life" grace: if spawn blocked and lives>0, decrement lives and try spawning after clearing the top 2 visible rows that contain blocks.
+      // If still blocked or lives==0 => GAME_OVER.
+      const originalSpawnNext = spawnNextPiece;
+      spawnNextPiece = function() {
+        if (nextTypes.length < 7) {
+          while (nextTypes.length < 7) {
+            const bag = PIECE_KEYS.slice();
+            for (let i=bag.length-1;i>0;i--){
+              const j = Math.floor(Math.random()*(i+1));
+              [bag[i], bag[j]] = [bag[j], bag[i]];
+            }
+            nextTypes.push(...bag);
+          }
+        }
+        const type = nextTypes.shift();
+        const mat = cloneMatrix(PIECES_BASE[type]);
+        const blocks = getBlocksFromMatrix(mat);
+        let minX=4, maxX=-1;
+        for (const b of blocks){ minX=Math.min(minX,b.x); maxX=Math.max(maxX,b.x); }
+        const pieceW = (maxX-minX+1);
+        const x = Math.floor((GRID_W - pieceW)/2) - minX;
+        const y = -1;
+        const p = { type, mat, x, y };
+
+        if (!collidesFor(p.mat, p.x, p.y)) {
+          active = p;
+          lockStart = null;
+          lockMoveResets = 0;
+          updateGhost();
+          return true;
+        }
+
+        // spawn blocked
+        if (lives > 0) {
+          lives--;
+          // remove top two rows (to simulate "stack hit" and give another chance)
+          const rowsToClear = [0,1];
+          for (const ry of rowsToClear) {
+            if (ry >=0 && ry < GRID_H) board[ry].fill(null);
+          }
+          // also remove any negative effect; keep going
+          // try spawn again by rewinding queue? We'll just not rewind; but that may skip pieces.
+          // Better: put type back to front by unshifting.
+          nextTypes.unshift(type);
+          console.log("Spawn blocked: life lost, lives left:", lives);
+          return spawnNextPiece();
+        }
+        return false;
+      };
+
+      // ===== Game Loop (delta tracking) =====
+      let lastTime = performance.now();
+
+      function step(t) {
+        const dt = t - lastTime;
+        lastTime = t;
+
+        // update
+        if (state === State.PLAYING) {
+          lastDropAccum += dt;
+
+          if (active) {
+            // If grounded, start lock delay
+            const groundedNow = isGrounded();
+
+            if (groundedNow) {
+              if (lockStart === null) {
+                lockStart = performance.now();
+                lockMoveResets = 0;
+              } else {
+                const elapsed = performance.now() - lockStart;
+                if (elapsed >= LOCK_DELAY_MS) {
+                  placeActiveAndResolve();
+                }
+              }
+            } else {
+              lockStart = null;
+              lockMoveResets = 0;
+            }
+
+            // Gravity fall
+            while (lastDropAccum >= gravityMs) {
+              lastDropAccum -= gravityMs;
+              // Attempt to move down by one row
+              if (!collidesFor(active.mat, active.x, active.y + 1)) {
+                active.y += 1;
+                updateGhost();
+              } else {
+                // can't move down: will be grounded; lock delay logic above will handle
+                // break to avoid infinite loop if gravityMs small
+                break;
+              }
+            }
+          }
+        }
+
+        // render
+        draw();
+
+        requestAnimationFrame(step);
+      }
+
+      function draw() {
+        // Clear full canvas (background)
+        ctx.clearRect(0,0,W,H);
+        ctx.fillStyle = '#111111';
+        ctx.fillRect(0,0,W,H);
+
+        // Draw well and content
+        drawGridFrame();
+        drawBoard();
+        drawGhost();
+        if (active && state !== State.IDLE) drawPiece(active, 1, false);
+
+        drawNextBox();
+        drawTextHud();
+
+        // Overlays
+        if (state === State.IDLE) {
+          drawStartScreen();
+        } else if (state === State.PAUSED) {
+          drawPausedOverlay();
+        } else if (state === State.GAME_OVER) {
+          drawGameOverOverlay();
+        }
+      }
+
+      // Initialize high score
+      try {
+        highScore = parseInt(localStorage.getItem('tetris_high_score') || '0', 10) || 0;
+      } catch(e) { highScore = 0; }
+
+      // Start initial draw
+      resetBoard();
+      state = State.IDLE;
+      console.log("State -> IDLE");
+      requestAnimationFrame(step);
+    })();
+  </script>
+</body>
+</html>

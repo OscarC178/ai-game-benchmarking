@@ -1,0 +1,606 @@
+<!--
+  GAME:      Pong
+  RUN:       r2-gpt54
+  BUILDER:   openai/gpt-5.4
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Pong</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background: #000;
+      overflow: hidden;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+    body {
+      display: grid;
+      place-items: center;
+    }
+    canvas {
+      display: block;
+      background: #000;
+      image-rendering: pixelated;
+      box-shadow: 0 0 40px rgba(255,255,255,0.08);
+    }
+  </style>
+</head>
+<body>
+<canvas id="game" width="800" height="600"></canvas>
+<script>
+(() => {
+  'use strict';
+
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  const WIDTH = 800;
+  const HEIGHT = 600;
+  const WIN_SCORE = 7;
+  const PADDLE_W = 12;
+  const PADDLE_H = 84;
+  const BALL_SIZE = 12;
+  const PLAYER_START_X = 32;
+  const PLAYER_START_Y = 258;
+  const CPU_START_X = 756;
+  const CPU_START_Y = 258;
+  const BALL_START_X = 394;
+  const BALL_START_Y = 294;
+  const PLAYER_SPEED = 420;
+  const CPU_SPEED = 320;
+  const SERVE_DELAY = 0.95;
+  const BALL_START_SPEED = 340;
+  const BALL_SPEED_ADD = 22;
+  const BALL_SPEED_CAP = 620;
+  const CPU_REACTION_DELAY = 0.08;
+  const CPU_DEADZONE = 14;
+  const MAX_BOUNCE_ANGLE = Math.PI / 3;
+  const DT_CAP = 0.05;
+
+  const STATES = {
+    TITLE: 'title',
+    SERVE: 'serve',
+    PLAYING: 'playing',
+    PAUSED: 'paused',
+    GAME_OVER: 'game_over'
+  };
+
+  const keys = Object.create(null);
+  const pressed = Object.create(null);
+
+  let audioCtx = null;
+  let lastTime = 0;
+  let state = STATES.TITLE;
+  let previousState = STATES.TITLE;
+  let flashTimer = 0;
+  let serveTimer = 0;
+  let serveDirection = 1;
+  let winner = '';
+  let aiTimer = 0;
+  let aiTargetY = HEIGHT / 2;
+  let aiOffset = 0;
+  let trailTimer = 0;
+
+  const particles = [];
+
+  const player = {
+    x: PLAYER_START_X,
+    y: PLAYER_START_Y,
+    w: PADDLE_W,
+    h: PADDLE_H,
+    vy: 0
+  };
+
+  const cpu = {
+    x: CPU_START_X,
+    y: CPU_START_Y,
+    w: PADDLE_W,
+    h: PADDLE_H,
+    vy: 0
+  };
+
+  const ball = {
+    x: BALL_START_X,
+    y: BALL_START_Y,
+    size: BALL_SIZE,
+    vx: 0,
+    vy: 0,
+    speed: BALL_START_SPEED,
+    lastHit: 0
+  };
+
+  const score = {
+    player: 0,
+    cpu: 0
+  };
+
+  function resize() {
+    const scale = Math.min(window.innerWidth / WIDTH, window.innerHeight / HEIGHT);
+    canvas.style.width = `${Math.floor(WIDTH * scale)}px`;
+    canvas.style.height = `${Math.floor(HEIGHT * scale)}px`;
+  }
+
+  function ensureAudio() {
+    if (!audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) {
+        try {
+          audioCtx = new AC();
+        } catch {}
+      }
+    }
+    if (audioCtx && audioCtx.state === 'suspended') {
+      audioCtx.resume().catch(() => {});
+    }
+  }
+
+  function beep(freq, duration, type, gain, slideTo = null) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const amp = audioCtx.createGain();
+    const now = audioCtx.currentTime;
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, now);
+    if (slideTo !== null) osc.frequency.linearRampToValueAtTime(slideTo, now + duration);
+    amp.gain.setValueAtTime(gain, now);
+    amp.gain.exponentialRampToValueAtTime(0.0001, now + duration);
+    osc.connect(amp);
+    amp.connect(audioCtx.destination);
+    osc.start(now);
+    osc.stop(now + duration);
+  }
+
+  const sounds = {
+    paddle() { beep(420, 0.05, 'square', 0.06, 520); },
+    wall() { beep(300, 0.04, 'triangle', 0.05, 220); },
+    score() { beep(180, 0.15, 'square', 0.08, 120); },
+    win() {
+      beep(440, 0.08, 'triangle', 0.06);
+      setTimeout(() => audioCtx && beep(660, 0.08, 'triangle', 0.06), 90);
+      setTimeout(() => audioCtx && beep(880, 0.12, 'triangle', 0.07), 180);
+    },
+    lose() {
+      beep(280, 0.1, 'sawtooth', 0.06, 220);
+      setTimeout(() => audioCtx && beep(180, 0.14, 'sawtooth', 0.06, 120), 120);
+    }
+  };
+
+  function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+  }
+
+  function resetPaddles() {
+    player.y = PLAYER_START_Y;
+    player.vy = 0;
+    cpu.y = CPU_START_Y;
+    cpu.vy = 0;
+    aiTargetY = HEIGHT / 2;
+    aiOffset = 0;
+    aiTimer = 0;
+  }
+
+  function resetBall() {
+    ball.x = BALL_START_X;
+    ball.y = BALL_START_Y;
+    ball.vx = 0;
+    ball.vy = 0;
+    ball.speed = BALL_START_SPEED;
+    ball.lastHit = 0;
+  }
+
+  function setBallVelocity(direction) {
+    const angle = (-28 + Math.random() * 56) * (Math.PI / 180);
+    const vx = Math.cos(angle) * ball.speed * direction;
+    const vy = Math.sin(angle) * ball.speed;
+    ball.vx = vx;
+    ball.vy = vy;
+    ball.lastHit = 0;
+  }
+
+  function beginServe(direction) {
+    resetPaddles();
+    resetBall();
+    serveDirection = direction;
+    serveTimer = SERVE_DELAY;
+    state = STATES.SERVE;
+  }
+
+  function startMatch() {
+    score.player = 0;
+    score.cpu = 0;
+    winner = '';
+    flashTimer = 0;
+    beginServe(Math.random() < 0.5 ? -1 : 1);
+  }
+
+  function scorePoint(side) {
+    ensureAudio();
+    sounds.score();
+    flashTimer = 0.18;
+    burst(ball.x + ball.size / 2, ball.y + ball.size / 2, 18);
+
+    if (side === 'player') score.player += 1;
+    else score.cpu += 1;
+
+    if (score.player >= WIN_SCORE || score.cpu >= WIN_SCORE) {
+      state = STATES.GAME_OVER;
+      winner = score.player > score.cpu ? 'PLAYER WINS' : 'CPU WINS';
+      ensureAudio();
+      if (score.player > score.cpu) sounds.win(); else sounds.lose();
+      resetBall();
+      resetPaddles();
+      return;
+    }
+
+    beginServe(side === 'player' ? -1 : 1);
+  }
+
+  function burst(x, y, count) {
+    for (let i = 0; i < count; i++) {
+      const angle = (Math.PI * 2 * i) / count + Math.random() * 0.4;
+      const speed = 60 + Math.random() * 100;
+      particles.push({
+        x, y,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        life: 0.25 + Math.random() * 0.25,
+        maxLife: 0.5
+      });
+    }
+  }
+
+  function updateParticles(dt) {
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.life -= dt;
+      if (p.life <= 0) particles.splice(i, 1);
+    }
+  }
+
+  function updatePlayer(dt) {
+    let move = 0;
+    if (keys.ArrowUp || keys.KeyW) move -= 1;
+    if (keys.ArrowDown || keys.KeyS) move += 1;
+    player.vy = move * PLAYER_SPEED;
+    player.y += player.vy * dt;
+    player.y = clamp(player.y, 0, HEIGHT - player.h);
+  }
+
+  function predictBallYAtCPU() {
+    let target = ball.y + ball.size / 2;
+    if (ball.vx > 0) {
+      const cpuFaceX = cpu.x;
+      const distanceX = cpuFaceX - (ball.x + ball.size);
+      if (distanceX > 0.0001) {
+        const travelTime = distanceX / Math.max(1, ball.vx);
+        let projectedY = ball.y + ball.size / 2 + ball.vy * travelTime;
+        const minY = ball.size / 2;
+        const maxY = HEIGHT - ball.size / 2;
+        while (projectedY < minY || projectedY > maxY) {
+          if (projectedY < minY) projectedY = minY + (minY - projectedY);
+          else if (projectedY > maxY) projectedY = maxY - (projectedY - maxY);
+        }
+        target = projectedY;
+      }
+    } else {
+      target = HEIGHT / 2;
+    }
+    return target + aiOffset;
+  }
+
+  function updateAI(dt) {
+    aiTimer -= dt;
+    const ballComing = ball.vx > 0;
+    if (aiTimer <= 0) {
+      aiTimer = CPU_REACTION_DELAY;
+      aiOffset = ballComing ? (Math.random() * 36 - 18) : (Math.random() * 24 - 12);
+      aiTargetY = predictBallYAtCPU();
+    }
+
+    const cpuCenter = cpu.y + cpu.h / 2;
+    const desired = ballComing ? aiTargetY : HEIGHT / 2 + aiOffset * 0.5;
+    const delta = desired - cpuCenter;
+
+    if (Math.abs(delta) <= CPU_DEADZONE) {
+      cpu.vy = 0;
+    } else {
+      cpu.vy = Math.sign(delta) * CPU_SPEED;
+    }
+
+    cpu.y += cpu.vy * dt;
+    cpu.y = clamp(cpu.y, 0, HEIGHT - cpu.h);
+  }
+
+  function collidePaddle(paddle, side) {
+    const movingToward = side === 'left' ? ball.vx < 0 : ball.vx > 0;
+    if (!movingToward) return false;
+
+    const overlap = !(
+      ball.x + ball.size < paddle.x ||
+      ball.x > paddle.x + paddle.w ||
+      ball.y + ball.size < paddle.y ||
+      ball.y > paddle.y + paddle.h
+    );
+
+    if (!overlap) return false;
+
+    const paddleCenter = paddle.y + paddle.h / 2;
+    const ballCenter = ball.y + ball.size / 2;
+    let impact = (ballCenter - paddleCenter) / (paddle.h / 2);
+    impact = clamp(impact, -1, 1);
+    const angle = impact * MAX_BOUNCE_ANGLE;
+
+    ball.speed = Math.min(BALL_SPEED_CAP, ball.speed + BALL_SPEED_ADD);
+    const speed = ball.speed;
+    const dir = side === 'left' ? 1 : -1;
+    ball.vx = Math.cos(angle) * speed * dir;
+    ball.vy = Math.sin(angle) * speed;
+    ball.lastHit = side === 'left' ? -1 : 1;
+
+    if (side === 'left') ball.x = paddle.x + paddle.w;
+    else ball.x = paddle.x - ball.size;
+
+    ensureAudio();
+    sounds.paddle();
+    burst(ball.x + ball.size / 2, ball.y + ball.size / 2, 8);
+    return true;
+  }
+
+  function updateBall(dt) {
+    ball.x += ball.vx * dt;
+    ball.y += ball.vy * dt;
+
+    if (ball.y <= 0) {
+      ball.y = 0;
+      ball.vy = Math.abs(ball.vy);
+      ensureAudio();
+      sounds.wall();
+    } else if (ball.y + ball.size >= HEIGHT) {
+      ball.y = HEIGHT - ball.size;
+      ball.vy = -Math.abs(ball.vy);
+      ensureAudio();
+      sounds.wall();
+    }
+
+    collidePaddle(player, 'left');
+    collidePaddle(cpu, 'right');
+
+    if (ball.x + ball.size < 0) {
+      scorePoint('cpu');
+    } else if (ball.x > WIDTH) {
+      scorePoint('player');
+    }
+  }
+
+  function updateServe(dt) {
+    updatePlayer(dt);
+    updateAI(dt);
+    serveTimer -= dt;
+    if (serveTimer <= 0) {
+      setBallVelocity(serveDirection);
+      state = STATES.PLAYING;
+    }
+  }
+
+  function updatePlaying(dt) {
+    updatePlayer(dt);
+    updateAI(dt);
+    updateBall(dt);
+  }
+
+  function update(dt) {
+    if (flashTimer > 0) flashTimer = Math.max(0, flashTimer - dt);
+    updateParticles(dt);
+
+    switch (state) {
+      case STATES.SERVE:
+        updateServe(dt);
+        break;
+      case STATES.PLAYING:
+        updatePlaying(dt);
+        break;
+    }
+  }
+
+  function wasPressed(code) {
+    return !!keys[code] && !pressed[code];
+  }
+
+  function handleActions() {
+    const startPressed = wasPressed('Enter') || wasPressed('Space');
+    if (startPressed) ensureAudio();
+
+    if (state === STATES.TITLE && startPressed) {
+      startMatch();
+    } else if (state === STATES.GAME_OVER && startPressed) {
+      startMatch();
+    }
+
+    if (wasPressed('KeyP')) {
+      if (state === STATES.PLAYING || state === STATES.SERVE) {
+        previousState = state;
+        state = STATES.PAUSED;
+      } else if (state === STATES.PAUSED) {
+        state = previousState;
+      }
+    }
+  }
+
+  function syncPressed() {
+    const codes = ['ArrowUp','ArrowDown','KeyW','KeyS','Enter','Space','KeyP'];
+    for (const code of codes) pressed[code] = !!keys[code];
+  }
+
+  function drawDivider() {
+    const x = WIDTH / 2 - 2;
+    ctx.fillStyle = '#fff';
+    for (let y = 0; y < HEIGHT; y += 26) {
+      ctx.fillRect(x, y, 4, 16);
+    }
+  }
+
+  function drawPaddle(p) {
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(Math.round(p.x), Math.round(p.y), p.w, p.h);
+  }
+
+  function drawBall() {
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(Math.round(ball.x), Math.round(ball.y), ball.size, ball.size);
+  }
+
+  function drawScore() {
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    ctx.font = 'bold 56px monospace';
+    ctx.fillText(String(score.player), WIDTH * 0.25, 28);
+    ctx.fillText(String(score.cpu), WIDTH * 0.75, 28);
+
+    ctx.font = '14px monospace';
+    ctx.fillStyle = '#aaa';
+    ctx.fillText('PLAYER', WIDTH * 0.25, 8);
+    ctx.fillText('CPU', WIDTH * 0.75, 8);
+  }
+
+  function drawParticles() {
+    ctx.fillStyle = '#fff';
+    for (const p of particles) {
+      ctx.globalAlpha = Math.max(0, p.life / p.maxLife);
+      ctx.fillRect(Math.round(p.x), Math.round(p.y), 2, 2);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawOverlayTitle() {
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 72px monospace';
+    ctx.fillText('PONG', WIDTH / 2, 180);
+
+    ctx.font = '20px monospace';
+    ctx.fillStyle = '#ddd';
+    ctx.fillText('Arrow Up / Arrow Down  or  W / S', WIDTH / 2, 270);
+    ctx.fillText('Enter to Start   •   P to Pause', WIDTH / 2, 308);
+
+    if (Math.floor(performance.now() / 450) % 2 === 0) {
+      ctx.fillStyle = '#fff';
+      ctx.font = '28px monospace';
+      ctx.fillText('Press Enter to Start', WIDTH / 2, 410);
+    }
+
+    ctx.font = '16px monospace';
+    ctx.fillStyle = '#888';
+    ctx.fillText('First to 7 wins', WIDTH / 2, 462);
+  }
+
+  function drawServeText() {
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#fff';
+    ctx.font = '28px monospace';
+    const label = serveTimer > 0.45 ? 'READY' : 'GO';
+    ctx.fillText(label, WIDTH / 2, HEIGHT / 2 - 70);
+  }
+
+  function drawPaused() {
+    ctx.fillStyle = 'rgba(0,0,0,0.65)';
+    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 44px monospace';
+    ctx.fillText('PAUSED', WIDTH / 2, HEIGHT / 2 - 20);
+    ctx.font = '20px monospace';
+    ctx.fillStyle = '#bbb';
+    ctx.fillText('Press P to Resume', WIDTH / 2, HEIGHT / 2 + 26);
+  }
+
+  function drawGameOver() {
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 40px monospace';
+    ctx.fillText(winner, WIDTH / 2, HEIGHT / 2 - 56);
+    ctx.font = '24px monospace';
+    ctx.fillText(`Final Score ${score.player} - ${score.cpu}`, WIDTH / 2, HEIGHT / 2 - 6);
+    if (Math.floor(performance.now() / 450) % 2 === 0) {
+      ctx.fillStyle = '#ddd';
+      ctx.font = '22px monospace';
+      ctx.fillText('Press Enter to Restart', WIDTH / 2, HEIGHT / 2 + 56);
+    }
+  }
+
+  function renderScene() {
+    ctx.fillStyle = flashTimer > 0 ? '#111' : '#000';
+    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+    drawDivider();
+    drawScore();
+    drawPaddle(player);
+    drawPaddle(cpu);
+    drawBall();
+    drawParticles();
+
+    if (state === STATES.TITLE) drawOverlayTitle();
+    else if (state === STATES.SERVE) drawServeText();
+    else if (state === STATES.PAUSED) drawPaused();
+    else if (state === STATES.GAME_OVER) drawGameOver();
+  }
+
+  function frame(ts) {
+    if (!lastTime) lastTime = ts;
+    const dt = Math.min(DT_CAP, (ts - lastTime) / 1000);
+    lastTime = ts;
+
+    handleActions();
+    if (state !== STATES.PAUSED && state !== STATES.TITLE && state !== STATES.GAME_OVER) {
+      update(dt);
+    } else {
+      updateParticles(dt);
+      if (flashTimer > 0) flashTimer = Math.max(0, flashTimer - dt);
+    }
+
+    renderScene();
+    syncPressed();
+    requestAnimationFrame(frame);
+  }
+
+  window.addEventListener('keydown', (e) => {
+    const handled = ['ArrowUp','ArrowDown','KeyW','KeyS','Enter','Space','KeyP'];
+    if (handled.includes(e.code)) e.preventDefault();
+    keys[e.code] = true;
+    ensureAudio();
+  }, { passive: false });
+
+  window.addEventListener('keyup', (e) => {
+    keys[e.code] = false;
+  });
+
+  window.addEventListener('blur', () => {
+    keys.ArrowUp = keys.ArrowDown = keys.KeyW = keys.KeyS = false;
+    if (state === STATES.PLAYING || state === STATES.SERVE) {
+      previousState = state;
+      state = STATES.PAUSED;
+    }
+  });
+
+  window.addEventListener('resize', resize);
+  resize();
+  resetPaddles();
+  resetBall();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

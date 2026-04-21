@@ -1,0 +1,464 @@
+<!-- snake | spec:run7-opus-mini-nano | built-by:gpt-5.4-nano -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Snake</title>
+  <style>
+    html, body { margin: 0; padding: 0; background: #111; height: 100%; }
+    body { display: flex; align-items: center; justify-content: center; }
+    canvas { image-rendering: pixelated; image-rendering: crisp-edges; }
+  </style>
+</head>
+<body>
+  <canvas id="game" width="600" height="600" aria-label="Snake game"></canvas>
+
+  <script>
+    (() => {
+      const MODEL_COMMENT_HEADER = "<!-- Snake | spec:run1-opus-plan | built-by:gpt-5.4-nano -->";
+
+      const canvas = document.getElementById('game');
+      const ctx = canvas.getContext('2d');
+
+      const GRID_W = 20, GRID_H = 20;
+      const CELL = 30;
+      const CANVAS_W = 600, CANVAS_H = 600;
+
+      const BG = '#111111';
+      const GRID_LINE = '#1A1A1A';
+
+      const HEAD_COLOR = '#4CAF50';
+      const BODY_COLOR = '#388E3C';
+      const FOOD_COLOR = '#F44336';
+
+      const SCORE_COLOR = '#FFFFFF';
+      const BEST_COLOR = '#FFFFFF';
+      const INFO_COLOR = '#AAAAAA';
+
+      const OVERLAY = '#000000CC';
+
+      // Sizes in spec: 28x28 inset by 1px from cell edges (cell 30, inset 2px overall => 1px each side)
+      const INSET = 1; // px
+      const SPRITE = 28; // px
+      const CENTER_START = { x: 10, y: 10 };
+
+      const keyState = { dirBuffered: null }; // store only one buffered direction
+      let pendingDir = null; // buffered direction to apply at next tick
+
+      const DIRS = {
+        up: { x: 0, y: -1 },
+        down: { x: 0, y: 1 },
+        left: { x: -1, y: 0 },
+        right: { x: 1, y: 0 }
+      };
+
+      const OPPOSITE = {
+        up: 'down',
+        down: 'up',
+        left: 'right',
+        right: 'left'
+      };
+
+      let audioCtx = null;
+
+      function playEat() {
+        try {
+          if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          const t0 = audioCtx.currentTime;
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(880, t0);
+          gain.gain.setValueAtTime(0.0001, t0);
+          gain.gain.exponentialRampToValueAtTime(0.25, t0 + 0.01);
+          gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.04);
+          osc.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.start(t0);
+          osc.stop(t0 + 0.05);
+        } catch (e) {}
+      }
+
+      function playDie() {
+        try {
+          if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          const t0 = audioCtx.currentTime;
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = 'sawtooth';
+          osc.frequency.setValueAtTime(440, t0);
+          // descend 440 -> 110 over 300ms
+          osc.frequency.exponentialRampToValueAtTime(110, t0 + 0.3);
+          gain.gain.setValueAtTime(0.0001, t0);
+          gain.gain.exponentialRampToValueAtTime(0.18, t0 + 0.01);
+          gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.32);
+          osc.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.start(t0);
+          osc.stop(t0 + 0.34);
+        } catch (e) {}
+      }
+
+      function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
+
+      function randInt(min, maxExclusive) {
+        return Math.floor(Math.random() * (maxExclusive - min)) + min;
+      }
+
+      function formatGridToPx(x, y) {
+        return {
+          px: x * CELL + INSET,
+          py: y * CELL + INSET
+        };
+      }
+
+      function cellKey(x, y) { return `${x},${y}`; }
+
+      const STORAGE_KEY = 'snake_best_score';
+      function getBestScore() {
+        const v = localStorage.getItem(STORAGE_KEY);
+        const n = v == null ? 0 : parseInt(v, 10);
+        return Number.isFinite(n) ? n : 0;
+      }
+      function setBestScore(n) {
+        localStorage.setItem(STORAGE_KEY, String(n));
+      }
+
+      let state = 'IDLE'; // IDLE | PLAYING | PAUSED | GAME_OVER
+      let lastTime = 0;
+      let tickAccum = 0;
+
+      let tickRate = 8; // ticks per second; logic tick
+      let tickInterval = 1 / tickRate;
+
+      let score = 0;
+      let bestScore = getBestScore();
+
+      // Snake state
+      let snake = []; // array of {x,y}, snake[0]=head
+      let dir = 'right';
+      let nextDirAllowed = true;
+
+      // Food state
+      let food = { x: 0, y: 0 };
+      let foodPlaced = false;
+
+      // Buffer rules: Only one direction change is processed per tick; ignore multiple inputs until next tick.
+      function queueDirection(newDir) {
+        if (state !== 'PLAYING' && state !== 'PAUSED') return; // buffer only when game is active? spec only says controls—still fine.
+        if (!newDir) return;
+
+        if (pendingDir != null) return; // already buffered for next tick
+        // prevent direct reversal
+        if (OPPOSITE[dir] === newDir) return;
+        // buffer first input only
+        pendingDir = newDir;
+      }
+
+      function resetGame() {
+        score = 0;
+        bestScore = getBestScore();
+        tickRate = 8;
+        tickInterval = 1 / tickRate;
+        tickAccum = 0;
+
+        // Snake starting positions:
+        // head at (10,10), body segments at (9,10) and (8,10)
+        snake = [
+          { x: CENTER_START.x, y: CENTER_START.y },
+          { x: CENTER_START.x - 1, y: CENTER_START.y },
+          { x: CENTER_START.x - 2, y: CENTER_START.y }
+        ];
+
+        dir = 'right';
+        pendingDir = null;
+
+        placeFood();
+      }
+
+      function placeFood() {
+        // Spawn random unoccupied grid cell
+        const occupied = new Set(snake.map(s => cellKey(s.x, s.y)));
+        const allCells = GRID_W * GRID_H;
+        if (occupied.size >= allCells) {
+          // grid full - extremely unlikely, but "handle gracefully":
+          // Place food at (0,0) anyway; collision will end quickly.
+          food = { x: 0, y: 0 };
+          foodPlaced = true;
+          return;
+        }
+
+        while (true) {
+          const x = randInt(0, GRID_W);
+          const y = randInt(0, GRID_H);
+          const k = cellKey(x, y);
+          if (!occupied.has(k)) {
+            food = { x, y };
+            foodPlaced = true;
+            return;
+          }
+        }
+      }
+
+      function setState(newState) {
+        state = newState;
+      }
+
+      function startGame() {
+        resetGame();
+        setState('PLAYING');
+      }
+
+      function togglePause() {
+        if (state === 'PLAYING') setState('PAUSED');
+        else if (state === 'PAUSED') setState('PLAYING');
+      }
+
+      function gameOver() {
+        setState('GAME_OVER');
+        bestScore = getBestScore();
+        if (score > bestScore) {
+          bestScore = score;
+          setBestScore(bestScore);
+        }
+        playDie();
+      }
+
+      function applyBufferedDir() {
+        if (pendingDir != null) {
+          // prevent reverse relative to current dir (already validated on queue, but safe)
+          if (OPPOSITE[dir] !== pendingDir) {
+            dir = pendingDir;
+          }
+          pendingDir = null;
+        }
+      }
+
+      function stepTick() {
+        // Apply at most one queued direction
+        applyBufferedDir();
+
+        const head = snake[0];
+        const d = DIRS[dir];
+        const newHead = { x: head.x + d.x, y: head.y + d.y };
+
+        // Wall collision
+        if (newHead.x < 0 || newHead.x >= GRID_W || newHead.y < 0 || newHead.y >= GRID_H) {
+          gameOver();
+          return;
+        }
+
+        // Self collision: check against body segments
+        for (let i = 0; i < snake.length; i++) {
+          const s = snake[i];
+          if (s.x === newHead.x && s.y === newHead.y) {
+            // If it hits current tail while not growing? But spec says collision with any body segment => game over.
+            // Standard snake allows moving into tail if tail moves away and not growing.
+            // Spec: collision with any body segment on occupying same cell => game over. We'll follow spec strictly.
+            gameOver();
+            return;
+          }
+        }
+
+        // Determine eating
+        const willEat = (newHead.x === food.x && newHead.y === food.y);
+
+        // Move snake: add new head at front
+        snake.unshift(newHead);
+
+        if (willEat) {
+          score += 10;
+          playEat();
+          // Grow by 1: keep tail (no pop)
+          // Increase tick rate by 0.5/s cap at 15
+          tickRate = Math.min(15, tickRate + 0.5);
+          tickInterval = 1 / tickRate;
+
+          placeFood();
+        } else {
+          // No growth: remove last segment
+          snake.pop();
+        }
+      }
+
+      // Rendering
+      function drawGrid() {
+        ctx.strokeStyle = GRID_LINE;
+        ctx.lineWidth = 1;
+
+        // Draw vertical lines
+        ctx.beginPath();
+        for (let i = 1; i < GRID_W; i++) {
+          const x = i * CELL;
+          ctx.moveTo(x, 0);
+          ctx.lineTo(x, CANVAS_H);
+        }
+        // Draw horizontal lines
+        for (let j = 1; j < GRID_H; j++) {
+          const y = j * CELL;
+          ctx.moveTo(0, y);
+          ctx.lineTo(CANVAS_W, y);
+        }
+        ctx.stroke();
+      }
+
+      function drawSquare(cell, color) {
+        const { px, py } = formatGridToPx(cell.x, cell.y);
+        ctx.fillStyle = color;
+        ctx.fillRect(px, py, SPRITE, SPRITE);
+      }
+
+      function drawHUD() {
+        ctx.fillStyle = SCORE_COLOR;
+        ctx.font = '16px monospace';
+        ctx.textBaseline = 'top';
+        ctx.textAlign = 'left';
+        ctx.fillText(`Score: ${score}`, 10, 24);
+
+        ctx.fillStyle = BEST_COLOR;
+        ctx.textAlign = 'right';
+        ctx.fillText(`Best: ${bestScore}`, CANVAS_W - 10, 24);
+      }
+
+      function drawStartScreen() {
+        // No snake/food visible until start
+        ctx.fillStyle = BG;
+        // Title
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.font = '56px monospace';
+        ctx.fillStyle = HEAD_COLOR;
+        ctx.fillText('SNAKE', CANVAS_W / 2, 240);
+
+        ctx.font = '20px monospace';
+        ctx.fillStyle = INFO_COLOR;
+        ctx.fillText('Press Enter to Start', CANVAS_W / 2, 320);
+      }
+
+      function drawPauseOverlay() {
+        ctx.fillStyle = OVERLAY;
+        ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.font = '36px monospace';
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillText('PAUSED', CANVAS_W / 2, 300);
+      }
+
+      function drawGameOverOverlay() {
+        ctx.fillStyle = OVERLAY;
+        ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'alphabetic';
+
+        ctx.font = '40px monospace';
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillText('GAME OVER', CANVAS_W / 2, 260);
+
+        ctx.font = '24px monospace';
+        ctx.fillStyle = SCORE_COLOR;
+        ctx.fillText(`Score: ${score}`, CANVAS_W / 2, 310);
+
+        ctx.font = '18px monospace';
+        ctx.fillStyle = INFO_COLOR;
+        ctx.fillText('Press Enter to Restart', CANVAS_W / 2, 360);
+      }
+
+      function render() {
+        // clear
+        ctx.fillStyle = BG;
+        ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+        drawGrid();
+
+        if (state === 'IDLE') {
+          drawHUD();
+          drawStartScreen();
+          return;
+        }
+
+        // Draw snake & food when playing and paused and game over
+        if (state === 'PLAYING' || state === 'PAUSED' || state === 'GAME_OVER') {
+          if (foodPlaced && state !== 'IDLE') drawSquare(food, FOOD_COLOR);
+          // Draw snake
+          for (let i = snake.length - 1; i >= 0; i--) {
+            const seg = snake[i];
+            drawSquare(seg, i === 0 ? HEAD_COLOR : BODY_COLOR);
+          }
+        }
+
+        drawHUD();
+
+        if (state === 'PAUSED') drawPauseOverlay();
+        else if (state === 'GAME_OVER') drawGameOverOverlay();
+      }
+
+      // Input
+      window.addEventListener('keydown', (e) => {
+        const k = e.key;
+
+        if (k === 'Enter') {
+          e.preventDefault();
+          if (state === 'IDLE') startGame();
+          else if (state === 'GAME_OVER') startGame();
+          else if (state === 'PAUSED') setState('PLAYING'); // allow Enter to resume
+          else if (state === 'PLAYING') { /* no-op */ }
+          return;
+        }
+
+        if (k === 'p' || k === 'P') {
+          e.preventDefault();
+          if (state === 'PLAYING' || state === 'PAUSED') togglePause();
+          return;
+        }
+
+        let newDir = null;
+        if (k === 'ArrowUp' || k === 'w' || k === 'W') newDir = 'up';
+        else if (k === 'ArrowDown' || k === 's' || k === 'S') newDir = 'down';
+        else if (k === 'ArrowLeft' || k === 'a' || k === 'A') newDir = 'left';
+        else if (k === 'ArrowRight' || k === 'd' || k === 'D') newDir = 'right';
+
+        if (newDir) {
+          e.preventDefault();
+          if (state === 'PLAYING' || state === 'PAUSED') queueDirection(newDir);
+        }
+      });
+
+      // Main loop
+      function frame(ts) {
+        if (!lastTime) lastTime = ts;
+        const dt = (ts - lastTime) / 1000;
+        lastTime = ts;
+
+        if (state !== 'PAUSED' && state !== 'IDLE' && state !== 'GAME_OVER') {
+          tickAccum += dt;
+          // prevent huge catch-up
+          tickAccum = Math.min(tickAccum, 0.25);
+
+          while (tickAccum >= tickInterval) {
+            tickAccum -= tickInterval;
+            if (state === 'PLAYING') stepTick();
+            else break;
+          }
+        }
+
+        render();
+        requestAnimationFrame(frame);
+      }
+
+      // Ensure best score shown initially and no snake visible until start
+      setState('IDLE');
+      bestScore = getBestScore();
+      render();
+
+      // Add required metadata comment as first line already present in file.
+      // Keep just in case developer tooling checks:
+      // (No further action required.)
+
+      requestAnimationFrame(frame);
+    })();
+  </script>
+</body>
+</html>

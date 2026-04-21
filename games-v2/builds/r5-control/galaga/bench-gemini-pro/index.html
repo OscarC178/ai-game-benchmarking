@@ -1,0 +1,585 @@
+<!--
+  GAME:      Galaga
+  RUN:       r5-control
+  BUILDER:   google/gemini-3-pro-preview
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Galaga</title>
+<style>
+    body {
+        margin: 0;
+        background-color: #111;
+        color: #fff;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        height: 100vh;
+        overflow: hidden;
+        font-family: 'Courier New', Courier, monospace;
+    }
+    #game-container { position: relative; }
+    canvas {
+        background-color: #000;
+        border: 2px solid #555;
+        box-shadow: 0 0 20px rgba(0,0,255,0.3);
+    }
+    #ui {
+        display: flex;
+        justify-content: space-between;
+        width: 480px;
+        margin-bottom: 5px;
+        font-weight: bold;
+        font-size: 18px;
+    }
+    .val { color: #FFF; }
+</style>
+</head>
+<body>
+
+<div id="game-container">
+    <div id="ui">
+        <div>SCORE: <span id="scoreVal" class="val">0</span></div>
+        <div>HIGH: <span id="hiVal" class="val">0</span></div>
+    </div>
+    <canvas id="gameCanvas" width="480" height="600"></canvas>
+    <div style="display:flex; justify-content:space-between; margin-top:5px; width:480px; color:#888;">
+        <span id="livesVal">LIVES: 3</span>
+        <span>A/D or Arrows: Move | Space: Fire</span>
+    </div>
+</div>
+
+<script>
+// --- Constants & Config ---
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const scoreEl = document.getElementById('scoreVal');
+const hiEl = document.getElementById('hiVal');
+const livesEl = document.getElementById('livesVal');
+
+const W = canvas.width;
+const H = canvas.height;
+
+const ST_TITLE = 0;
+const ST_READY = 1;
+const ST_PLAY = 2;
+const ST_DEAD = 3;
+const ST_CLEAR = 4;
+const ST_OVER = 5;
+
+const PL_W = 32;
+const PL_H = 32;
+const PL_SPD = 250; // px/sec
+const BULLET_SPD = 400; // px/sec
+const EBULLET_SPD = 250;
+
+const EN_W = 24;
+const EN_H = 24;
+
+// Colors
+const C_BOSS = '#0F0';
+const C_GOEI = '#F00';
+const C_ZAKO = '#0FF';
+
+// --- State ---
+let state = ST_TITLE;
+let stateTimer = 0;
+
+let score = 0;
+let highScore = parseInt(localStorage.getItem('galaga_hi')) || 0;
+let lives = 3;
+let stage = 1;
+
+hiEl.innerText = highScore;
+
+let player = { x: W/2, y: H - 50, dead: false, dual: false, s1: true, s2: false };
+let bullets = [];
+let eBullets = [];
+let enemies = [];
+let stars = [];
+let explosions = [];
+
+// Formation logic
+let formX = W/2;
+let formY = 120;
+let formDir = 1;
+let formTime = 0;
+
+let diveTimer = 0;
+
+const keys = { left: false, right: false, space: false };
+let lastSpace = false;
+
+// --- Input ---
+window.addEventListener('keydown', e => {
+    let k = e.key.toLowerCase();
+    if (['arrowleft', 'a'].includes(k)) keys.left = true;
+    if (['arrowright', 'd'].includes(k)) keys.right = true;
+    if (k === ' ' || k === 'spacebar') keys.space = true;
+    
+    if (k === 'enter' || k === ' ') {
+        if (state === ST_TITLE || state === ST_OVER) {
+            startGame();
+        }
+    }
+});
+
+window.addEventListener('keyup', e => {
+    let k = e.key.toLowerCase();
+    if (['arrowleft', 'a'].includes(k)) keys.left = false;
+    if (['arrowright', 'd'].includes(k)) keys.right = false;
+    if (k === ' ' || k === 'spacebar') keys.space = false;
+});
+
+// --- Entities ---
+function initStars() {
+    stars = [];
+    for(let i=0; i<80; i++) {
+        stars.push({
+            x: Math.random() * W,
+            y: Math.random() * H,
+            spd: Math.random() * 50 + 20,
+            c: Math.random() > 0.5 ? '#FFF' : (Math.random() > 0.5 ? '#FAA' : '#AAF')
+        });
+    }
+}
+
+function initFormation() {
+    enemies = [];
+    formX = W/2;
+    formY = 100;
+    
+    // Boss (1x4)
+    for(let i=0; i<4; i++) {
+        enemies.push({ id: `b_${i}`, type: 'boss', cx: (i-1.5)*40, cy: -50, hp: 2, pts: 150, state: 'grid' });
+    }
+    // Goei (2x4)
+    for(let r=0; r<2; r++) {
+        for(let c=0; c<4; c++) {
+            enemies.push({ id: `g_${r}_${c}`, type: 'goei', cx: (c-1.5)*40, cy: r*30, hp: 1, pts: 80, state: 'grid' });
+        }
+    }
+    // Zako (2x5)
+    for(let r=0; r<2; r++) {
+        for(let c=0; c<5; c++) {
+            enemies.push({ id: `z_${r}_${c}`, type: 'zako', cx: (c-2)*40, cy: 60 + r*30, hp: 1, pts: 50, state: 'grid' });
+        }
+    }
+    
+    // Set absolute positions based on formX/Y initially
+    for(let e of enemies) {
+        e.x = formX + e.cx;
+        e.y = formY + e.cy;
+        e.homeX = e.x;
+        e.homeY = e.y;
+        e.diving = false;
+    }
+}
+
+function resetPlayer() {
+    player = { x: W/2, y: H - 50, dead: false, dual: false, s1: true, s2: false };
+    bullets = [];
+    eBullets = [];
+}
+
+function startStage() {
+    initFormation();
+    resetPlayer();
+    state = ST_READY;
+    stateTimer = 2.0;
+    diveTimer = 2.0;
+}
+
+function startGame() {
+    score = 0; scoreEl.innerText = score;
+    lives = 3; livesEl.innerText = `LIVES: ${lives}`;
+    stage = 1;
+    initStars();
+    startStage();
+}
+
+function explode(x, y, color) {
+    for(let i=0; i<15; i++) {
+        let a = Math.random() * Math.PI*2;
+        let s = Math.random() * 100 + 50;
+        explosions.push({
+            x: x, y: y,
+            vx: Math.cos(a)*s, vy: Math.sin(a)*s,
+            life: Math.random() * 0.3 + 0.1,
+            c: color
+        });
+    }
+}
+
+function addScore(pts) {
+    score += pts;
+    scoreEl.innerText = score;
+    if (score > highScore) {
+        highScore = score;
+        hiEl.innerText = highScore;
+        localStorage.setItem('galaga_hi', highScore);
+    }
+}
+
+// --- Logic ---
+function update(dt) {
+    // Stars
+    for (let s of stars) {
+        s.y += s.spd * dt;
+        if (s.y > H) { s.y = 0; s.x = Math.random() * W; }
+    }
+
+    if (state === ST_TITLE || state === ST_OVER) return;
+
+    if (state === ST_DEAD || state === ST_READY || state === ST_CLEAR) {
+        stateTimer -= dt;
+        updateExplosions(dt);
+        if (stateTimer <= 0) {
+            if (state === ST_DEAD) {
+                lives--;
+                livesEl.innerText = `LIVES: ${lives}`;
+                if (lives <= 0) state = ST_OVER;
+                else { resetPlayer(); state = ST_READY; stateTimer = 2.0; }
+            } else if (state === ST_CLEAR) {
+                stage++;
+                startStage();
+            } else if (state === ST_READY) {
+                state = ST_PLAY;
+            }
+        }
+        if(state === ST_READY) updateFormation(dt); // hover
+        return;
+    }
+
+    // Play
+    // Movement
+    if (keys.left) player.x -= PL_SPD * dt;
+    if (keys.right) player.x += PL_SPD * dt;
+    let halfW = player.dual ? PL_W : PL_W/2;
+    if (player.x < halfW) player.x = halfW;
+    if (player.x > W - halfW) player.x = W - halfW;
+
+    // Fire
+    if (keys.space && !lastSpace) {
+        let maxB = player.dual ? 4 : 2;
+        if (bullets.length < maxB) {
+            if (player.dual) {
+                if (player.s1) bullets.push({x: player.x - 16, y: player.y});
+                if (player.s2) bullets.push({x: player.x + 16, y: player.y});
+            } else {
+                if (player.s1) bullets.push({x: player.x, y: player.y});
+            }
+        }
+    }
+    lastSpace = keys.space;
+
+    // Projectiles
+    for(let i=bullets.length-1; i>=0; i--) {
+        bullets[i].y -= BULLET_SPD * dt;
+        if(bullets[i].y < 0) bullets.splice(i, 1);
+    }
+    for(let i=eBullets.length-1; i>=0; i--) {
+        eBullets[i].y += EBULLET_SPD * dt;
+        if(eBullets[i].y > H) eBullets.splice(i, 1);
+    }
+
+    updateFormation(dt);
+    updateEnemies(dt);
+    checkCollisions();
+    updateExplosions(dt);
+
+    if (enemies.length === 0) {
+        state = ST_CLEAR;
+        stateTimer = 2.0;
+    }
+}
+
+function updateExplosions(dt) {
+    for(let i=explosions.length-1; i>=0; i--) {
+        let p = explosions[i];
+        p.x += p.vx * dt; p.y += p.vy * dt;
+        p.life -= dt;
+        if(p.life <= 0) explosions.splice(i, 1);
+    }
+}
+
+function updateFormation(dt) {
+    formTime += dt;
+    // Breathing motion
+    formX = W/2 + Math.sin(formTime * 1.5) * 40;
+    // Lunge slightly every few seconds
+    let lunge = 0;
+    if (Math.sin(formTime * 0.5) > 0.8) lunge = Math.sin(formTime * 5) * 10;
+    
+    for (let e of enemies) {
+        e.homeX = formX + e.cx;
+        e.homeY = formY + e.cy + lunge;
+        if (e.state === 'grid') {
+            e.x = e.homeX;
+            e.y = e.homeY;
+        }
+    }
+}
+
+function updateEnemies(dt) {
+    // Dive logic
+    diveTimer -= dt;
+    if (diveTimer <= 0) {
+        let grids = enemies.filter(e => e.state === 'grid');
+        if (grids.length > 0) {
+            let choice = grids[Math.floor(Math.random() * Math.min(grids.length, 5))]; // Bias top rows? Simplified random here
+            choice.state = 'dive_arc';
+            choice.diveT = 0;
+            choice.startX = choice.x;
+            choice.startY = choice.y;
+        }
+        diveTimer = Math.max(0.5, 2.0 - (stage * 0.1));
+    }
+
+    for (let e of enemies) {
+        if (e.state === 'grid') continue;
+        
+        e.diveT += dt;
+        let t = e.diveT;
+
+        if (e.state === 'dive_arc') {
+            // Simplified dive curve
+            e.x = e.startX + Math.sin(t * 3) * 80; // Loop outwards
+            e.y = e.startY + t * 200;              // Fall
+            
+            // Shoot
+            if (t > 0.5 && t < 0.6 && Math.random() < 0.5) {
+                eBullets.push({x: e.x, y: e.y + 10});
+            }
+            
+            // Loop back
+            if (e.y > H + 50) {
+                e.y = -50;
+                e.x = e.homeX; // roughly above target
+                e.state = 'return';
+            }
+        } 
+        else if (e.state === 'return') {
+            // Lerp back to home spot
+            let dx = e.homeX - e.x;
+            let dy = e.homeY - e.y;
+            e.x += dx * 5 * dt;
+            e.y += dy * 5 * dt;
+            if (Math.abs(dx) < 5 && Math.abs(dy) < 5) {
+                e.state = 'grid';
+            }
+        }
+    }
+}
+
+function AABB(x1, y1, w1, h1, x2, y2, w2, h2) {
+    return x1 < x2 + w2 && x1 + w1 > x2 && y1 < y2 + h2 && y1 + h1 > y2;
+}
+
+function checkCollisions() {
+    if (state !== ST_PLAY) return;
+
+    // Player rect regions
+    let r1 = { x: player.dual ? player.x - 32 : player.x - 16, y: player.y - 16, w: 32, h: 32 };
+    let r2 = { x: player.x, y: player.y - 16, w: 32, h: 32 }; // Only used if dual
+
+    let pHit = false;
+
+    // Player vs Missiles
+    for(let i=eBullets.length-1; i>=0; i--) {
+        let m = eBullets[i];
+        let hit1 = player.s1 && AABB(m.x, m.y, 4, 8, r1.x, r1.y, r1.w, r1.h);
+        let hit2 = player.dual && player.s2 && AABB(m.x, m.y, 4, 8, r2.x, r2.y, r2.w, r2.h);
+        
+        if (hit1 || hit2) {
+            pHit = true; eBullets.splice(i, 1);
+            if (hit1) player.s1 = false;
+            if (hit2) player.s2 = false;
+            break;
+        }
+    }
+
+    // Player vs Enemy body
+    for (let e of enemies) {
+        if (pHit) break;
+        let ew = EN_W-4, eh = EN_H-4;
+        let ex = e.x - ew/2, ey = e.y - eh/2;
+        
+        let hit1 = player.s1 && AABB(ex, ey, ew, eh, r1.x, r1.y, r1.w, r1.h);
+        let hit2 = player.dual && player.s2 && AABB(ex, ey, ew, eh, r2.x, r2.y, r2.w, r2.h);
+        
+        if (hit1 || hit2) {
+            pHit = true;
+            if (hit1) player.s1 = false;
+            if (hit2) player.s2 = false;
+        }
+    }
+
+    if (pHit) {
+        explode(r1.x + 16, r1.y + 16, '#0FF');
+        if (!player.s1 && !player.s2) {
+            player.dead = true;
+            state = ST_DEAD;
+            stateTimer = 2.0;
+        }
+    }
+
+    // Bullets vs Enemies
+    for(let i=bullets.length-1; i>=0; i--) {
+        let b = bullets[i];
+        let hit = false;
+        
+        for (let j=enemies.length-1; j>=0; j--) {
+            let e = enemies[j];
+            if (AABB(b.x, b.y, 4, 12, e.x - EN_W/2, e.y - EN_H/2, EN_W, EN_H)) {
+                hit = true;
+                e.hp--;
+                explode(b.x, b.y, '#FFF');
+                if (e.hp <= 0) {
+                    explode(e.x, e.y, e.type === 'boss' ? '#0F0' : '#F00');
+                    addScore(e.state === 'grid' ? e.pts : e.pts * 2);
+                    enemies.splice(j, 1);
+                }
+                break;
+            }
+        }
+        if (hit) bullets.splice(i, 1);
+    }
+}
+
+// --- Render ---
+function drawPlayer(x, y) {
+    ctx.fillStyle = '#FFF';
+    ctx.fillRect(x - 2, y - 16, 4, 10); // Nose
+    ctx.fillRect(x - 8, y - 6, 16, 12); // Body
+    ctx.fillStyle = '#F00';
+    ctx.fillRect(x - 14, y, 6, 16); // L Wing
+    ctx.fillRect(x + 8, y, 6, 16); // R Wing
+    ctx.fillStyle = '#0FF';
+    ctx.fillRect(x - 4, y - 4, 8, 4); // Cockpit
+}
+
+function drawEnemy(e) {
+    let t = performance.now() / 200;
+    let frame = Math.floor(e.x / 20 + t) % 2; // Unique wobble sync
+    
+    ctx.save();
+    ctx.translate(e.x, e.y);
+    
+    if (e.type === 'boss') {
+        ctx.fillStyle = e.hp === 2 ? '#0F0' : '#00F'; // Dark blue if damaged
+        ctx.beginPath(); ctx.arc(0, 0, 10, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#F0F';
+        let wy = frame ? -2 : 2;
+        ctx.fillRect(-16, wy, 8, 6);
+        ctx.fillRect(8, wy, 8, 6);
+        // Eyes
+        ctx.fillStyle = '#F00';
+        ctx.fillRect(-6, -4, 4, 4); ctx.fillRect(2, -4, 4, 4);
+    } 
+    else if (e.type === 'goei') {
+        ctx.fillStyle = e.state === 'grid' ? '#F00' : '#A0A'; // Purple if diving
+        ctx.fillRect(-8, -8, 16, 16);
+        ctx.fillStyle = '#FF0'; // Yellow wings
+        let wy = frame ? -4 : 0;
+        ctx.fillRect(-12, wy, 4, 12);
+        ctx.fillRect(8, wy, 4, 12);
+    }
+    else { // Zako
+        ctx.fillStyle = e.state === 'grid' ? '#FF0' : '#0FF';
+        ctx.beginPath(); ctx.arc(0, 0, 8, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#FFF';
+        let wy = frame ? 2 : -2;
+        ctx.fillRect(-10, wy, 6, 6);
+        ctx.fillRect(4, wy, 6, 6);
+        ctx.fillStyle = '#F00'; ctx.fillRect(-2, -3, 4, 4);
+    }
+    
+    ctx.restore();
+}
+
+function render() {
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+    
+    // Stars
+    for (let s of stars) {
+        ctx.fillStyle = s.c;
+        ctx.fillRect(s.x, s.y, 2, 2);
+    }
+
+    if (state === ST_TITLE) {
+        ctx.fillStyle = '#0FF'; ctx.textAlign = 'center'; ctx.font = 'bold 50px monospace';
+        ctx.fillText("GALAGA", W/2, H/3);
+        if (Math.floor(performance.now()/500)%2===0) {
+            ctx.fillStyle = '#FFF'; ctx.font = '20px monospace';
+            ctx.fillText("PRESS ENTER TO START", W/2, H/2 + 20);
+        }
+        return;
+    }
+
+    // Player
+    if (!player.dead && state !== ST_OVER) {
+        if (player.dual) {
+            if(player.s1) drawPlayer(player.x - 16, player.y);
+            if(player.s2) drawPlayer(player.x + 16, player.y);
+        } else {
+            if(player.s1) drawPlayer(player.x, player.y);
+        }
+    }
+
+    // Enemies
+    for (let e of enemies) drawEnemy(e);
+
+    // Projectiles
+    ctx.fillStyle = '#FF0';
+    for (let b of bullets) ctx.fillRect(b.x - 2, b.y, 4, 12);
+    ctx.fillStyle = '#F00';
+    for (let b of eBullets) ctx.fillRect(b.x - 2, b.y, 4, 8);
+
+    // Explosions
+    for (let p of explosions) {
+        ctx.fillStyle = p.c;
+        ctx.fillRect(p.x, p.y, 3, 3);
+    }
+
+    // Overlays
+    ctx.textAlign = 'center';
+    if (state === ST_READY) {
+        ctx.fillStyle = '#0FF'; ctx.font = 'bold 30px monospace';
+        ctx.fillText(`STAGE ${stage}`, W/2, H/2);
+    } else if (state === ST_CLEAR) {
+        ctx.fillStyle = '#0F0'; ctx.font = 'bold 30px monospace';
+        ctx.fillText("STAGE CLEAR!", W/2, H/2);
+    } else if (state === ST_OVER) {
+        ctx.fillStyle = '#F00'; ctx.font = 'bold 40px monospace';
+        ctx.fillText("GAME OVER", W/2, H/2);
+        if (Math.floor(performance.now()/500)%2===0) {
+            ctx.fillStyle = '#FFF'; ctx.font = '20px monospace';
+            ctx.fillText("PRESS ENTER TO RESTART", W/2, H/2 + 40);
+        }
+    }
+}
+
+// --- Loop ---
+let lastTime = 0;
+function loop(ts) {
+    let dt = (ts - lastTime) / 1000;
+    lastTime = ts;
+    if (dt > 0.1) dt = 0.016; // Clamp lag
+    
+    update(dt);
+    render();
+    
+    requestAnimationFrame(loop);
+}
+
+initStars();
+requestAnimationFrame(loop);
+
+</script>
+</body>
+</html>

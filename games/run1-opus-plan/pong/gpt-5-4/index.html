@@ -1,0 +1,431 @@
+<!--
+  GAME:           Pong
+  RUN:            run1-opus-plan
+  BUILDER:        openai/gpt-5.4
+  PLANNER:        anthropic/claude-opus-4.6
+  BUILD TIME:     1 seconds
+  TOKENS IN:      0
+  TOKENS OUT:     0
+  ESTIMATED COST: $0.00
+  ITERATIONS:     1
+  TOOLS USED:     write, read
+  STATUS:         complete
+  TIMESTAMP:      2026-03-30T23:15:19Z
+  TASKS DONE:     T01,T02,T03,T04,T05,T06,T07,T08,T09,T10,T11,T12
+  FIRST FAILURE:  none
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Pong</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background: #000000;
+      overflow: hidden;
+      font-family: monospace;
+    }
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    canvas {
+      display: block;
+      width: 800px;
+      height: 600px;
+      background: #000000;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="game" width="800" height="600" aria-label="Pong game canvas"></canvas>
+  <script>
+    (() => {
+      const canvas = document.getElementById('game');
+      const ctx = canvas.getContext('2d');
+
+      const WIDTH = 800;
+      const HEIGHT = 600;
+      const STATES = {
+        IDLE: 'IDLE',
+        PLAYING: 'PLAYING',
+        PAUSED: 'PAUSED',
+        GAME_OVER: 'GAME_OVER'
+      };
+
+      const keys = new Set();
+      const player = { x: 30, y: 260, width: 12, height: 80, speed: 400 };
+      const cpu = { x: 758, y: 260, width: 12, height: 80, speed: 300, easing: 0.08 };
+      const ball = { x: 394, y: 294, size: 12, speed: 350, vx: 0, vy: 0 };
+
+      let state = STATES.IDLE;
+      let playerScore = 0;
+      let cpuScore = 0;
+      let winnerText = '';
+      let relaunchTimer = 0;
+      let pendingLaunchDirection = 1;
+      let lastTime = 0;
+      let highScore = loadHighScore();
+      let audioCtx = null;
+
+      function loadHighScore() {
+        try {
+          const value = window.localStorage.getItem('pongHighScore');
+          return value ? Number(value) || 0 : 0;
+        } catch (_) {
+          return 0;
+        }
+      }
+
+      function saveHighScore() {
+        try {
+          window.localStorage.setItem('pongHighScore', String(highScore));
+        } catch (_) {}
+      }
+
+      function ensureAudio() {
+        if (!audioCtx) {
+          const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+          if (AudioContextClass) audioCtx = new AudioContextClass();
+        }
+        if (audioCtx && audioCtx.state === 'suspended') {
+          audioCtx.resume().catch(() => {});
+        }
+      }
+
+      function playTone(type, frequency, duration, rampTo) {
+        if (!audioCtx) return;
+        const now = audioCtx.currentTime;
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = type;
+        osc.frequency.setValueAtTime(frequency, now);
+        if (typeof rampTo === 'number') {
+          osc.frequency.linearRampToValueAtTime(rampTo, now + duration);
+        }
+        gain.gain.setValueAtTime(0.04, now);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(now);
+        osc.stop(now + duration);
+      }
+
+      function playPaddleSound() {
+        playTone('square', 440, 0.05);
+      }
+
+      function playWallSound() {
+        playTone('square', 220, 0.05);
+      }
+
+      function playScoreSound() {
+        playTone('square', 660, 0.2, 330);
+      }
+
+      function clamp(value, min, max) {
+        return Math.max(min, Math.min(max, value));
+      }
+
+      function resetPaddles() {
+        player.y = 260;
+        cpu.y = 260;
+      }
+
+      function resetBall() {
+        ball.x = 394;
+        ball.y = 294;
+        ball.speed = 350;
+        ball.vx = 0;
+        ball.vy = 0;
+      }
+
+      function launchBall(direction) {
+        const angle = (Math.random() * 60 - 30) * Math.PI / 180;
+        ball.speed = 350;
+        ball.vx = Math.cos(angle) * ball.speed * direction;
+        ball.vy = Math.sin(angle) * ball.speed;
+      }
+
+      function scheduleBallLaunch(direction) {
+        resetBall();
+        relaunchTimer = 1;
+        pendingLaunchDirection = direction;
+      }
+
+      function startMatch() {
+        ensureAudio();
+        playerScore = 0;
+        cpuScore = 0;
+        winnerText = '';
+        resetPaddles();
+        resetBall();
+        state = STATES.PLAYING;
+        relaunchTimer = 0;
+        launchBall(Math.random() < 0.5 ? -1 : 1);
+      }
+
+      function goToIdle() {
+        winnerText = '';
+        resetPaddles();
+        resetBall();
+        relaunchTimer = 0;
+        state = STATES.IDLE;
+      }
+
+      function aabbIntersect(a, b) {
+        return (
+          a.x < b.x + b.width &&
+          a.x + a.size > b.x &&
+          a.y < b.y + b.height &&
+          a.y + a.size > b.y
+        );
+      }
+
+      function applyPaddleBounce(paddle, direction) {
+        const ballCenterY = ball.y + ball.size / 2;
+        const paddleCenterY = paddle.y + paddle.height / 2;
+        const offset = clamp((ballCenterY - paddleCenterY) / (paddle.height / 2), -1, 1);
+        const angle = offset * (Math.PI / 3);
+        ball.speed = Math.min(600, ball.speed + 25);
+        ball.vx = Math.cos(angle) * ball.speed * direction;
+        ball.vy = Math.sin(angle) * ball.speed;
+        if (direction > 0) {
+          ball.x = paddle.x + paddle.width;
+        } else {
+          ball.x = paddle.x - ball.size;
+        }
+        playPaddleSound();
+      }
+
+      function updatePlayer(dt) {
+        let dy = 0;
+        if (keys.has('ArrowUp') || keys.has('KeyW')) dy -= player.speed * dt;
+        if (keys.has('ArrowDown') || keys.has('KeyS')) dy += player.speed * dt;
+        player.y = clamp(player.y + dy, 0, HEIGHT - player.height);
+      }
+
+      function updateCpu(dt) {
+        const targetY = ball.y + ball.size / 2 - cpu.height / 2;
+        const desiredY = cpu.y + (targetY - cpu.y) * cpu.easing;
+        const maxStep = cpu.speed * dt;
+        const delta = clamp(desiredY - cpu.y, -maxStep, maxStep);
+        cpu.y = clamp(cpu.y + delta, 0, HEIGHT - cpu.height);
+      }
+
+      function scorePoint(side) {
+        if (side === 'player') {
+          playerScore += 1;
+          if (playerScore > highScore) {
+            highScore = playerScore;
+            saveHighScore();
+          }
+        } else {
+          cpuScore += 1;
+        }
+
+        playScoreSound();
+
+        if (playerScore >= 7 || cpuScore >= 7) {
+          winnerText = playerScore >= 7 ? 'YOU WIN' : 'GAME OVER';
+          state = STATES.GAME_OVER;
+          resetBall();
+          return;
+        }
+
+        scheduleBallLaunch(side === 'player' ? -1 : 1);
+      }
+
+      function updateBall(dt) {
+        if (relaunchTimer > 0) {
+          relaunchTimer = Math.max(0, relaunchTimer - dt);
+          if (relaunchTimer === 0) {
+            launchBall(pendingLaunchDirection);
+          }
+          return;
+        }
+
+        ball.x += ball.vx * dt;
+        ball.y += ball.vy * dt;
+
+        if (ball.y <= 0) {
+          ball.y = 0;
+          ball.vy *= -1;
+          playWallSound();
+        } else if (ball.y + ball.size >= HEIGHT) {
+          ball.y = HEIGHT - ball.size;
+          ball.vy *= -1;
+          playWallSound();
+        }
+
+        if (ball.vx < 0 && aabbIntersect(ball, player)) {
+          applyPaddleBounce(player, 1);
+        } else if (ball.vx > 0 && aabbIntersect(ball, cpu)) {
+          applyPaddleBounce(cpu, -1);
+        }
+
+        if (ball.x + ball.size < 0) {
+          scorePoint('cpu');
+        } else if (ball.x > WIDTH) {
+          scorePoint('player');
+        }
+      }
+
+      function update(dt) {
+        if (state !== STATES.PLAYING) return;
+        updatePlayer(dt);
+        updateCpu(dt);
+        updateBall(dt);
+      }
+
+      function drawCenterLine() {
+        ctx.fillStyle = '#444444';
+        const lineWidth = 4;
+        const segment = 15;
+        const gap = 10;
+        const x = 400 - lineWidth / 2;
+        for (let y = 0; y < HEIGHT; y += segment + gap) {
+          ctx.fillRect(x, y, lineWidth, segment);
+        }
+      }
+
+      function drawScores() {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '48px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(String(playerScore), 300, 50);
+        ctx.fillText(String(cpuScore), 500, 50);
+      }
+
+      function drawHighScore() {
+        ctx.fillStyle = '#888888';
+        ctx.font = '12px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        ctx.fillText('HIGH SCORE: ' + highScore, WIDTH / 2, 16);
+      }
+
+      function drawPaddle(paddle) {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(paddle.x, paddle.y, paddle.width, paddle.height);
+      }
+
+      function drawBall() {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(ball.x, ball.y, ball.size, ball.size);
+      }
+
+      function drawStartScreen() {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '64px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('PONG', WIDTH / 2, 200);
+
+        ctx.fillStyle = '#AAAAAA';
+        ctx.font = '20px monospace';
+        ctx.fillText('Press Enter to Start', WIDTH / 2, 350);
+      }
+
+      function drawGameOver() {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '48px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(winnerText, WIDTH / 2, HEIGHT / 2 - 40);
+
+        ctx.font = '24px monospace';
+        ctx.fillText(playerScore + ' - ' + cpuScore, WIDTH / 2, HEIGHT / 2 + 20);
+
+        ctx.fillStyle = '#AAAAAA';
+        ctx.font = '18px monospace';
+        ctx.fillText('Press Enter to Restart', WIDTH / 2, HEIGHT / 2 + 65);
+      }
+
+      function drawPauseOverlay() {
+        ctx.fillStyle = '#000000CC';
+        ctx.fillRect(0, 0, WIDTH, HEIGHT);
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '36px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('PAUSED', WIDTH / 2, HEIGHT / 2);
+      }
+
+      function render() {
+        ctx.clearRect(0, 0, WIDTH, HEIGHT);
+        ctx.fillStyle = '#000000';
+        ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+        drawHighScore();
+
+        if (state === STATES.IDLE) {
+          drawStartScreen();
+          return;
+        }
+
+        drawCenterLine();
+        drawScores();
+        drawPaddle(player);
+        drawPaddle(cpu);
+        drawBall();
+
+        if (state === STATES.PAUSED) {
+          drawPauseOverlay();
+        } else if (state === STATES.GAME_OVER) {
+          drawGameOver();
+        }
+      }
+
+      function loop(timestamp) {
+        if (!lastTime) lastTime = timestamp;
+        let dt = (timestamp - lastTime) / 1000;
+        lastTime = timestamp;
+        dt = Math.min(dt, 0.05);
+
+        update(dt);
+        render();
+        window.requestAnimationFrame(loop);
+      }
+
+      window.addEventListener('keydown', (event) => {
+        if (['ArrowUp', 'ArrowDown', 'KeyW', 'KeyS', 'Enter', 'KeyP'].includes(event.code)) {
+          event.preventDefault();
+        }
+
+        keys.add(event.code);
+
+        if (event.code === 'Enter') {
+          ensureAudio();
+          if (state === STATES.IDLE) {
+            startMatch();
+          } else if (state === STATES.GAME_OVER) {
+            goToIdle();
+          }
+        } else if (event.code === 'KeyP') {
+          if (state === STATES.PLAYING) {
+            state = STATES.PAUSED;
+          } else if (state === STATES.PAUSED) {
+            state = STATES.PLAYING;
+          }
+        }
+      });
+
+      window.addEventListener('keyup', (event) => {
+        keys.delete(event.code);
+      });
+
+      goToIdle();
+      window.requestAnimationFrame(loop);
+    })();
+  </script>
+</body>
+</html>

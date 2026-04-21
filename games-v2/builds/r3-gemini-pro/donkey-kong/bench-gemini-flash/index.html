@@ -1,0 +1,310 @@
+<!--
+  GAME:      Donkey Kong
+  RUN:       r3-gemini-pro
+  BUILDER:   google/gemini-3-flash-preview
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Donkey Kong - Arcade Classic</title>
+    <style>
+        body { margin: 0; background-color: #000; display: flex; justify-content: center; align-items: center; height: 100vh; overflow: hidden; font-family: 'Courier New', Courier, monospace; }
+        canvas { background-color: #000; border: 2px solid #333; display: block; image-rendering: pixelated; }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas" width="600" height="750"></canvas>
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        // --- Game Config & Constants ---
+        const WIDTH = 600, HEIGHT = 750;
+        const GRAVITY = 800;
+        const JUMP_FORCE = -350;
+        const WALK_SPEED = 150;
+        const CLIMB_SPEED = 100;
+
+        // --- Game State ---
+        let gameState = 'START'; // START, PLAYING, DEATH, GAMEOVER, WIN
+        let score = 0, highScore = parseInt(localStorage.getItem('dk_hi')) || 0;
+        let lives = 3, level = 1, bonus = 5000;
+        let lastTime = 0, dt = 0;
+        let keys = {};
+
+        // --- Level Geometry ---
+        // Girders: [{x1, y1, x2, y2}] - sloped lines
+        const girders = [
+            { x1: 50, y1: 700, x2: 550, y2: 680 }, // L1 (Bottom)
+            { x1: 50, y1: 580, x2: 550, y2: 600 }, // L2
+            { x1: 50, y1: 500, x2: 550, y2: 480 }, // L3
+            { x1: 50, y1: 380, x2: 550, y2: 400 }, // L4
+            { x1: 50, y1: 300, x2: 550, y2: 280 }, // L5
+            { x1: 150, y1: 180, x2: 450, y2: 180 }  // L6 (Top DK/Pauline)
+        ];
+
+        // Ladders: [{x, yTop, yBot}]
+        const ladders = [
+            { x: 500, yBot: 682, yTop: 600 },
+            { x: 100, yBot: 582, yTop: 500 },
+            { x: 500, yBot: 482, yTop: 400 },
+            { x: 100, yBot: 382, yTop: 300 },
+            { x: 300, yBot: 290, yTop: 180 }
+        ];
+
+        // --- Entities ---
+        const player = {
+            x: 70, y: 650, vx: 0, vy: 0, w: 24, h: 30,
+            onGround: false, climbing: false, jumping: false,
+            dir: 1, anim: 0
+        };
+
+        let barrels = [];
+        let spawnTimer = 0;
+
+        // --- Audio System ---
+        let audioCtx = null;
+        function initAudio() { if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+        function playSound(freq, dur, type = 'square', sweep = null) {
+            if (!audioCtx) return;
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.type = type;
+            osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+            if (sweep) osc.frequency.exponentialRampToValueAtTime(sweep, audioCtx.currentTime + dur);
+            gain.gain.setValueAtTime(0.05, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + dur);
+            osc.connect(gain).connect(audioCtx.destination);
+            osc.start(); osc.stop(audioCtx.currentTime + dur);
+        }
+
+        // --- Logic & Physics ---
+        function getGroundAt(x, y) {
+            for (let g of girders) {
+                if (x + 10 >= Math.min(g.x1, g.x2) && x + 10 <= Math.max(g.x1, g.x2)) {
+                    // Line equation: y = y1 + (x - x1) * (y2 - y1) / (x2 - x1)
+                    const groundY = g.y1 + (x + 10 - g.x1) * (g.y2 - g.y1) / (g.x2 - g.x1);
+                    if (y + player.h >= groundY - 5 && y + player.h <= groundY + 10) {
+                        return groundY;
+                    }
+                }
+            }
+            return null;
+        }
+
+        function checkLadder(x, y) {
+            for (let l of ladders) {
+                if (Math.abs(x + player.w/2 - l.x) < 20 && y + player.h > l.yTop && y < l.yBot) {
+                    return l;
+                }
+            }
+            return null;
+        }
+
+        function update(time) {
+            dt = Math.min((time - lastTime) / 1000, 0.1);
+            lastTime = time;
+
+            if (gameState === 'START') {
+                if (keys['Enter'] || keys[' ']) { initAudio(); resetGame(); gameState = 'PLAYING'; }
+                return;
+            }
+
+            if (gameState === 'PLAYING') {
+                bonus = Math.max(0, bonus - 50 * dt);
+                if (bonus <= 0) die();
+
+                // Player Movement
+                if (!player.climbing) {
+                    if (keys['ArrowLeft']) { player.vx = -WALK_SPEED; player.dir = -1; player.anim += dt * 10; }
+                    else if (keys['ArrowRight']) { player.vx = WALK_SPEED; player.dir = 1; player.anim += dt * 10; }
+                    else { player.vx = 0; }
+
+                    if (keys[' '] && player.onGround && !player.jumping) {
+                        player.vy = JUMP_FORCE;
+                        player.onGround = false;
+                        player.jumping = true;
+                        playSound(400, 0.1, 'triangle', 800);
+                    }
+
+                    player.vy += GRAVITY * dt;
+                    player.x += player.vx * dt;
+                    player.y += player.vy * dt;
+
+                    const gy = getGroundAt(player.x, player.y);
+                    if (gy && player.vy >= 0) {
+                        player.y = gy - player.h;
+                        player.vy = 0;
+                        player.onGround = true;
+                        player.jumping = false;
+                    } else {
+                        player.onGround = false;
+                    }
+                }
+
+                // Ladder logic
+                const ladder = checkLadder(player.x, player.y);
+                if (ladder) {
+                    if (keys['ArrowUp']) { 
+                        player.climbing = true; player.y -= CLIMB_SPEED * dt; 
+                        player.x = ladder.x - player.w/2; // Snap 
+                    }
+                    else if (keys['ArrowDown']) { 
+                        player.climbing = true; player.y += CLIMB_SPEED * dt; 
+                        player.x = ladder.x - player.w/2; 
+                    }
+                } else {
+                    player.climbing = false;
+                }
+
+                // Barrels Spawning
+                spawnTimer -= dt;
+                if (spawnTimer <= 0) {
+                    barrels.push({ x: 160, y: 160, vx: 180, vy: 0, state: 'roll' });
+                    spawnTimer = 4 - (level * 0.5);
+                }
+
+                updateBarrels();
+                checkCollisions();
+
+                // Win Condition
+                if (player.y < 200 && player.x > 250 && player.x < 350) {
+                    score += Math.floor(bonus);
+                    level++;
+                    gameState = 'WIN';
+                    playSound(600, 0.5, 'sine', 1200);
+                    setTimeout(() => { resetLevel(); gameState = 'PLAYING'; }, 2000);
+                }
+            }
+        }
+
+        function updateBarrels() {
+            barrels.forEach((b, i) => {
+                b.vy += GRAVITY * dt;
+                b.x += b.vx * dt;
+                b.y += b.vy * dt;
+
+                // Collide with girders
+                for (let g of girders) {
+                    if (b.x >= Math.min(g.x1, g.x2) && b.x <= Math.max(g.x1, g.x2)) {
+                        const gy = g.y1 + (b.x - g.x1) * (g.y2 - g.y1) / (g.x2 - g.x1);
+                        if (b.y + 18 >= gy && b.y + 18 <= gy + 15 && b.vy >= 0) {
+                            b.y = gy - 18;
+                            b.vy = 0;
+                            // Reverse direction based on slope
+                            if (g.y2 > g.y1) b.vx = 180;
+                            else if (g.y2 < g.y1) b.vx = -180;
+                            else b.vx = 0;
+                        }
+                    }
+                }
+
+                if (b.y > HEIGHT) barrels.splice(i, 1);
+            });
+        }
+
+        function checkCollisions() {
+            barrels.forEach(b => {
+                const dist = Math.hypot(player.x + player.w/2 - (b.x + 9), player.y + player.h/2 - (b.y + 9));
+                if (dist < 18) die();
+            });
+        }
+
+        function die() {
+            gameState = 'DEATH';
+            lives--;
+            playSound(100, 0.5, 'sawtooth', 20);
+            setTimeout(() => {
+                if (lives <= 0) gameState = 'GAMEOVER';
+                else { resetLevel(); gameState = 'PLAYING'; }
+            }, 1500);
+        }
+
+        function resetLevel() {
+            player.x = 70; player.y = 650; player.vx = 0; player.vy = 0;
+            barrels = []; spawnTimer = 2; bonus = 5000;
+        }
+
+        function resetGame() {
+            score = 0; lives = 3; level = 1;
+            resetLevel();
+        }
+
+        // --- Render ---
+        function draw() {
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+            // Girders
+            ctx.strokeStyle = '#f00'; ctx.lineWidth = 4;
+            girders.forEach(g => {
+                ctx.beginPath(); ctx.moveTo(g.x1, g.y1); ctx.lineTo(g.x2, g.y2); ctx.stroke();
+            });
+
+            // Ladders
+            ctx.strokeStyle = '#0ff'; ctx.lineWidth = 2;
+            ladders.forEach(l => {
+                ctx.beginPath(); ctx.moveTo(l.x, l.yTop); ctx.lineTo(l.x, l.yBot); ctx.stroke();
+                // Rungs
+                for (let ry = l.yTop; ry < l.yBot; ry += 10) {
+                    ctx.beginPath(); ctx.moveTo(l.x - 10, ry); ctx.lineTo(l.x + 10, ry); ctx.stroke();
+                }
+            });
+
+            // Player
+            ctx.fillStyle = '#f00';
+            ctx.fillRect(player.x, player.y, player.w, player.h);
+            ctx.fillStyle = '#ffc'; // Face
+            ctx.fillRect(player.x + (player.dir > 0 ? 10 : 4) , player.y + 4, 10, 10);
+
+            // Donkey Kong
+            ctx.fillStyle = '#840';
+            ctx.fillRect(50, 120, 60, 60);
+            ctx.fillStyle = '#fb0'; // Belly
+            ctx.fillRect(65, 140, 30, 35);
+
+            // Pauline
+            ctx.fillStyle = '#f0f';
+            ctx.fillRect(290, 150, 20, 30);
+
+            // Barrels
+            ctx.fillStyle = '#a52';
+            barrels.forEach(b => {
+                ctx.beginPath(); ctx.arc(b.x + 9, b.y + 9, 9, 0, 7); ctx.fill();
+                ctx.strokeStyle = '#000'; ctx.stroke();
+            });
+
+            // HUD
+            ctx.fillStyle = '#fff'; ctx.font = '20px Courier'; ctx.textAlign = 'left';
+            ctx.fillText(`SCORE: ${score}`, 20, 30);
+            ctx.textAlign = 'right';
+            ctx.fillText(`BONUS: ${Math.floor(bonus)}`, WIDTH - 20, 30);
+            ctx.textAlign = 'center';
+            ctx.fillText(`LIVES: ${lives}`, WIDTH/2, 30);
+
+            if (gameState === 'START') {
+                ctx.fillStyle = 'rgba(0,0,0,0.8)'; ctx.fillRect(0,0,WIDTH,HEIGHT);
+                ctx.fillStyle = '#f00'; ctx.font = 'bold 40px Courier';
+                ctx.fillText('DONKEY KONG', WIDTH/2, 300);
+                ctx.fillStyle = '#fff'; ctx.font = '20px Courier';
+                ctx.fillText('PRESS ENTER TO START', WIDTH/2, 400);
+            }
+            if (gameState === 'GAMEOVER') {
+                ctx.fillStyle = '#f00'; ctx.font = 'bold 50px Courier';
+                ctx.fillText('GAME OVER', WIDTH/2, HEIGHT/2);
+            }
+        }
+
+        function run(time) {
+            update(time);
+            draw();
+            requestAnimationFrame(run);
+        }
+
+        window.addEventListener('keydown', e => keys[e.code] = true);
+        window.addEventListener('keyup', e => keys[e.code] = false);
+        requestAnimationFrame(run);
+    </script>
+</body>
+</html>

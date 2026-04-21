@@ -1,0 +1,764 @@
+<!--
+  GAME:      Donkey Kong
+  RUN:       r5-control
+  BUILDER:   google/gemini-3-pro-preview
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Donkey Kong</title>
+    <style>
+        body {
+            margin: 0;
+            background-color: #111;
+            color: #fff;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            font-family: monospace;
+            overflow: hidden;
+        }
+        #game-container { position: relative; }
+        canvas {
+            background-color: #000;
+            border: 4px solid #DF1A22;
+            box-shadow: 0 0 20px rgba(223, 26, 34, 0.3);
+            image-rendering: pixelated;
+        }
+        #ui {
+            width: 448px;
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 5px;
+            font-size: 20px;
+            font-weight: bold;
+            color: #DF1A22;
+        }
+        .white-text { color: white; }
+    </style>
+</head>
+<body>
+
+<div id="game-container">
+    <div id="ui">
+        <div>SCORE <span id="scoreVal" class="white-text">0</span></div>
+        <div>L: <span id="livesVal" class="white-text">3</span></div>
+        <div>BONUS <span id="bonusVal" class="white-text">5000</span></div>
+    </div>
+    <canvas id="gameCanvas" width="448" height="512"></canvas>
+    <div style="width:448px; text-align:center; color:#888; margin-top:10px; font-size:14px;">
+        Arrows/WASD: Move & Climb | SPACE: Jump | P: Pause
+    </div>
+</div>
+
+<script>
+    // --- Constants & Config ---
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    const scoreEl = document.getElementById('scoreVal');
+    const livesEl = document.getElementById('livesVal');
+    const bonusEl = document.getElementById('bonusVal');
+
+    const W = canvas.width;
+    const H = canvas.height;
+    
+    // States
+    const ST_TITLE = 0, ST_PLAY = 1, ST_DEAD = 2, ST_CLEAR = 3, ST_OVER = 4, ST_PAUSE = 5;
+    
+    // Level Design Constants
+    const PLATFORM_COLOR = '#DF1A22';
+    const LADDER_COLOR = '#3ED1D2';
+    
+    // Game variables
+    let state = ST_TITLE;
+    let stateTimer = 0;
+    let score = 0;
+    let lives = 3;
+    let level = 1;
+    let bonus = 5000;
+    let bonusTimer = 0;
+    let globalTicks = 0;
+    
+    let platforms = [];
+    let ladders = [];
+    let barrels = [];
+    let player = {};
+    let dk = {};
+    let pauline = {};
+
+    // Input Handling
+    const keys = { left: false, right: false, up: false, down: false, space: false };
+    let spaceReleased = true; // For jump debouncing
+
+    // --- Level Architecture ---
+    // A classic girder level approximation.
+    // 6 platforms. 
+    // Plat 1: Bottom, slopes slightly right up (not really, let's keep bottom flat, rest sloping)
+    // Actually, authentic DK slopes are about ~10px over the span.
+    
+    function buildLevel() {
+        platforms = [];
+        ladders = [];
+        barrels = [];
+        
+        let pColor = PLATFORM_COLOR;
+        let pThickness = 12;
+
+        // Base 0 (Bottom)
+        platforms.push({ x1: 0, y1: 480, x2: W, y2: 480, color: pColor, w: pThickness });
+        // Plat 1 (Slopes up to right)
+        platforms.push({ x1: 0, y1: 410, x2: W-40, y2: 395, color: pColor, w: pThickness });
+        // Plat 2 (Slopes up to left)
+        platforms.push({ x1: 40, y1: 340, x2: W, y2: 325, color: pColor, w: pThickness });
+        // Plat 3 (Slopes up to right)
+        platforms.push({ x1: 0, y1: 270, x2: W-40, y2: 255, color: pColor, w: pThickness });
+        // Plat 4 (Slopes up to left)
+        platforms.push({ x1: 40, y1: 200, x2: W, y2: 185, color: pColor, w: pThickness });
+        // Plat 5 (Top flat for DK and Pauline)
+        platforms.push({ x1: 40, y1: 110, x2: W-80, y2: 110, color: pColor, w: pThickness }); // DK platform
+        platforms.push({ x1: 180, y1: 60, x2: 240, y2: 60, color: pColor, w: pThickness }); // Pauline platform
+
+        // Helper to add ladder. Finds Y automatically if linking plat to plat.
+        function addLadder(x, platBottomIdx, platTopIdx, broken=false) {
+            let pB = platforms[platBottomIdx];
+            let pT = platforms[platTopIdx];
+            
+            // Interpolate Y given X
+            let getTrueY = (plat, targetX) => {
+                if (plat.x1 === plat.x2) return plat.y1; // Vertical plat? Shouldnt happen
+                let m = (plat.y2 - plat.y1) / (plat.x2 - plat.x1);
+                return plat.y1 + m * (targetX - plat.x1);
+            };
+
+            let yB = getTrueY(pB, x);
+            let yT = getTrueY(pT, x);
+            
+            ladders.push({ x: x, yBot: yB, yTop: yT, broken: broken });
+        }
+
+        // Add ladders (Bot plat to Top plat)
+        addLadder(360, 0, 1);
+        addLadder(100, 1, 2);
+        addLadder(220, 1, 2, true); // Broken
+        addLadder(380, 2, 3);
+        addLadder(80, 3, 4);
+        addLadder(180, 3, 4, true); // Broken
+        addLadder(380, 4, 5); // To DK
+        addLadder(200, 5, 6); // To Pauline
+        
+        // Spawn DK
+        dk = { x: 80, y: platforms[5].y1 - 40, w: 40, h: 40, timer: 0 };
+        // Spawn Pauline
+        pauline = { x: 190, y: platforms[6].y1 - 30, w: 20, h: 30 };
+    }
+
+    function initPlayer() {
+        player = {
+            x: 40, y: 470, // Start pos on bottom platform
+            w: 16, h: 24,
+            vx: 0, vy: 0,
+            speed: 120, // px per sec
+            jumpForce: -260,
+            gravity: 800,
+            state: 'ground', // ground, air, climb
+            climbTargetX: 0,
+            facing: 1, // 1 right, -1 left
+            lastPlat: null
+        };
+    }
+
+    function startGame() {
+        score = 0;
+        lives = 3;
+        level = 1;
+        initLevel();
+        state = ST_PLAY;
+    }
+
+    function initLevel() {
+        buildLevel();
+        initPlayer();
+        bonus = 5000;
+        bonusTimer = 0;
+        barrels = [];
+        updateUI();
+    }
+
+    // --- Input ---
+    window.addEventListener('keydown', e => {
+        let k = e.key;
+        if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(k)) e.preventDefault();
+        
+        if (k === 'ArrowRight' || k.toLowerCase() === 'd') keys.right = true;
+        if (k === 'ArrowLeft' || k.toLowerCase() === 'a') keys.left = true;
+        if (k === 'ArrowUp' || k.toLowerCase() === 'w') keys.up = true;
+        if (k === 'ArrowDown' || k.toLowerCase() === 's') keys.down = true;
+        
+        if (k === ' ') {
+            keys.space = true;
+            if (state === ST_TITLE) startGame();
+            else if (state === ST_OVER && stateTimer <= 0) { state = ST_TITLE; }
+        }
+        if (k.toLowerCase() === 'p') {
+            if (state === ST_PLAY) state = ST_PAUSE;
+            else if (state === ST_PAUSE) state = ST_PLAY;
+        }
+    });
+
+    window.addEventListener('keyup', e => {
+        let k = e.key;
+        if (k === 'ArrowRight' || k.toLowerCase() === 'd') keys.right = false;
+        if (k === 'ArrowLeft' || k.toLowerCase() === 'a') keys.left = false;
+        if (k === 'ArrowUp' || k.toLowerCase() === 'w') keys.up = false;
+        if (k === 'ArrowDown' || k.toLowerCase() === 's') keys.down = false;
+        if (k === ' ') { keys.space = false; spaceReleased = true; }
+    });
+
+    // --- Physics Helpers ---
+    function getPlatformY(plat, x) {
+        if (x < plat.x1 || x > plat.x2) return null;
+        let m = (plat.y2 - plat.y1) / (plat.x2 - plat.x1);
+        return plat.y1 + m * (x - plat.x1);
+    }
+
+    // --- Update Logic ---
+    function update(dt) {
+        globalTicks += dt;
+
+        if (state === ST_TITLE || state === ST_PAUSE) return;
+
+        if (state === ST_DEAD || state === ST_CLEAR || state === ST_OVER) {
+            stateTimer -= dt;
+            if (stateTimer <= 0 && state !== ST_OVER) {
+                if (state === ST_DEAD) {
+                    lives--;
+                    if (lives <= 0) {
+                        state = ST_OVER;
+                        stateTimer = 1.0; // Wait before allowing restart
+                    } else {
+                        initLevel(); // Restart level
+                        state = ST_PLAY;
+                    }
+                } else if (state === ST_CLEAR) {
+                    level++;
+                    initLevel(); // Next level (same layout for now, faster barrels)
+                    state = ST_PLAY;
+                }
+            }
+            if (state === ST_DEAD) {
+                 // Simple death animation for player
+                 player.vy += player.gravity * dt;
+                 player.y += player.vy * dt;
+            }
+            return;
+        }
+
+        // --- ST_PLAY ---
+
+        // Bonus decrement
+        bonusTimer += dt;
+        if (bonusTimer >= 1.5) { // Decrease bonus every 1.5s
+            bonus = Math.max(0, bonus - 100);
+            bonusTimer = 0;
+            updateUI();
+            if (bonus === 0) {
+                // Time Up = Dead
+                die();
+                return;
+            }
+        }
+
+        // DK spawns barrels
+        dk.timer += dt;
+        let spawnRate = Math.max(1.5, 3.5 - (level * 0.3));
+        if (dk.timer >= spawnRate) {
+            dk.timer = 0;
+            // Animation state logic for DK throwing
+            if (barrels.length < 15) {
+                spawnBarrel();
+            }
+        }
+
+        updatePlayer(dt);
+        updateBarrels(dt);
+        checkCollisions();
+        
+        // Win condition: reach Pauline's platform
+        if (player.y <= platforms[6].y1 + 10 && player.x >= platforms[6].x1 && player.x <= platforms[6].x2) {
+            state = ST_CLEAR;
+            stateTimer = 3.0; // Wait 3 seconds
+            score += bonus;
+            updateUI();
+        }
+    }
+
+    function updatePlayer(dt) {
+        if (player.state === 'ground' || player.state === 'air') {
+            // Horizontal move
+            if (keys.left) { player.vx = -player.speed; player.facing = -1; }
+            else if (keys.right) { player.vx = player.speed; player.facing = 1; }
+            else { player.vx = 0; }
+
+            // Jump
+            if (keys.space && spaceReleased && player.state === 'ground') {
+                player.vy = player.jumpForce;
+                player.state = 'air';
+                spaceReleased = false;
+                // Add a slight score bump for jumping barrels later
+            }
+
+            // Apply movement
+            player.x += player.vx * dt;
+            
+            // X Bounds
+            if (player.x < 0) player.x = 0;
+            if (player.x > W - player.w) player.x = W - player.w;
+
+            // Gravity
+            player.vy += player.gravity * dt;
+            player.y += player.vy * dt;
+
+            // Platform collision (Falling down)
+            if (player.vy >= 0) {
+                let isOnPlatform = false;
+                let lowestStandableY = getLowestStandableY(player.x + player.w/2, player.y);
+                
+                // If we cross a platform threshold
+                if (lowestStandableY !== null) {
+                    let platY = lowestStandableY.y;
+                    // Check if player bottom crossed plat line this frame
+                    let pBottom = player.y + player.h;
+                    let pLastBottom = pBottom - player.vy * dt;
+                    
+                    if (pLastBottom <= platY + 5 && pBottom >= platY) {
+                        player.y = platY - player.h;
+                        player.vy = 0;
+                        player.state = 'ground';
+                        player.lastPlat = lowestStandableY.plat;
+                        isOnPlatform = true;
+                    }
+                }
+                
+                if (!isOnPlatform && player.state === 'ground') {
+                     // Walked off an edge
+                     player.state = 'air';
+                }
+            }
+
+            // Climbing check
+            if ((keys.up || keys.down) && player.state === 'ground') {
+                // Find nearest unbroken ladder overlapping player center
+                let px = player.x + player.w/2;
+                for (let l of ladders) {
+                    if (l.broken) continue;
+                    // Are we overlapping the ladder X?
+                    if (Math.abs(px - l.x) < 12) {
+                        // Are we currently at bottom or top of this ladder?
+                        let atBottom = Math.abs((player.y + player.h) - l.yBot) < 5;
+                        let atTop = Math.abs((player.y + player.h) - l.yTop) < 5;
+                        
+                        if ((keys.up && atBottom) || (keys.down && atTop)) {
+                            player.state = 'climb';
+                            player.climbTargetX = l.x - player.w/2;
+                            player.x = player.climbTargetX;
+                            player.vx = 0;
+                            player.vy = 0;
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if (player.state === 'climb') {
+            let climbSpeed = 80;
+            if (keys.up) player.vy = -climbSpeed;
+            else if (keys.down) player.vy = climbSpeed;
+            else player.vy = 0;
+
+            player.y += player.vy * dt;
+            
+            // Re-find the ladder we are on
+            let currentLadder = null;
+            let px = player.x + player.w/2;
+            for (let l of ladders) {
+                if (Math.abs(px - l.x) < 5 && !l.broken) {
+                    currentLadder = l; break;
+                }
+            }
+
+            if (currentLadder) {
+                // Clamp climb
+                if (player.y + player.h < currentLadder.yTop) {
+                    player.y = currentLadder.yTop - player.h;
+                    player.state = 'ground';
+                    player.vy = 0;
+                } else if (player.y + player.h > currentLadder.yBot) {
+                    player.y = currentLadder.yBot - player.h;
+                    player.state = 'ground';
+                    player.vy = 0;
+                }
+            } else {
+                // Slipped off ladder? Shouldn't happen unless logic fails, but fallback
+                player.state = 'air';
+            }
+        }
+    }
+
+    // Helps determine which platform Y is below our current position for snapping
+    function getLowestStandableY(px, py) {
+        let bestY = null;
+        let chosenPlat = null;
+        for (let p of platforms) {
+            let pYAtX = getPlatformY(p, px);
+            if (pYAtX !== null) {
+                // Only consider platforms that are below or very close to our feet
+                if (pYAtX >= py + player.h - 15) { 
+                    if (bestY === null || pYAtX < bestY) {
+                        bestY = pYAtX;
+                        chosenPlat = p;
+                    }
+                }
+            }
+        }
+        if (bestY !== null) return { y: bestY, plat: chosenPlat };
+        return null;
+    }
+
+    function spawnBarrel() {
+        let startPlat = platforms[5];
+        let startX = 120; // Near DK
+        let startY = startPlat.y1 - 10;
+        
+        barrels.push({
+            x: startX,
+            y: startY,
+            r: 8,
+            vx: 80 + (level * 10),
+            vy: 0,
+            state: 'roll', // roll, fall
+            ignoreLadderTimer: 0 // Prevents falling down multiple ladders instantly
+        });
+    }
+
+    function updateBarrels(dt) {
+        for (let i = barrels.length - 1; i >= 0; i--) {
+            let b = barrels[i];
+
+            if (b.ignoreLadderTimer > 0) b.ignoreLadderTimer -= dt;
+
+            if (b.state === 'roll') {
+                b.vy += player.gravity * dt; // Gravity to stay on slopes
+                
+                let nextX = b.x + b.vx * dt;
+                
+                // Track if jumped
+                let jumpedPlayer = false;
+                if (!b.scoredJump) {
+                    // If barrel passes player horizontally
+                    let prevDist = b.x - (player.x + player.w/2);
+                    let currDist = nextX - (player.x + player.w/2);
+                    
+                    if (Math.sign(prevDist) !== Math.sign(currDist)) {
+                        // Passed player logic. Was player jumping over it?
+                        if (player.state === 'air' && player.y + player.h < b.y) {
+                            score += 100;
+                            updateUI();
+                            b.scoredJump = true;
+                        }
+                    }
+                }
+
+                b.x = nextX;
+                b.y += b.vy * dt;
+
+                // Wall bounce / Drop logic
+                if (b.x < 0) { b.x = 0; b.vx *= -1; }
+                if (b.x > W) { b.x = W; b.vx *= -1; }
+
+                // Platform resolve
+                let platInfo = getLowestStandableY(b.x, b.y - b.r);
+                if (platInfo) {
+                    let platY = platInfo.y;
+                    if (b.y + b.r >= platY - 5) {
+                        b.y = platY - b.r;
+                        b.vy = 0;
+                        
+                        // Slope affects velocity direction
+                        let p = platInfo.plat;
+                        let slope = (p.y2 - p.y1) / (p.x2 - p.x1);
+                        // Barrels tend to roll down
+                        if (slope > 0) b.vx = Math.abs(b.vx); // Roll right
+                        else if (slope < 0) b.vx = -Math.abs(b.vx); // Roll left
+                    }
+                } else {
+                     b.state = 'fall';
+                }
+
+                // Ladder drop chance
+                if (b.ignoreLadderTimer <= 0) {
+                    for (let l of ladders) {
+                        if (l.broken) continue;
+                        if (Math.abs(b.x - l.x) < 5) {
+                            // 30% chance to drop down a ladder if near top
+                            if (Math.abs((b.y + b.r) - l.yTop) < 5) {
+                                if (Math.random() < 0.3) {
+                                    b.state = 'fall';
+                                    b.x = l.x;
+                                    b.vx = 0; // Drop straight down mostly
+                                    break;
+                                } else {
+                                    b.ignoreLadderTimer = 1.0; // Don't check this ladder again immediately
+                                }
+                            }
+                        }
+                    }
+                }
+
+            } else if (b.state === 'fall') {
+                b.vy += player.gravity * dt;
+                b.y += b.vy * dt;
+
+                let platInfo = getLowestStandableY(b.x, b.y - b.r);
+                if (platInfo) {
+                    let platY = platInfo.y;
+                    if (b.y + b.r >= platY) {
+                        b.y = platY - b.r;
+                        b.vy = 0;
+                        b.state = 'roll';
+                        // Pick random direction or slope driven
+                        let p = platInfo.plat;
+                        let slope = (p.y2 - p.y1) / (p.x2 - p.x1);
+                        let baseSpd = 80 + (level * 10);
+                        if (slope > 0) b.vx = baseSpd;
+                        else if (slope < 0) b.vx = -baseSpd;
+                        else b.vx = Math.random() > 0.5 ? baseSpd : -baseSpd;
+                    }
+                }
+            }
+
+            // Remove out of bounds (falling off bottom left typically)
+            if (b.y > H || (b.x < 10 && b.y > 450)) {
+                barrels.splice(i, 1);
+            }
+        }
+    }
+
+    function checkCollisions() {
+        if (state !== ST_PLAY) return;
+
+        let px = player.x;
+        let py = player.y;
+        let pw = player.w;
+        let ph = player.h - 2; // Slight leniency on head
+
+        for (let b of barrels) {
+            // Circle to AABB collision approximation
+            let testX = b.x;
+            let testY = b.y;
+
+            if (b.x < px) testX = px;
+            else if (b.x > px + pw) testX = px + pw;
+
+            if (b.y < py) testY = py;
+            else if (b.y > py + ph) testY = py + ph;
+
+            let distX = b.x - testX;
+            let distY = b.y - testY;
+            let distance = Math.sqrt((distX*distX) + (distY*distY));
+
+            if (distance <= b.r - 2) { // smaller hurtbox
+                die();
+                return;
+            }
+        }
+    }
+
+    function die() {
+        state = ST_DEAD;
+        stateTimer = 2.0;
+        player.vy = -200; // Jump up on death
+    }
+
+    function updateUI() {
+        scoreEl.innerText = score;
+        livesEl.innerText = lives;
+        bonusEl.innerText = bonus;
+    }
+
+    // --- Rendering ---
+    function draw() {
+        // Clear
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, W, H);
+
+        if (state === ST_TITLE) {
+            ctx.fillStyle = PLATFORM_COLOR; ctx.font = 'bold 40px monospace'; ctx.textAlign = 'center';
+            ctx.fillText("DONKEY KONG", W/2, H/3);
+            if (Math.floor(globalTicks*2) % 2 === 0) {
+                ctx.fillStyle = '#fff'; ctx.font = '20px monospace';
+                ctx.fillText("PRESS SPACE TO START", W/2, H/2 + 20);
+            }
+            return;
+        }
+
+        // Draw Ladders
+        ctx.strokeStyle = LADDER_COLOR;
+        ctx.lineWidth = 2;
+        for (let l of ladders) {
+            let ly1 = l.yTop;
+            let ly2 = l.yBot;
+            
+            // Draw rails
+            ctx.beginPath();
+            ctx.moveTo(l.x - 6, ly1); ctx.lineTo(l.x - 6, ly2);
+            ctx.moveTo(l.x + 6, ly1); ctx.lineTo(l.x + 6, ly2);
+            ctx.stroke();
+
+            // Draw rungs
+            let rungDist = 12;
+            let drawBot = ly2;
+            if (l.broken) drawBot = ly1 + 20; // Broken ladders just stop early visually
+            
+            ctx.beginPath();
+            for (let y = ly1 + rungDist; y < drawBot; y += rungDist) {
+                ctx.moveTo(l.x - 6, y);
+                ctx.lineTo(l.x + 6, y);
+            }
+            ctx.stroke();
+            
+            if (l.broken) {
+                // Bottom stub of broken ladder
+                ctx.beginPath();
+                ctx.moveTo(l.x - 6, ly2 - 20); ctx.lineTo(l.x - 6, ly2);
+                ctx.moveTo(l.x + 6, ly2 - 20); ctx.lineTo(l.x + 6, ly2);
+                ctx.moveTo(l.x - 6, ly2 - 10); ctx.lineTo(l.x + 6, ly2 - 10);
+                ctx.stroke();
+            }
+        }
+
+        // Draw Platforms
+        ctx.fillStyle = PLATFORM_COLOR;
+        for (let p of platforms) {
+            ctx.beginPath();
+            ctx.moveTo(p.x1, p.y1);
+            ctx.lineTo(p.x2, p.y2);
+            ctx.lineTo(p.x2, p.y2 + p.w);
+            ctx.lineTo(p.x1, p.y1 + p.w);
+            ctx.fill();
+        }
+
+        // Draw Pauline
+        ctx.fillStyle = '#FFB6C1'; // Pink dress
+        ctx.fillRect(pauline.x, pauline.y, pauline.w, pauline.h);
+        ctx.fillStyle = '#FFDAB9'; // Head
+        ctx.fillRect(pauline.x + 4, pauline.y - 12, 12, 12);
+        // "HELP!" text
+        if (state === ST_PLAY && Math.floor(globalTicks*2) % 2 === 0) {
+            ctx.fillStyle = '#fff'; ctx.font = '12px monospace'; ctx.textAlign = 'center';
+            ctx.fillText("HELP!", pauline.x + 10, pauline.y - 20);
+        }
+
+        // Draw DK
+        ctx.fillStyle = '#8B4513';
+        ctx.fillRect(dk.x, dk.y, dk.w, dk.h); // Body
+        ctx.fillRect(dk.x + 6, dk.y - 16, 28, 16); // Head
+        // Arms mapping to action
+        let armY = dk.y + 10;
+        if (dk.timer > 1.2 && barrels.length < 15) armY -= 15; // Raised arm preparing to throw
+        ctx.fillRect(dk.x - 10, armY, 10, 20);
+        ctx.fillRect(dk.x + dk.w, armY, 10, 20);
+
+        // Draw Barrels
+        for (let b of barrels) {
+            ctx.save();
+            ctx.translate(b.x, b.y); // Use center for rolling
+            if (b.state === 'roll') ctx.rotate((b.x / 10) * Math.PI/2);
+            
+            ctx.fillStyle = '#CD853F'; // Wood
+            ctx.beginPath(); ctx.arc(0, 0, b.r, 0, Math.PI*2); ctx.fill();
+            ctx.strokeStyle = '#5c2e0b'; // Bands
+            ctx.lineWidth = 2;
+            
+            if (b.state === 'roll') {
+                 // Cross line to show roll
+                 ctx.beginPath(); ctx.moveTo(-b.r, 0); ctx.lineTo(b.r, 0); ctx.stroke();
+                 ctx.beginPath(); ctx.moveTo(0, -b.r); ctx.lineTo(0, b.r); ctx.stroke();
+            } else {
+                 ctx.beginPath(); ctx.moveTo(-b.r + 2, -4); ctx.lineTo(b.r - 2, -4); ctx.stroke();
+                 ctx.beginPath(); ctx.moveTo(-b.r + 2, 4); ctx.lineTo(b.r - 2, 4); ctx.stroke();
+            }
+            
+            ctx.restore();
+        }
+
+        // Draw Player (Jumpman)
+        if (state !== ST_CLEAR) {
+            ctx.fillStyle = '#ff0000'; // Overalls/Hat
+            if (state === ST_DEAD) {
+                 ctx.save();
+                 ctx.translate(player.x + player.w/2, player.y + player.h/2);
+                 ctx.rotate(globalTicks * 10);
+                 ctx.fillRect(-player.w/2, -player.h/2, player.w, player.h);
+                 ctx.restore();
+            } else {
+                 ctx.fillRect(player.x, player.y, player.w, player.h); // Body
+                 // Face / Direction
+                 ctx.fillStyle = '#FFDAB9';
+                 let fx = player.facing === 1 ? player.w - 6 : 0;
+                 ctx.fillRect(player.x + fx, player.y + 4, 6, 6);
+                 
+                 // Legs animation
+                 ctx.fillStyle = '#0000FF'; // Blue shirt/legs
+                 let isMoving = player.state === 'ground' && player.vx !== 0;
+                 let isClimbing = player.state === 'climb' && player.vy !== 0;
+                 
+                 let legOffset = isMoving ? Math.sin(globalTicks * 15) * 4 : 0;
+                 if (isClimbing) legOffset = Math.sin(globalTicks * 15) * 4;
+
+                 ctx.fillRect(player.x + 2, player.y + player.h - 6, 4, 6 + legOffset);
+                 ctx.fillRect(player.x + player.w - 6, player.y + player.h - 6, 4, 6 - legOffset);
+            }
+        }
+
+        // Overlays
+        ctx.textAlign = 'center';
+        if (state === ST_PAUSE) {
+            ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0,0,W,H);
+            ctx.fillStyle = '#FFF'; ctx.font = 'bold 40px monospace';
+            ctx.fillText("PAUSED", W/2, H/2);
+        } else if (state === ST_OVER) {
+            ctx.fillStyle = '#F00'; ctx.font = 'bold 40px monospace';
+            ctx.fillText("GAME OVER", W/2, H/2 - 20);
+        } else if (state === ST_CLEAR) {
+            ctx.fillStyle = '#0F0'; ctx.font = 'bold 30px monospace';
+            ctx.fillText("LEVEL CLEAR!", W/2, H/2);
+            ctx.fillStyle = '#FFF'; ctx.font = '20px monospace';
+            ctx.fillText(`BONUS ADDED: ${bonus}`, W/2, H/2 + 30);
+        }
+
+        // Level text
+        ctx.fillStyle = '#FFF'; ctx.font = '14px monospace'; ctx.textAlign = 'right';
+        ctx.fillText(`L=${level}`, W - 10, 20);
+    }
+
+    // --- Loop ---
+    let lastTime = 0;
+    function loop(ts) {
+        let dt = (ts - lastTime) / 1000;
+        lastTime = ts;
+        if (dt > 0.1) dt = 0.016; // Fix huge jumps
+
+        update(dt);
+        draw();
+        
+        requestAnimationFrame(loop);
+    }
+
+    requestAnimationFrame(loop);
+
+</script>
+</body>
+</html>

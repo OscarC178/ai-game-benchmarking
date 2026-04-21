@@ -1,0 +1,590 @@
+<!--
+  GAME:      Pong
+  RUN:       r1-opus
+  BUILDER:   anthropic/claude-sonnet-4.6
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Pong</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#111; display:flex; align-items:center; justify-content:center; width:100vw; height:100vh; overflow:hidden; }
+canvas { display:block; image-rendering:pixelated; }
+</style>
+</head>
+<body>
+<canvas id="c" width="858" height="525"></canvas>
+<script>
+(function(){
+'use strict';
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const W = 858, H = 525;
+
+// Scale to fit
+function resize() {
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H);
+  canvas.style.width = (W * s) + 'px';
+  canvas.style.height = (H * s) + 'px';
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ---- Audio ----
+let AC = null;
+function getAC() {
+  if (!AC) try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch(e) {}
+  return AC;
+}
+function playSquare(freq, dur, gain) {
+  try {
+    const ac = getAC(); if (!ac) return;
+    const osc = ac.createOscillator();
+    const gn = ac.createGain();
+    osc.connect(gn); gn.connect(ac.destination);
+    osc.type = 'square';
+    osc.frequency.value = freq;
+    gn.gain.setValueAtTime(gain, ac.currentTime);
+    gn.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
+    osc.start(ac.currentTime);
+    osc.stop(ac.currentTime + dur + 0.01);
+  } catch(e) {}
+}
+function playPaddleHit() { playSquare(480, 0.045, 0.3); }
+function playWallBounce() { playSquare(240, 0.030, 0.2); }
+function playScore() { playSquare(160, 0.250, 0.3); }
+function playWin() {
+  playSquare(660, 0.07, 0.25);
+  setTimeout(() => playSquare(990, 0.1, 0.25), 80);
+}
+function playLoss() { playSquare(140, 0.5, 0.25); }
+
+// ---- Input ----
+const keys = {};
+window.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  // First interaction init audio
+  getAC();
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// ---- Bitmap Digits ----
+const DIGITS = [
+  [[1,1,1],[1,0,1],[1,0,1],[1,0,1],[1,1,1]], // 0
+  [[0,1,0],[0,1,0],[0,1,0],[0,1,0],[0,1,0]], // 1
+  [[1,1,1],[0,0,1],[1,1,1],[1,0,0],[1,1,1]], // 2
+  [[1,1,1],[0,0,1],[1,1,1],[0,0,1],[1,1,1]], // 3
+  [[1,0,1],[1,0,1],[1,1,1],[0,0,1],[0,0,1]], // 4
+  [[1,1,1],[1,0,0],[1,1,1],[0,0,1],[1,1,1]], // 5
+  [[1,1,1],[1,0,0],[1,1,1],[1,0,1],[1,1,1]], // 6
+  [[1,1,1],[0,0,1],[0,0,1],[0,0,1],[0,0,1]], // 7
+  [[1,1,1],[1,0,1],[1,1,1],[1,0,1],[1,1,1]], // 8
+  [[1,1,1],[1,0,1],[1,1,1],[0,0,1],[1,1,1]], // 9
+];
+const CELL = 10, GAP = 3;
+const DIGIT_W = 3*CELL + 2*GAP; // 36
+const DIGIT_H = 5*CELL + 4*GAP; // 62
+
+function drawDigit(d, cx, cy, scale) {
+  scale = scale || 1;
+  const pattern = DIGITS[d];
+  const totalW = DIGIT_W * scale;
+  const totalH = DIGIT_H * scale;
+  const startX = cx - totalW/2;
+  const startY = cy - totalH/2;
+  ctx.fillStyle = '#FFFFFF';
+  for (let row=0; row<5; row++) {
+    for (let col=0; col<3; col++) {
+      if (pattern[row][col]) {
+        ctx.fillRect(
+          startX + col*(CELL+GAP)*scale,
+          startY + row*(CELL+GAP)*scale,
+          CELL*scale, CELL*scale
+        );
+      }
+    }
+  }
+}
+
+// ---- Game State ----
+const ST = { TITLE:0, SERVE:1, PLAYING:2, PAUSED:3, SCORED:4, MATCH_OVER:5 };
+let state = ST.TITLE;
+let singlePlayer = true;
+let titleOption = 0; // 0=1P, 1=2P
+
+let p1Score = 0, p2Score = 0;
+let scorePopP1 = 0, scorePopP2 = 0; // frames remaining for pop animation
+let lastScorer = 1; // who scored last (1 or 2)
+let scoredTimer = 0;
+let serveTimer = 0;
+let flashFrames = 0;
+let matchOverBlink = 0;
+
+// Paddles
+const PAD_W = 14, PAD_H = 90;
+const PAD_SPEED = 380;
+let p1 = { x:30, y:(H-PAD_H)/2 };
+let p2 = { x:814, y:(H-PAD_H)/2 };
+
+// Ball
+const BALL_SIZE = 14;
+const BALL_SPEED_INIT = 280;
+const BALL_SPEED_MAX = 550;
+const BALL_ACCEL = 30;
+let ball = {
+  x: W/2 - BALL_SIZE/2,
+  y: H/2 - BALL_SIZE/2,
+  vx: 0, vy: 0,
+  speed: BALL_SPEED_INIT,
+  prevX: W/2, prevY: H/2,
+  stretchFrames: 0
+};
+// Trail ring buffer
+const TRAIL_LEN = 5;
+let trail = [];
+for (let i=0; i<TRAIL_LEN; i++) trail.push({x:ball.x, y:ball.y});
+let trailIdx = 0;
+const TRAIL_ALPHA = [0.5, 0.35, 0.2, 0.1, 0.05];
+
+// Attract mode ball
+let attractBall = { x:W/2, y:H/2, vx:200, vy:130 };
+
+// AI
+let aiTarget = H/2;
+let aiError = 0;
+const AI_SPEED = 320;
+const AI_DEAD_ZONE = 8;
+
+function resetBall(serveDir) {
+  ball.x = W/2 - BALL_SIZE/2;
+  ball.y = H/2 - BALL_SIZE/2;
+  ball.prevX = ball.x;
+  ball.prevY = ball.y;
+  ball.speed = BALL_SPEED_INIT;
+  ball.stretchFrames = 0;
+  const angle = (Math.random() * 70 - 35) * Math.PI / 180;
+  ball.vx = ball.speed * Math.cos(angle) * serveDir;
+  ball.vy = ball.speed * Math.sin(angle);
+  // Prevent near-zero vx
+  if (Math.abs(ball.vx) < 50) ball.vx = 50 * serveDir;
+  for (let i=0; i<TRAIL_LEN; i++) trail[i] = {x:ball.x, y:ball.y};
+  trailIdx = 0;
+}
+
+function predictAI() {
+  // Simulate ball trajectory to AI paddle x
+  let bx = ball.x + BALL_SIZE/2;
+  let by = ball.y + BALL_SIZE/2;
+  let bvx = ball.vx;
+  let bvy = ball.vy;
+  const targetX = p2.x;
+  // Step in 50px increments
+  let steps = 0;
+  while (bx < targetX && steps < 200) {
+    const step = 50;
+    const t = step / Math.abs(bvx);
+    bx += bvx * t;
+    by += bvy * t;
+    if (by < 0) { by = -by; bvy = -bvy; }
+    if (by > H) { by = 2*H - by; bvy = -bvy; }
+    steps++;
+  }
+  // Clamp
+  by = Math.max(0, Math.min(H, by));
+  aiError = (Math.random() * 70 - 35);
+  aiTarget = by + aiError;
+}
+
+function startGame(sp) {
+  singlePlayer = sp;
+  p1Score = 0; p2Score = 0;
+  p1.y = (H-PAD_H)/2;
+  p2.y = (H-PAD_H)/2;
+  lastScorer = Math.random() < 0.5 ? 1 : 2;
+  state = ST.SERVE;
+  serveTimer = 1.5;
+  resetBall(lastScorer === 1 ? -1 : 1);
+}
+
+function newServe() {
+  state = ST.SERVE;
+  serveTimer = 1.5;
+  resetBall(lastScorer === 1 ? -1 : 1);
+  if (singlePlayer) predictAI();
+}
+
+// ---- Main Loop ----
+let lastTime = 0;
+let totalTime = 0;
+let prevKeys = {};
+
+function loop(ts) {
+  requestAnimationFrame(loop);
+  const rawDt = (ts - lastTime) / 1000;
+  const dt = Math.min(rawDt, 0.05);
+  lastTime = ts;
+  totalTime += dt;
+
+  // Edge key events
+  const enterPressed = keys['Enter'] && !prevKeys['Enter'];
+  const pPressed = (keys['KeyP'] || keys['Escape']) && !(prevKeys['KeyP'] || prevKeys['Escape']);
+  const key1Pressed = keys['Digit1'] && !prevKeys['Digit1'];
+  const key2Pressed = keys['Digit2'] && !prevKeys['Digit2'];
+  const upPressed = (keys['ArrowUp'] || keys['KeyW']) && !(prevKeys['ArrowUp'] || prevKeys['KeyW']);
+  const downPressed = (keys['ArrowDown'] || keys['KeyS']) && !(prevKeys['ArrowDown'] || prevKeys['KeyS']);
+  Object.assign(prevKeys, keys);
+
+  update(dt, { enterPressed, pPressed, key1Pressed, key2Pressed, upPressed, downPressed });
+  draw();
+}
+
+function update(dt, ev) {
+  // Title screen
+  if (state === ST.TITLE) {
+    if (ev.key1Pressed || (ev.enterPressed && titleOption === 0)) { startGame(true); return; }
+    if (ev.key2Pressed || (ev.enterPressed && titleOption === 1)) { startGame(false); return; }
+    if (ev.upPressed || ev.downPressed) titleOption = 1 - titleOption;
+    // Attract ball
+    attractBall.x += attractBall.vx * dt;
+    attractBall.y += attractBall.vy * dt;
+    if (attractBall.x < 0 || attractBall.x > W-BALL_SIZE) { attractBall.vx *= -1; attractBall.x = Math.max(0, Math.min(W-BALL_SIZE, attractBall.x)); }
+    if (attractBall.y < 0 || attractBall.y > H-BALL_SIZE) { attractBall.vy *= -1; attractBall.y = Math.max(0, Math.min(H-BALL_SIZE, attractBall.y)); }
+    return;
+  }
+
+  if (state === ST.MATCH_OVER) {
+    matchOverBlink += dt;
+    if (ev.enterPressed) { state = ST.TITLE; titleOption = 0; }
+    return;
+  }
+
+  if (state === ST.PAUSED) {
+    if (ev.pPressed) state = ST.PLAYING;
+    return;
+  }
+
+  if (state === ST.SCORED) {
+    scoredTimer -= dt;
+    if (scoredTimer <= 0) {
+      if (p1Score >= 11 || p2Score >= 11) {
+        state = ST.MATCH_OVER;
+        matchOverBlink = 0;
+        // Play win/loss
+        if (singlePlayer) {
+          if (p1Score >= 11) playWin(); else playLoss();
+        } else {
+          playWin();
+        }
+      } else {
+        newServe();
+      }
+    }
+    return;
+  }
+
+  if (state === ST.SERVE) {
+    if (ev.pPressed) { state = ST.PAUSED; return; }
+    movePlayer(dt);
+    serveTimer -= dt;
+    if (serveTimer <= 0) state = ST.PLAYING;
+    return;
+  }
+
+  // PLAYING
+  if (ev.pPressed) { state = ST.PAUSED; return; }
+
+  movePlayer(dt);
+  if (singlePlayer) moveAI(dt);
+  else moveP2(dt);
+
+  moveBall(dt);
+  checkCollisions(dt);
+  if (flashFrames > 0) flashFrames--;
+  if (scorePopP1 > 0) scorePopP1--;
+  if (scorePopP2 > 0) scorePopP2--;
+}
+
+function movePlayer(dt) {
+  if (keys['KeyW']) p1.y -= PAD_SPEED * dt;
+  if (keys['KeyS']) p1.y += PAD_SPEED * dt;
+  p1.y = Math.max(0, Math.min(H - PAD_H, p1.y));
+}
+function moveP2(dt) {
+  if (keys['ArrowUp']) p2.y -= PAD_SPEED * dt;
+  if (keys['ArrowDown']) p2.y += PAD_SPEED * dt;
+  p2.y = Math.max(0, Math.min(H - PAD_H, p2.y));
+}
+function moveAI(dt) {
+  const paddleCenter = p2.y + PAD_H/2;
+  const diff = aiTarget - paddleCenter;
+  if (Math.abs(diff) > AI_DEAD_ZONE) {
+    const dir = diff > 0 ? 1 : -1;
+    if (ball.vx > 0) {
+      // Approaching — move toward predicted target
+      p2.y += dir * AI_SPEED * dt;
+    } else {
+      // Moving away — drift toward center
+      const centerDiff = H/2 - paddleCenter;
+      const cDir = centerDiff > 0 ? 1 : -1;
+      if (Math.abs(centerDiff) > AI_DEAD_ZONE) p2.y += cDir * 100 * dt;
+    }
+  }
+  p2.y = Math.max(0, Math.min(H - PAD_H, p2.y));
+}
+
+function moveBall(dt) {
+  ball.prevX = ball.x;
+  ball.prevY = ball.y;
+  ball.x += ball.vx * dt;
+  ball.y += ball.vy * dt;
+
+  // Wall bounces
+  if (ball.y < 0) {
+    ball.y = 0;
+    ball.vy = Math.abs(ball.vy);
+    playWallBounce();
+  }
+  if (ball.y + BALL_SIZE > H) {
+    ball.y = H - BALL_SIZE;
+    ball.vy = -Math.abs(ball.vy);
+    playWallBounce();
+  }
+
+  // Prevent near-vertical
+  if (Math.abs(ball.vx) < 50) {
+    ball.vx = 50 * (ball.vx >= 0 ? 1 : -1);
+  }
+
+  // Trail
+  trail[trailIdx] = { x: ball.x, y: ball.y };
+  trailIdx = (trailIdx + 1) % TRAIL_LEN;
+}
+
+function checkCollisions(dt) {
+  const bx = ball.x, by = ball.y;
+  const prevBx = ball.prevX, prevBy = ball.prevY;
+  const bCX = bx + BALL_SIZE/2;
+  const bCY = by + BALL_SIZE/2;
+
+  // Left paddle
+  const p1Right = p1.x + PAD_W;
+  // Sweep check: did ball cross left paddle's right edge?
+  if (prevBx >= p1Right && bx < p1Right) {
+    const t = (p1Right - prevBx) / (bx - prevBx);
+    const byAtCross = prevBy + t * (by - prevBy);
+    const ballCY = byAtCross + BALL_SIZE/2;
+    if (ballCY >= p1.y && ballCY <= p1.y + PAD_H) {
+      // Hit!
+      const hitRatio = Math.max(-1, Math.min(1, (ballCY - (p1.y + PAD_H/2)) / (PAD_H/2)));
+      const angle = hitRatio * 65 * Math.PI / 180;
+      ball.speed = Math.min(BALL_SPEED_MAX, ball.speed + BALL_ACCEL);
+      ball.vx = ball.speed * Math.cos(angle);
+      ball.vy = ball.speed * Math.sin(angle);
+      ball.x = p1Right + 1;
+      ball.stretchFrames = 3;
+      playPaddleHit();
+      // AI re-predict
+      if (singlePlayer) predictAI();
+    }
+  }
+
+  // Right paddle
+  const p2Left = p2.x;
+  // Sweep check: did ball cross right paddle's left edge?
+  if (prevBx + BALL_SIZE <= p2Left && bx + BALL_SIZE > p2Left) {
+    const t = (p2Left - (prevBx + BALL_SIZE)) / ((bx + BALL_SIZE) - (prevBx + BALL_SIZE));
+    const byAtCross = prevBy + t * (by - prevBy);
+    const ballCY = byAtCross + BALL_SIZE/2;
+    if (ballCY >= p2.y && ballCY <= p2.y + PAD_H) {
+      const hitRatio = Math.max(-1, Math.min(1, (ballCY - (p2.y + PAD_H/2)) / (PAD_H/2)));
+      const angle = hitRatio * 65 * Math.PI / 180;
+      ball.speed = Math.min(BALL_SPEED_MAX, ball.speed + BALL_ACCEL);
+      ball.vx = -ball.speed * Math.cos(angle);
+      ball.vy = ball.speed * Math.sin(angle);
+      ball.x = p2Left - BALL_SIZE - 1;
+      ball.stretchFrames = 3;
+      playPaddleHit();
+    }
+  }
+
+  // Scoring
+  if (bx + BALL_SIZE/2 < -10) {
+    p2Score++;
+    lastScorer = 2;
+    scorePopP2 = 5;
+    flashFrames = 2;
+    playScore();
+    state = ST.SCORED;
+    scoredTimer = 1.2;
+  } else if (bx + BALL_SIZE/2 > W + 10) {
+    p1Score++;
+    lastScorer = 1;
+    scorePopP1 = 5;
+    flashFrames = 2;
+    playScore();
+    state = ST.SCORED;
+    scoredTimer = 1.2;
+  }
+}
+
+// ---- Draw ----
+function draw() {
+  // Flash
+  if (flashFrames > 0) {
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(0, 0, W, H);
+    return;
+  }
+
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(0, 0, W, H);
+
+  drawNet();
+
+  if (state === ST.TITLE) {
+    drawTitle();
+    return;
+  }
+
+  drawPaddles();
+  drawScore();
+
+  if (state !== ST.SCORED) {
+    drawTrail();
+    drawBall();
+  }
+
+  if (state === ST.SERVE) drawReady();
+  if (state === ST.PAUSED) drawPaused();
+  if (state === ST.MATCH_OVER) drawMatchOver();
+}
+
+function drawNet() {
+  ctx.fillStyle = '#FFFFFF';
+  const dashH = 12, dashW = 4, gap = 12;
+  let y = 0;
+  while (y < H) {
+    ctx.fillRect(W/2 - dashW/2, y, dashW, dashH);
+    y += dashH + gap;
+  }
+}
+
+function drawPaddles() {
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fillRect(p1.x, p1.y, PAD_W, PAD_H);
+  ctx.fillRect(p2.x, p2.y, PAD_W, PAD_H);
+}
+
+function drawBall() {
+  ctx.fillStyle = '#FFFFFF';
+  const sx = ball.stretchFrames > 0 ? 2 : 0;
+  ctx.fillRect(ball.x - sx, ball.y, BALL_SIZE + sx*2, BALL_SIZE);
+  if (ball.stretchFrames > 0) ball.stretchFrames--;
+}
+
+function drawTrail() {
+  for (let i = 0; i < TRAIL_LEN; i++) {
+    const idx = (trailIdx - 1 - i + TRAIL_LEN) % TRAIL_LEN;
+    const t = trail[idx];
+    ctx.globalAlpha = TRAIL_ALPHA[i];
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(t.x, t.y, BALL_SIZE, BALL_SIZE);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawScore() {
+  const s1 = Math.min(9, p1Score);
+  const s2 = Math.min(9, p2Score);
+  const scale1 = scorePopP1 > 0 ? 1.3 : 1;
+  const scale2 = scorePopP2 > 0 ? 1.3 : 1;
+  drawDigit(s1, 300, 71, scale1);
+  drawDigit(s2, 558, 71, scale2);
+}
+
+function drawTitle() {
+  // Attract ball at 50% opacity
+  ctx.globalAlpha = 0.5;
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fillRect(attractBall.x, attractBall.y, BALL_SIZE, BALL_SIZE);
+  ctx.globalAlpha = 1;
+
+  // PONG title
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = 'bold 80px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('PONG', W/2, 160);
+
+  // Mode selection
+  const opts = ['1 PLAYER', '2 PLAYERS'];
+  ctx.font = '26px monospace';
+  for (let i = 0; i < 2; i++) {
+    ctx.fillStyle = titleOption === i ? '#FFFFFF' : '#888888';
+    const y = 250 + i * 50;
+    if (titleOption === i) {
+      ctx.fillText('▸ ' + opts[i], W/2, y);
+    } else {
+      ctx.fillText(opts[i], W/2, y);
+    }
+  }
+
+  // Controls hint
+  ctx.fillStyle = '#555555';
+  ctx.font = '14px monospace';
+  ctx.fillText('W/S and ↑/↓ to move paddles', W/2, 400);
+  ctx.fillText('Press 1 or 2 to select', W/2, 420);
+
+  // Score zeros
+  drawDigit(0, 300, 71, 1);
+  drawDigit(0, 558, 71, 1);
+}
+
+function drawReady() {
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = '36px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('READY', W/2, H/2 - 20);
+
+  // Draw score
+  drawScore();
+}
+
+function drawPaused() {
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = '40px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('PAUSED', W/2, H/2);
+}
+
+function drawMatchOver() {
+  // Winner text
+  let msg;
+  if (singlePlayer) {
+    msg = p1Score >= 11 ? 'YOU WIN' : 'COMPUTER WINS';
+  } else {
+    msg = p1Score >= 11 ? 'PLAYER 1 WINS' : 'PLAYER 2 WINS';
+  }
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = '40px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(msg, W/2, H/2 - 30);
+
+  // Blink restart text
+  if (Math.floor(matchOverBlink * 2) % 2 === 0) {
+    ctx.fillStyle = '#AAAAAA';
+    ctx.font = '20px monospace';
+    ctx.fillText('Press Enter to play again', W/2, H/2 + 30);
+  }
+}
+
+requestAnimationFrame(ts => { lastTime = ts; requestAnimationFrame(loop); });
+
+})();
+</script>
+</body>
+</html>

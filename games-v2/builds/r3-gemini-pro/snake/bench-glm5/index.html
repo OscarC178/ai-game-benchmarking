@@ -1,0 +1,392 @@
+<!--
+  GAME:      Snake
+  RUN:       r3-gemini-pro
+  BUILDER:   z-ai/glm-5
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Snake</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      background: #000;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      overflow: hidden;
+    }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <script>
+    // ==================== CONSTANTS ====================
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    
+    const W = 600;
+    const H = 600;
+    canvas.width = W;
+    canvas.height = H;
+    
+    const CELL = 20;
+    const COLS = W / CELL;
+    const ROWS = H / CELL;
+    
+    // Game states
+    const STATE_START = 0;
+    const STATE_PLAYING = 1;
+    const STATE_GAMEOVER = 2;
+    
+    // Colors
+    const COLORS = {
+      bg: '#0a140a',
+      head: '#FFFF00',
+      body: '#00CC00',
+      food: '#FF0000',
+      text: '#FFFFFF'
+    };
+    
+    // Directions
+    const UP = { dx: 0, dy: -1 };
+    const DOWN = { dx: 0, dy: 1 };
+    const LEFT = { dx: -1, dy: 0 };
+    const RIGHT = { dx: 1, dy: 0 };
+    
+    // ==================== GAME STATE ====================
+    let state = STATE_START;
+    let snake = [];
+    let food = { x: 0, y: 0 };
+    let direction = RIGHT;
+    let lastProcessedDir = RIGHT;
+    let inputQueue = [];
+    let score = 0;
+    let tickInterval = 100;
+    let minTickInterval = 50;
+    let tickAccumulator = 0;
+    let lastTime = 0;
+    
+    // Audio
+    let audioCtx = null;
+    
+    // ==================== AUDIO ====================
+    function initAudio() {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+      }
+    }
+    
+    function playEatSound() {
+      if (!audioCtx) return;
+      try {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'square';
+        osc.frequency.setValueAtTime(400, audioCtx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(800, audioCtx.currentTime + 0.1);
+        gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.1);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.1);
+      } catch (e) {}
+    }
+    
+    function playCrashSound() {
+      if (!audioCtx) return;
+      try {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(200, audioCtx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(50, audioCtx.currentTime + 0.4);
+        gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.4);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.4);
+      } catch (e) {}
+    }
+    
+    // ==================== INITIALIZATION ====================
+    function initGame() {
+      // Reset snake to center, horizontal, facing right
+      const startX = Math.floor(COLS / 2);
+      const startY = Math.floor(ROWS / 2);
+      
+      snake = [
+        { x: startX, y: startY },
+        { x: startX - 1, y: startY },
+        { x: startX - 2, y: startY },
+        { x: startX - 3, y: startY }
+      ];
+      
+      direction = RIGHT;
+      lastProcessedDir = RIGHT;
+      inputQueue = [];
+      score = 0;
+      tickInterval = 100;
+      tickAccumulator = 0;
+      
+      spawnFood();
+    }
+    
+    function spawnFood() {
+      let validPosition = false;
+      let attempts = 0;
+      const maxAttempts = 1000;
+      
+      while (!validPosition && attempts < maxAttempts) {
+        food.x = Math.floor(Math.random() * COLS);
+        food.y = Math.floor(Math.random() * ROWS);
+        
+        validPosition = true;
+        for (const segment of snake) {
+          if (segment.x === food.x && segment.y === food.y) {
+            validPosition = false;
+            break;
+          }
+        }
+        attempts++;
+      }
+    }
+    
+    function startGame() {
+      initAudio();
+      initGame();
+      state = STATE_PLAYING;
+    }
+    
+    // ==================== GAME TICK ====================
+    function gameTick() {
+      // Process input queue
+      if (inputQueue.length > 0) {
+        const newDir = inputQueue.shift();
+        
+        // Check if new direction is orthogonal to last processed direction
+        const isOrthogonal = (lastProcessedDir.dx === 0 && newDir.dx !== 0) ||
+                            (lastProcessedDir.dy === 0 && newDir.dy !== 0);
+        
+        if (isOrthogonal) {
+          direction = newDir;
+        }
+      }
+      
+      lastProcessedDir = direction;
+      
+      // Calculate new head position
+      const head = snake[0];
+      const newHead = {
+        x: head.x + direction.dx,
+        y: head.y + direction.dy
+      };
+      
+      // Check wall collision
+      if (newHead.x < 0 || newHead.x >= COLS || newHead.y < 0 || newHead.y >= ROWS) {
+        gameOver();
+        return;
+      }
+      
+      // Check self collision (skip tail as it will move)
+      for (let i = 0; i < snake.length - 1; i++) {
+        if (snake[i].x === newHead.x && snake[i].y === newHead.y) {
+          gameOver();
+          return;
+        }
+      }
+      
+      // Add new head
+      snake.unshift(newHead);
+      
+      // Check if eating food
+      if (newHead.x === food.x && newHead.y === food.y) {
+        score += 10;
+        playEatSound();
+        spawnFood();
+        
+        // Increase speed slightly
+        tickInterval = Math.max(minTickInterval, tickInterval - 2);
+      } else {
+        // Remove tail (no growth)
+        snake.pop();
+      }
+    }
+    
+    function gameOver() {
+      state = STATE_GAMEOVER;
+      playCrashSound();
+    }
+    
+    // ==================== UPDATE ====================
+    function update(dt) {
+      if (state === STATE_START) {
+        if (keys['Space']) {
+          startGame();
+          keys['Space'] = false;
+        }
+        return;
+      }
+      
+      if (state === STATE_GAMEOVER) {
+        if (keys['Space']) {
+          startGame();
+          keys['Space'] = false;
+        }
+        return;
+      }
+      
+      // Playing state - accumulate time for tick
+      tickAccumulator += dt * 1000;
+      
+      while (tickAccumulator >= tickInterval) {
+        tickAccumulator -= tickInterval;
+        gameTick();
+        
+        // Stop if game over during tick
+        if (state !== STATE_PLAYING) break;
+      }
+    }
+    
+    // ==================== RENDER ====================
+    function render() {
+      // Clear
+      ctx.fillStyle = COLORS.bg;
+      ctx.fillRect(0, 0, W, H);
+      
+      if (state === STATE_START) {
+        drawStartScreen();
+        return;
+      }
+      
+      // Draw food
+      ctx.fillStyle = COLORS.food;
+      ctx.fillRect(food.x * CELL + 2, food.y * CELL + 2, CELL - 4, CELL - 4);
+      
+      // Draw snake
+      for (let i = 0; i < snake.length; i++) {
+        const segment = snake[i];
+        if (i === 0) {
+          ctx.fillStyle = COLORS.head;
+        } else {
+          ctx.fillStyle = COLORS.body;
+        }
+        ctx.fillRect(segment.x * CELL + 1, segment.y * CELL + 1, CELL - 2, CELL - 2);
+      }
+      
+      // Draw score
+      ctx.fillStyle = COLORS.text;
+      ctx.font = 'bold 20px Courier New, monospace';
+      ctx.textAlign = 'left';
+      ctx.fillText(`Score: ${score}`, 10, 30);
+      
+      if (state === STATE_GAMEOVER) {
+        drawGameOver();
+      }
+    }
+    
+    function drawStartScreen() {
+      ctx.fillStyle = COLORS.text;
+      ctx.font = 'bold 72px Courier New, monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('SNAKE', W / 2, H / 2 - 80);
+      
+      ctx.font = '24px Courier New, monospace';
+      ctx.fillText('Eat food to grow', W / 2, H / 2);
+      ctx.fillText('Avoid walls and yourself', W / 2, H / 2 + 35);
+      
+      if (Math.floor(Date.now() / 500) % 2 === 0) {
+        ctx.fillText('Press Space to Start', W / 2, H / 2 + 100);
+      }
+      
+      ctx.font = '16px Courier New, monospace';
+      ctx.fillText('Arrow Keys or WASD to move', W / 2, H / 2 + 160);
+    }
+    
+    function drawGameOver() {
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+      ctx.fillRect(0, 0, W, H);
+      
+      ctx.fillStyle = '#F00';
+      ctx.font = 'bold 56px Courier New, monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('GAME OVER', W / 2, H / 2 - 40);
+      
+      ctx.fillStyle = COLORS.text;
+      ctx.font = '32px Courier New, monospace';
+      ctx.fillText(`Score: ${score}`, W / 2, H / 2 + 20);
+      
+      if (Math.floor(Date.now() / 500) % 2 === 0) {
+        ctx.font = '24px Courier New, monospace';
+        ctx.fillText('Press Space to Restart', W / 2, H / 2 + 80);
+      }
+    }
+    
+    // ==================== GAME LOOP ====================
+    let lastFrameTime = 0;
+    
+    function gameLoop(timestamp) {
+      const dt = Math.min((timestamp - lastFrameTime) / 1000, 0.1);
+      lastFrameTime = timestamp;
+      
+      update(dt);
+      render();
+      
+      requestAnimationFrame(gameLoop);
+    }
+    
+    // ==================== INPUT ====================
+    const keys = {};
+    
+    document.addEventListener('keydown', (e) => {
+      keys[e.code] = true;
+      
+      // Queue direction inputs
+      if (state === STATE_PLAYING) {
+        let newDir = null;
+        
+        if ((e.code === 'ArrowUp' || e.code === 'KeyW') && inputQueue.length < 2) {
+          newDir = UP;
+        } else if ((e.code === 'ArrowDown' || e.code === 'KeyS') && inputQueue.length < 2) {
+          newDir = DOWN;
+        } else if ((e.code === 'ArrowLeft' || e.code === 'KeyA') && inputQueue.length < 2) {
+          newDir = LEFT;
+        } else if ((e.code === 'ArrowRight' || e.code === 'KeyD') && inputQueue.length < 2) {
+          newDir = RIGHT;
+        }
+        
+        if (newDir) {
+          // Prevent duplicate consecutive inputs
+          if (inputQueue.length === 0) {
+            inputQueue.push(newDir);
+          } else if (inputQueue[inputQueue.length - 1] !== newDir) {
+            inputQueue.push(newDir);
+          }
+        }
+      }
+      
+      if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) {
+        e.preventDefault();
+      }
+    });
+    
+    document.addEventListener('keyup', (e) => {
+      keys[e.code] = false;
+    });
+    
+    // Start
+    lastFrameTime = performance.now();
+    requestAnimationFrame(gameLoop);
+  </script>
+</body>
+</html>

@@ -1,0 +1,845 @@
+<!--
+  GAME:      Donkey Kong
+  RUN:       r2-gpt54
+  BUILDER:   google/gemini-3-pro-preview
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Donkey Kong</title>
+<style>
+  body {
+    margin: 0;
+    padding: 0;
+    background-color: #111;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    overflow: hidden;
+    font-family: monospace;
+    color: white;
+  }
+  canvas {
+    background-color: #000;
+    box-shadow: 0 0 15px rgba(0,0,0,0.8);
+    image-rendering: crisp-edges;
+  }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas" width="700" height="800"></canvas>
+
+<script>
+// --- Audio System ---
+const AudioContext = window.AudioContext || window.webkitAudioContext;
+let actx = null;
+
+function initAudio() {
+    if (!actx) actx = new AudioContext();
+    if (actx.state === 'suspended') actx.resume();
+}
+
+function playTone(freq, type, dur, vol, slideFreq) {
+    if (!actx) return;
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, actx.currentTime);
+    if (slideFreq) {
+        osc.frequency.exponentialRampToValueAtTime(slideFreq, actx.currentTime + dur);
+    }
+    gain.gain.setValueAtTime(vol, actx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, actx.currentTime + dur);
+    osc.connect(gain);
+    gain.connect(actx.destination);
+    osc.start();
+    osc.stop(actx.currentTime + dur);
+}
+
+function playNoise(dur, vol) {
+    if (!actx) return;
+    const bufferSize = actx.sampleRate * dur;
+    const buffer = actx.createBuffer(1, bufferSize, actx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) data[i] = Math.random() * 2 - 1;
+    const noise = actx.createBufferSource();
+    noise.buffer = buffer;
+    const filter = actx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = 1000;
+    const gain = actx.createGain();
+    gain.gain.setValueAtTime(vol, actx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, actx.currentTime + dur);
+    noise.connect(filter);
+    filter.connect(gain);
+    gain.connect(actx.destination);
+    noise.start();
+    noise.stop(actx.currentTime + dur);
+}
+
+const sfx = {
+    jump: () => playTone(300, 'sine', 0.3, 0.05, 500),
+    walk: () => playTone(150, 'triangle', 0.05, 0.02),
+    climb: () => playTone(400, 'square', 0.05, 0.02),
+    smash: () => playNoise(0.2, 0.2),
+    hammer: () => playTone(500, 'square', 0.1, 0.05, 400),
+    score: () => playTone(800, 'sine', 0.1, 0.05, 1200),
+    die: () => playTone(200, 'sawtooth', 1.0, 0.2, 50),
+    clear: () => {
+        [440, 554, 659, 880].forEach((f, i) => setTimeout(() => playTone(f, 'square', 0.15, 0.1), i * 150));
+    }
+};
+
+// --- Constants & Config ---
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const W = 700;
+const H = 800;
+
+const STATE_TITLE = 0;
+const STATE_PLAYING = 1;
+const STATE_PAUSED = 2;
+const STATE_DYING = 3;
+const STATE_CLEAR = 4;
+const STATE_GAMEOVER = 5;
+
+// Physics
+const GRAVITY = 900;
+const JUMP_V = -340;
+const RUN_SPEED = 150;
+const CLIMB_SPEED = 120;
+const BARREL_SPEED_BASE = 120;
+
+// Sizes
+const PW = 24, PH = 32;
+const BW = 18, BH = 18;
+
+// --- State ---
+let state = STATE_TITLE;
+let lastTime = 0;
+let stateTimer = 0;
+
+let score = 0;
+let highScore = parseInt(localStorage.getItem('dkHigh')) || 0;
+let lives = 3;
+let level = 1;
+
+let bonusTimer = 5000;
+let timeAccum = 0;
+
+// Entities
+let player = null;
+let barrels = [];
+let hammers = [];
+let pickups = []; // Floating scores
+
+let animTime = 0;
+let dkAnim = 0;
+let dkSpawnTimer = 0;
+
+// --- Level Data ---
+// Girders: left to right.
+// L1 = bottom, L6 = top
+const girders = [
+    { id: 0, x1: 40, y1: 760, x2: 660, y2: 740 }, // L1
+    { id: 1, x1: 40, y1: 640, x2: 660, y2: 660 }, // L2
+    { id: 2, x1: 40, y1: 560, x2: 660, y2: 540 }, // L3
+    { id: 3, x1: 40, y1: 440, x2: 660, y2: 460 }, // L4
+    { id: 4, x1: 40, y1: 360, x2: 660, y2: 340 }, // L5
+    { id: 5, x1: 40, y1: 240, x2: 400, y2: 240 }, // L6 (DK area)
+    { id: 6, x1: 300, y1: 140, x2: 480, y2: 140 } // L7 (Pauline)
+];
+
+const ladders = [
+    // L1 to L2
+    { x: 580, topY: 642, botY: 742, broken: false },
+    { x: 120, topY: 651, botY: 757, broken: true },
+    // L2 to L3
+    { x: 120, topY: 555, botY: 642, broken: false },
+    { x: 300, topY: 549, botY: 647, broken: false },
+    // L3 to L4
+    { x: 500, topY: 445, botY: 545, broken: false },
+    { x: 250, topY: 452, botY: 552, broken: true },
+    // L4 to L5
+    { x: 120, topY: 357, botY: 442, broken: false },
+    { x: 600, topY: 342, botY: 458, broken: false },
+    // L5 to L6
+    { x: 350, topY: 240, botY: 349, broken: false },
+    // L6 to L7 (Pauline)
+    { x: 350, topY: 140, botY: 240, broken: false }
+];
+
+const goalArea = { x: 300, y: 100, w: 180, h: 40 };
+
+// --- Input ---
+const keys = { ArrowLeft: false, ArrowRight: false, ArrowUp: false, ArrowDown: false, KeyA: false, KeyD: false, KeyW: false, KeyS: false, Space: false };
+const keyStates = {}; // for fresh presses
+
+window.addEventListener('keydown', e => {
+    initAudio();
+    if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
+    
+    if (e.code === 'Enter') {
+        if (state === STATE_TITLE || state === STATE_GAMEOVER) startGame();
+    } else if (e.code === 'KeyP') {
+        if (state === STATE_PLAYING) state = STATE_PAUSED;
+        else if (state === STATE_PAUSED) { state = STATE_PLAYING; lastTime = performance.now(); }
+    }
+    
+    if (!keys[e.code]) keyStates[e.code] = true;
+    keys[e.code] = true;
+});
+
+window.addEventListener('keyup', e => {
+    keys[e.code] = false;
+    keyStates[e.code] = false;
+});
+
+const isLeft = () => keys.ArrowLeft || keys.KeyA;
+const isRight = () => keys.ArrowRight || keys.KeyD;
+const isUp = () => keys.ArrowUp || keys.KeyW;
+const isDown = () => keys.ArrowDown || keys.KeyS;
+const isJump = () => {
+    if (keyStates.Space) { keyStates.Space = false; return true; }
+    return false;
+};
+
+// --- Helpers ---
+function getGirderY(g, x) {
+    if (x < g.x1 || x > g.x2) return null;
+    let t = (x - g.x1) / (g.x2 - g.x1);
+    return g.y1 + t * (g.y2 - g.y1);
+}
+
+function rectIntersect(x1, y1, w1, h1, x2, y2, w2, h2) {
+    return x1 < x2 + w2 && x1 + w1 > x2 && y1 < y2 + h2 && y1 + h1 > y2;
+}
+
+// --- Setup ---
+function resetPlayer() {
+    player = {
+        x: 80, y: 720, vx: 0, vy: 0, w: PW, h: PH,
+        onGround: false, girder: null,
+        climbing: false, ladder: null,
+        facing: 1, hammerTime: 0,
+        jumpIds: new Set()
+    };
+    keys.Space = false; // reset jump
+}
+
+function initStage() {
+    resetPlayer();
+    barrels = [];
+    pickups = [];
+    bonusTimer = 5000;
+    timeAccum = 0;
+    
+    hammers = [
+        { x: 100, y: 535, girder: girders[2], active: true },
+        { x: 550, y: 325, girder: girders[4], active: true }
+    ];
+}
+
+function startGame() {
+    score = 0;
+    lives = 3;
+    level = 1;
+    initStage();
+    state = STATE_PLAYING;
+}
+
+function die() {
+    lives--;
+    sfx.die();
+    if (lives <= 0) {
+        state = STATE_GAMEOVER;
+        if (score > highScore) localStorage.setItem('dkHigh', score);
+    } else {
+        state = STATE_DYING;
+        stateTimer = 1.5;
+    }
+}
+
+// --- Update Logic ---
+
+function updatePlayer(dt) {
+    // Hammer timer
+    if (player.hammerTime > 0) {
+        player.hammerTime -= dt;
+        if (player.hammerTime <= 0) player.hammerTime = 0;
+    }
+
+    if (player.climbing) {
+        let speed = 0;
+        if (isUp()) speed = -CLIMB_SPEED;
+        else if (isDown()) speed = CLIMB_SPEED;
+        
+        player.y += speed * dt;
+        
+        if (speed !== 0 && Math.floor(animTime*10)%2===0) sfx.climb();
+
+        // Check ladder exit
+        let l = player.ladder;
+        
+        // Escape top
+        let topG = girders.find(g => getGirderY(g, player.x) !== null && Math.abs(getGirderY(g, player.x) - l.topY) < 5);
+        if (topG && player.y + PH <= topG.y) {
+            player.climbing = false;
+            player.ladder = null;
+            player.y = getGirderY(topG, player.x) - PH;
+            player.girder = topG;
+            player.onGround = true;
+        }
+        
+        // Escape bottom
+        let botG = girders.find(g => getGirderY(g, player.x) !== null && Math.abs(getGirderY(g, player.x) - l.botY) < 5);
+        if (botG && player.y + PH >= l.botY) {
+            player.climbing = false;
+            player.ladder = null;
+            player.y = l.botY - PH;
+            player.girder = botG;
+            player.onGround = true;
+        }
+        
+        // Can't pass broken part
+        if (l.broken) {
+            if (player.y + PH < l.botY - 20 && speed < 0) {
+                player.y = l.botY - 20 - PH; // Block upward movement
+            }
+        }
+        
+        return; // Skip walking/jumping while climbing
+    }
+
+    // Walking
+    if (player.onGround && player.hammerTime === 0 && (isUp() || isDown())) {
+        // Try climb
+        let lCenter = player.x + PW/2;
+        let lBottomY = player.y + PH;
+        
+        for (let l of ladders) {
+            if (Math.abs(lCenter - l.x) < 14) {
+                // Climb up from bottom
+                if (isUp() && Math.abs(lBottomY - l.botY) < 6) {
+                    player.climbing = true; player.ladder = l; player.x = l.x - PW/2; player.onGround = false; player.girder = null;
+                    return;
+                }
+                // Climb down from top
+                if (isDown() && !l.broken && Math.abs(lBottomY - l.topY) < 6) {
+                    player.climbing = true; player.ladder = l; player.x = l.x - PW/2; player.onGround = false; player.girder = null;
+                    player.y += 10; // pop down slightly to detach
+                    return;
+                }
+            }
+        }
+    }
+
+    // Walk physics
+    let speedMult = player.hammerTime > 0 ? 0.6 : 1.0;
+    
+    if (isLeft()) { player.vx = -RUN_SPEED * speedMult; player.facing = -1; }
+    else if (isRight()) { player.vx = RUN_SPEED * speedMult; player.facing = 1; }
+    else { player.vx = 0; }
+
+    if (player.vx !== 0 && player.onGround && Math.floor(animTime*15)%2===0) sfx.walk();
+
+    // Jump
+    if (isJump() && player.onGround && player.hammerTime === 0) {
+        player.vy = JUMP_V;
+        player.onGround = false;
+        player.girder = null;
+        player.jumpIds.clear(); // Reset jump tracking for new jump
+        sfx.jump();
+    }
+
+    // Apply X velocity
+    player.x += player.vx * dt;
+    
+    // Clamp X to screen
+    if (player.x < 10) player.x = 10;
+    if (player.x + PW > W - 10) player.x = W - 10 - PW;
+
+    if (player.onGround) {
+        // Keep grounded on girder
+        let gy = getGirderY(player.girder, player.x + PW/2);
+        if (gy !== null) {
+            player.y = gy - PH;
+        } else {
+            // Walked off edge
+            player.onGround = false;
+            player.girder = null;
+            player.vy = 0;
+        }
+    } else {
+        // Airborne
+        player.vy += GRAVITY * dt;
+        player.y += player.vy * dt;
+        
+        // Terminal velocity
+        if (player.vy > 400) player.vy = 400;
+
+        // Check landing
+        if (player.vy > 0) {
+            for (let g of girders) {
+                let pxC = player.x + PW/2;
+                let gy = getGirderY(g, pxC);
+                if (gy !== null) {
+                    // Check if feet passed through surface this frame
+                    let feetY = player.y + PH;
+                    let prevFeetY = feetY - player.vy * dt;
+                    if (prevFeetY <= gy + 4 && feetY >= gy) {
+                        player.y = gy - PH;
+                        
+                        // Fall death check
+                        let fallDist = player.y - (player.startYFall || player.y);
+                        if (fallDist > 70) {
+                            die(); return;
+                        }
+                        
+                        player.onGround = true;
+                        player.girder = g;
+                        player.vy = 0;
+                        break;
+                    }
+                }
+            }
+        } else {
+            // Store highest point for fall damage calculation
+            player.startYFall = player.y; 
+        }
+    }
+}
+
+function updateBarrels(dt) {
+    let speedMult = 1 + (level - 1) * 0.1;
+    
+    for (let i = barrels.length - 1; i >= 0; i--) {
+        let b = barrels[i];
+        
+        if (b.state === 'rolling') {
+            b.x += b.dir * b.speed * speedMult * dt;
+            
+            // Re-eval girder based on center
+            let g = b.girder;
+            let gy = getGirderY(g, b.x + BW/2);
+            
+            if (gy !== null) {
+                b.y = gy - BH;
+                
+                // Chance to take ladder
+                if (Math.random() < 0.05) {
+                    let bc = b.x + BW/2;
+                    for (let l of ladders) {
+                        if (!l.broken && Math.abs(bc - l.x) < 4 && Math.abs((b.y + BH) - l.topY) < 6) {
+                            b.state = 'ladder';
+                            b.x = l.x - BW/2;
+                            b.ladder = l;
+                            b.vy = 100;
+                            break;
+                        }
+                    }
+                }
+                
+            } else {
+                b.state = 'falling';
+                b.girder = null;
+                b.vy = 0; // Start drop
+            }
+        } else if (b.state === 'falling') {
+            b.vy += GRAVITY * dt;
+            b.y += b.vy * dt;
+            // Slight horizontal drift
+            b.x += b.dir * (b.speed * 0.3) * dt;
+            
+            // Check land
+            let landed = false;
+            for (let g of girders) {
+                let gy = getGirderY(g, b.x + BW/2);
+                if (gy !== null) {
+                    let byB = b.y + BH;
+                    if (byB >= gy && byB - b.vy*dt <= gy + 10) {
+                        b.y = gy - BH;
+                        b.state = 'rolling';
+                        b.girder = g;
+                        // Always roll downhill
+                        b.dir = g.y1 < g.y2 ? 1 : -1;
+                        landed = true;
+                        break;
+                    }
+                }
+            }
+            if (!landed && b.y > H) {
+                barrels.splice(i, 1); // remove off screen
+                continue;
+            }
+        } else if (b.state === 'ladder') {
+            b.y += b.vy * speedMult * dt;
+            if (b.y + BH >= b.ladder.botY) {
+                b.y = b.ladder.botY - BH;
+                // Find girder
+                let lbc = b.x + BW/2;
+                b.girder = girders.find(g => getGirderY(g, lbc) !== null);
+                if (b.girder) {
+                    b.state = 'rolling';
+                    b.dir = b.girder.y1 < b.girder.y2 ? 1 : -1;
+                } else {
+                    b.state = 'falling';
+                }
+                b.ladder = null;
+            }
+        }
+    }
+}
+
+function updatePlaying(dt) {
+    animTime += dt;
+    
+    // Bonus Timer
+    timeAccum += dt;
+    if (timeAccum > 2.0) {
+        timeAccum -= 2.0;
+        if (bonusTimer > 0) bonusTimer -= 100;
+        if (bonusTimer <= 0) { bonusTimer = 0; die(); return; }
+    }
+
+    // DK Spawn Barrels
+    dkSpawnTimer -= dt;
+    if (dkSpawnTimer <= 0) {
+        dkAnim = 1;
+        sfx.walk(); // Thump
+        setTimeout(() => { // Throw
+            dkAnim = 0; 
+            if (state === STATE_PLAYING) {
+                barrels.push({
+                    id: Math.random().toString(),
+                    x: 100, y: 190, 
+                    w: BW, h: BH, 
+                    state: 'falling', 
+                    dir: 1, speed: BARREL_SPEED_BASE, 
+                    girder: null, vy: 0
+                });
+            }
+        }, 200);
+        let pace = Math.max(1.5, 3.5 - level*0.2);
+        dkSpawnTimer = pace + Math.random();
+    }
+
+    updatePlayer(dt);
+    updateBarrels(dt);
+
+    if (player.dead || state !== STATE_PLAYING) return;
+
+    // Pickups cleanup
+    for (let i = pickups.length -1; i>=0; i--) {
+        pickups[i].t -= dt;
+        pickups[i].y -= 20 * dt;
+        if (pickups[i].t <= 0) pickups.splice(i, 1);
+    }
+
+    // --- Collisions ---
+
+    let pBox = { x: player.x, y: player.y, w: PW, h: PH };
+    
+    // Hammer Box (larger, oriented)
+    let hBox = null;
+    let hammerActiveFrame = false;
+    if (player.hammerTime > 0) {
+        hammerActiveFrame = Math.floor(animTime * 10) % 2 === 0;
+        if (hammerActiveFrame) {
+            if (player.facing === 1) hBox = { x: player.x + PW, y: player.y - 12, w: 20, h: 32 };
+            else hBox = { x: player.x - 20, y: player.y - 12, w: 20, h: 32 };
+        }
+        if (Math.floor(animTime*10)%2===0 && Math.floor((animTime-dt)*10)%2!==0) sfx.hammer();
+    }
+
+    // Hammers
+    for (let h of hammers) {
+        if (h.active && rectIntersect(pBox.x, pBox.y, pBox.w, pBox.h, h.x, h.y, 16, 16)) {
+            h.active = false;
+            player.hammerTime = 8.0;
+            sfx.score();
+        }
+    }
+
+    // Barrels vs Player
+    for (let i = barrels.length - 1; i >= 0; i--) {
+        let b = barrels[i];
+        let bBox = { x: b.x, y: b.y, w: b.w, h: b.h };
+
+        // Hammer Smash
+        if (hBox && rectIntersect(hBox.x, hBox.y, hBox.w, hBox.h, bBox.x, bBox.y, bBox.w, bBox.h)) {
+            barrels.splice(i, 1);
+            score += 300;
+            if (score > highScore) localStorage.setItem('dkHigh', score);
+            sfx.smash();
+            pickups.push({ x: b.x, y: b.y, text: "300", t: 0.6 });
+            continue;
+        }
+
+        // Direct Hit
+        if (rectIntersect(pBox.x + 4, pBox.y + 4, pBox.w - 8, pBox.h - 8, bBox.x, bBox.y, bBox.w, bBox.h)) {
+            die(); return;
+        }
+
+        // Jump Score (Airborne, directly above, moving over)
+        if (!player.onGround && !player.climbing) {
+            if (!player.jumpIds.has(b.id)) {
+                // If player feet are above barrel top, and horizontally overlapping
+                if (player.y + PH < b.y && rectIntersect(pBox.x, 0, pBox.w, H, bBox.x, 0, bBox.w, H)) {
+                    // Check if close enough vertically (~25 px)
+                    if (b.y - (player.y + PH) < 25) {
+                        player.jumpIds.add(b.id);
+                        score += 100;
+                        if (score > highScore) localStorage.setItem('dkHigh', score);
+                        sfx.score();
+                        pickups.push({ x: player.x, y: player.y - 10, text: "100", t: 0.6 });
+                    }
+                }
+            }
+        }
+    }
+
+    // Goal
+    if (rectIntersect(pBox.x, pBox.y, pBox.w, pBox.h, goalArea.x, goalArea.y, goalArea.w, goalArea.h)) {
+        state = STATE_CLEAR;
+        stateTimer = 3.0; // Wait a bit
+        sfx.clear();
+    }
+}
+
+// --- Render ---
+
+function drawRect(x, y, w, h, color) {
+    ctx.fillStyle = color; ctx.fillRect(Math.floor(x), Math.floor(y), w, h);
+}
+
+function drawText(txt, x, y, size, align='center', color='#FFF') {
+    ctx.fillStyle = color; ctx.font = `${size}px monospace`; ctx.textAlign=align; ctx.textBaseline='middle'; ctx.fillText(txt,x,y);
+}
+
+function render() {
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+
+    // Draw Girders
+    ctx.strokeStyle = '#D13';
+    ctx.lineWidth = 12;
+    ctx.lineCap = 'butt';
+    
+    // Draw thick line then detail dots
+    for (let g of girders) {
+        ctx.beginPath(); ctx.moveTo(g.x1, g.y1); ctx.lineTo(g.x2, g.y2); ctx.stroke();
+        
+        ctx.fillStyle = '#500';
+        let len = Math.hypot(g.x2 - g.x1, g.y2 - g.y1);
+        let dx = (g.x2 - g.x1) / len;
+        let dy = (g.y2 - g.y1) / len;
+        
+        for (let i = 0; i < len; i += 18) {
+            ctx.fillRect(g.x1 + dx * i - 2, g.y1 + dy * i - 6, 4, 12);
+        }
+    }
+    ctx.lineWidth = 1;
+
+    // Ladders
+    ctx.strokeStyle = '#0CF'; 
+    ctx.lineWidth = 2;
+    for (let l of ladders) {
+        let top = l.topY; let bot = l.botY;
+        if (l.broken) {
+            // Draw top chunk and bottom chunk
+            ctx.beginPath(); ctx.moveTo(l.x - 8, top); ctx.lineTo(l.x - 8, top + 30); ctx.moveTo(l.x + 8, top); ctx.lineTo(l.x + 8, top + 30); ctx.stroke();
+            for (let y = top; y < top + 25; y+=10) { ctx.beginPath(); ctx.moveTo(l.x-8, y); ctx.lineTo(l.x+8, y); ctx.stroke(); }
+            
+            ctx.beginPath(); ctx.moveTo(l.x - 8, bot - 30); ctx.lineTo(l.x - 8, bot); ctx.moveTo(l.x + 8, bot - 30); ctx.lineTo(l.x + 8, bot); ctx.stroke();
+            for (let y = bot-30; y < bot; y+=10) { ctx.beginPath(); ctx.moveTo(l.x-8, y); ctx.lineTo(l.x+8, y); ctx.stroke(); }
+
+        } else {
+            ctx.beginPath(); ctx.moveTo(l.x - 8, top); ctx.lineTo(l.x - 8, bot); ctx.moveTo(l.x + 8, top); ctx.lineTo(l.x + 8, bot); ctx.stroke();
+            for (let y = top + 5; y < bot; y+=10) {
+                ctx.beginPath(); ctx.moveTo(l.x-8, y); ctx.lineTo(l.x+8, y); ctx.stroke();
+            }
+        }
+    }
+
+    // Oil Drum
+    drawRect(40, 724, 24, 36, '#333');
+    if (Math.floor(performance.now()/100)%2===0) {
+        ctx.fillStyle = '#F40'; ctx.beginPath(); ctx.moveTo(40, 724); ctx.lineTo(52, 710); ctx.lineTo(64, 724); ctx.fill();
+    }
+
+    // Pauline
+    drawRect(350, 108, 16, 32, '#F6B');
+    drawRect(354, 100, 8, 8, '#FCB'); // head
+    if (state !== STATE_CLEAR && Math.floor(animTime * 2) % 2 === 0) {
+        drawText("HELP!", 358, 80, 14, 'center', '#0CF');
+    }
+    if (state === STATE_CLEAR) drawText("♥", 330, 90, 20, 'center', '#F00');
+
+    // DK
+    drawRect(100, 184, 56, 56, '#841');
+    drawRect(110, 194, 36, 24, '#CD8'); // chest
+    drawRect(118, 176, 20, 16, '#CD8'); // face
+    if (dkAnim === 0) { // Idle
+        drawRect(92, 214, 12, 26, '#841'); // L arm
+        drawRect(152, 214, 12, 26, '#841'); // R arm
+    } else { // Throw
+        drawRect(80, 170, 12, 26, '#841'); // L arm up
+        drawRect(164, 170, 12, 26, '#841'); // R arm up
+    }
+
+    // Hammers
+    for (let h of hammers) {
+        if (h.active) {
+            drawRect(h.x, h.y, 4, 16, '#852'); // handle
+            drawRect(h.x - 6, h.y - 8, 16, 10, '#444'); // head
+        }
+    }
+
+    // Barrels
+    for (let b of barrels) {
+        ctx.save();
+        ctx.translate(b.x + b.w/2, b.y + b.h/2);
+        if (b.state === 'rolling') ctx.rotate(b.dir * animTime * 10);
+        
+        drawRect(-b.w/2, -b.h/2, b.w, b.h, '#C62');
+        ctx.fillStyle = '#621'; ctx.fillRect(-b.w/2, -b.h/4, b.w, 2); ctx.fillRect(-b.w/2, b.h/4 - 2, b.w, 2);
+        
+        ctx.restore();
+    }
+
+    // Player
+    if (state !== STATE_TITLE && player && !player.dead && state !== STATE_CLEAR) {
+        ctx.save();
+        ctx.translate(player.x + PW/2, player.y + PH); // base center
+        ctx.scale(player.facing, 1);
+        
+        let dy = 0;
+        if (player.climbing) {
+            dy = (Math.floor(animTime * 10) % 2 === 0) ? -2 : 0;
+            ctx.scale(player.facing, 1); // unflip for climbing
+        } else if (player.onGround && player.vx !== 0) {
+            dy = (Math.floor(animTime * 15) % 2 === 0) ? -2 : 0;
+        } else if (!player.onGround) {
+            dy = -2; // tucked jump
+        }
+
+        if (state === STATE_DYING) {
+            let rot = (1.5 - stateTimer) * 10;
+            ctx.rotate(rot);
+        }
+
+        // Draw character
+        ctx.fillStyle = '#00A'; ctx.fillRect(-8, -20 + dy, 16, 12); // overalls
+        ctx.fillStyle = '#F00'; ctx.fillRect(-8, -26 + dy, 16, 6); // shirt
+        ctx.fillStyle = '#FCA'; ctx.fillRect(-6, -34 + dy, 12, 8); // face
+        ctx.fillStyle = '#F00'; ctx.fillRect(-8, -36 + dy, 16, 4); // hat
+
+        ctx.fillStyle = '#00A'; 
+        if (player.climbing) {
+            ctx.fillRect((dy?-8:-4), -8, 6, 8); ctx.fillRect((dy?2:-2), -8, 6, 8); // legs
+            ctx.fillStyle = '#FCA'; ctx.fillRect(-12, -22 + dy, 4, 6); ctx.fillRect(8, -22 + dy, 4, 6); // hands
+        } else {
+            ctx.fillRect(-6, -8, 6, 8); ctx.fillRect(2, -10 + dy, 6, 10 - dy); // legs
+            ctx.fillStyle = '#FCA'; ctx.fillRect(-12, -20 + dy, 4, 6); ctx.fillRect(8, -20 + dy, 4, 6); // hands
+        }
+
+        // Hammer
+        if (player.hammerTime > 0) {
+            ctx.restore(); ctx.save(); // Reset transform for absolute hammer positioning relative to base
+            ctx.translate(player.x + PW/2, player.y + PH);
+            let downSwing = Math.floor(animTime * 10) % 2 === 0;
+            if (downSwing) {
+                // Swing down in front
+                let hx = player.facing === 1 ? 16 : -16;
+                drawRect(hx, -20, 4, 16, '#852'); drawRect(hx-6, -24, 16, 10, '#444');
+            } else {
+                // Swing up behind head
+                drawRect(-2, -40, 4, 16, '#852'); drawRect(-8, -48, 16, 10, '#444');
+            }
+        }
+
+        ctx.restore();
+    }
+
+    // Floating text
+    for (let p of pickups) {
+        drawText(p.text, p.x, p.y, 14, 'center', '#FFF');
+    }
+
+    // HUD
+    drawText(`SCORE\n${score}`, 80, 20, 20, 'center', '#F00');
+    drawText(`HIGH SCORE\n${highScore}`, W - 100, 20, 20, 'center', '#F00');
+    
+    drawText(`BONUS\n${bonusTimer}`, W/2, 30, 20, 'center', bonusTimer < 1000 ? '#F00' : '#0CF');
+    drawText(`L=${level}`, W - 40, 80, 16, 'center', '#AAA');
+    
+    // Lives
+    for (let i = 0; i < lives - 1; i++) {
+        drawRect(20 + i*20, 50, 12, 12, '#F00'); // simple icon
+        drawRect(22 + i*20, 50, 8, 4, '#FCA');
+    }
+
+    // Overlays
+    if (state === STATE_TITLE) {
+        ctx.fillStyle = 'rgba(0,0,0,0.8)'; ctx.fillRect(0,0,W,H);
+        drawText("DONKEY KONG", W/2, H/3, 64, 'center', '#0CF');
+        drawText("Arrows / WASD to move & climb. Space to jump.", W/2, H/2 - 30, 18);
+        drawText("Jump over barrels or grab a hammer to smash them.", W/2, H/2 + 10, 18);
+        drawText("Reach the captive at the top!", W/2, H/2 + 50, 18);
+        if (Math.floor(performance.now()/500)%2===0) drawText("Press Enter to Start", W/2, H/2 + 120, 24, 'center', '#FF0');
+    } else if (state === STATE_PAUSED) {
+        ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0,0,W,H);
+        drawText("PAUSED", W/2, H/2, 48);
+    } else if (state === STATE_GAMEOVER) {
+        ctx.fillStyle = 'rgba(0,0,0,0.8)'; ctx.fillRect(0,0,W,H);
+        drawText("GAME OVER", W/2, H/2 - 40, 64, 'center', '#F00');
+        drawText(`Score: ${score}`, W/2, H/2 + 20, 24);
+        drawText("Press Enter to Restart", W/2, H/2 + 80, 20, 'center', '#FFF');
+    } else if (state === STATE_CLEAR) {
+        drawText(`STAGE CLEAR!`, W/2, H/2, 48, 'center', '#0F0');
+    }
+}
+
+// --- Main Loop ---
+function loop(timestamp) {
+    if (!lastTime) lastTime = timestamp;
+    let dt = (timestamp - lastTime) / 1000;
+    lastTime = timestamp;
+    
+    if (dt > 0.1) dt = 0.1; // clamp
+    
+    if (state === STATE_PLAYING) {
+        updatePlaying(dt);
+    } else if (state === STATE_DYING) {
+        stateTimer -= dt;
+        if (stateTimer <= 0) {
+            initStage();
+            state = STATE_PLAYING;
+        }
+    } else if (state === STATE_CLEAR) {
+        stateTimer -= dt;
+        // Drain bonus
+        if (bonusTimer > 0) {
+            bonusTimer -= 100;
+            score += 100;
+            if (bonusTimer < 0) { score += bonusTimer; bonusTimer = 0; }
+            sfx.walk(); // tick
+        } else if (stateTimer <= 0) {
+            level++;
+            initStage();
+            state = STATE_PLAYING;
+        }
+    }
+    
+    render();
+    requestAnimationFrame(loop);
+}
+
+requestAnimationFrame(loop);
+
+</script>
+</body>
+</html>

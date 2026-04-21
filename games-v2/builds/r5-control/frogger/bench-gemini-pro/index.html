@@ -1,0 +1,650 @@
+<!--
+  GAME:      Frogger
+  RUN:       r5-control
+  BUILDER:   google/gemini-3-pro-preview
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Frogger</title>
+<style>
+    body {
+        margin: 0;
+        background-color: #111;
+        color: #fff;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        height: 100vh;
+        font-family: monospace;
+    }
+    #game-container {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+    }
+    canvas {
+        background-color: #000;
+        border: 4px solid #333;
+        box-shadow: 0 0 20px rgba(0, 255, 0, 0.2);
+    }
+    #ui {
+        width: 560px;
+        display: flex;
+        justify-content: space-between;
+        margin-bottom: 10px;
+        font-size: 24px;
+        font-weight: bold;
+    }
+    .val { color: #0F0; }
+</style>
+</head>
+<body>
+
+<div id="game-container">
+    <div id="ui">
+        <div>SCORE: <span id="scoreVal" class="val">0</span></div>
+        <div>LIVES: <span id="livesVal" class="val">3</span></div>
+        <div>TIME: <span id="timeVal" class="val">60</span></div>
+    </div>
+    <canvas id="gameCanvas" width="560" height="600"></canvas>
+    <div style="margin-top: 10px; color: #888;">
+        Arrows / WASD to hop. Press SPACE to Start/Pause.
+    </div>
+</div>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const scoreEl = document.getElementById('scoreVal');
+const livesEl = document.getElementById('livesVal');
+const timeEl = document.getElementById('timeVal');
+
+const W = canvas.width;
+const H = canvas.height;
+const TS = 40; // Tile Size
+const ROWS = 15;
+const COLS = 14;
+
+// States
+const ST_TITLE = 0;
+const ST_PLAY = 1;
+const ST_DEAD = 2;
+const ST_WIN_SLOT = 3;
+const ST_LEVEL_CLEAR = 4;
+const ST_OVER = 5;
+const ST_PAUSE = 6;
+
+let state = ST_TITLE;
+let stateTimer = 0;
+
+let score = 0;
+let lives = 3;
+let level = 1;
+let timeLimit = 60;
+let timeLeft = 60;
+let maxRowRendered = 14; // To track forward progress score
+
+let frog = null;
+let obstacles = [];
+let homes = [];
+
+const keys = { w:false, a:false, s:false, d:false, left:false, right:false, up:false, down:false, space:false };
+let lastInput = null; // Prevent continuous holding
+
+// Environment definitions based on row (0 is top padding/UI, 1 is home, 2-6 water, 7 median, 8-12 road, 13 start, 14 padding)
+// Actually standard is: top home, 5 water, median, 5 road, bottom.
+// 0: top wall
+// 1: home (5 slots)
+// 2,3,4,5,6: Water (logs/turtles)
+// 7: Median
+// 8,9,10,11,12: Road (cars)
+// 13: Start line
+// 14: Bottom info
+
+const R_HOME = 1;
+const R_WATER_ST = 2;
+const R_WATER_END = 6;
+const R_MEDIAN = 7;
+const R_ROAD_ST = 8;
+const R_ROAD_END = 12;
+const R_START = 13;
+
+function initLevel() {
+    obstacles = [];
+    timeLimit = Math.max(30, 60 - (level - 1) * 5); // Faster timer
+    
+    // Homes only clear on level start
+    if (!homes.length || homes.every(h => h.filled)) {
+        homes = [
+            { c: 1, filled: false },
+            { c: 4, filled: false },
+            { c: 7, filled: false },
+            { c: 10, filled: false },
+            { c: 13, filled: false } // Note: array 0-indexed, but logic might offset
+        ];
+    }
+    
+    let baseSpd = 1.0 + (level - 1) * 0.15; // Speed multiplier
+    
+    // Function to add objects uniformly
+    // row, type, width in cells, count, speed, direction (1 right, -1 left), spacing multiplier
+    const addRow = (row, type, cellsW, count, speed, dir) => {
+        let spacing = (COLS * TS) / count;
+        for (let i=0; i<count; i++) {
+            obstacles.push({
+                type: type,
+                r: row,
+                x: i * spacing,
+                y: row * TS,
+                w: cellsW * TS,
+                h: TS,
+                vx: speed * baseSpd * dir,
+                dir: dir,
+                // Turtles specific
+                cycle: type === 'turtle' ? Math.random() * 200 : 0, 
+                sunken: false
+            });
+        }
+    };
+    
+    // WATER (moving left/right)
+    addRow(2, 'log', 3, 3, 1.5, 1);    // Fast right
+    addRow(3, 'log', 5, 2, 0.8, -1);   // Slow, long left
+    addRow(4, 'turtle', 2, 4, 1.2, 1); // Med right, 2-wide turtle groups
+    addRow(5, 'log', 4, 3, 2.0, -1);   // Fast left
+    addRow(6, 'turtle', 3, 3, 0.9, 1); // Slow right, 3-wide turtles
+    
+    // ROAD (moving left/right)
+    addRow(8, 'car', 1, 4, 2.0, -1);   // Fast left (cars)
+    addRow(9, 'car', 1, 4, 2.5, 1);    // Very fast right
+    addRow(10, 'truck', 2, 3, 1.0, -1); // Slow left (trucks)
+    addRow(11, 'car', 1, 3, 1.5, 1);   // Med right
+    addRow(12, 'truck', 3, 2, 0.8, -1); // V. slow, very long left
+
+    spawnFrog();
+}
+
+function spawnFrog() {
+    frog = {
+        c: 6, // center column
+        r: R_START,
+        x: 6 * TS + TS/2, // stored as center for easier rendering later but we use grid logic for hopping
+        y: R_START * TS + TS/2,
+        facing: 'up',
+        vx: 0 // drift velocity if on log
+    };
+    timeLeft = timeLimit;
+    timeEl.innerText = timeLeft;
+    maxRowRendered = R_START;
+}
+
+function startGame() {
+    score = 0;
+    lives = 3;
+    level = 1;
+    homes = [];
+    scoreEl.innerText = score;
+    livesEl.innerText = lives;
+    
+    initLevel();
+    state = ST_PLAY;
+}
+
+// --- Input ---
+window.addEventListener('keydown', e => {
+    let k = e.key.toLowerCase();
+    if (['w','a','s','d','arrowup','arrowdown','arrowleft','arrowright',' '].includes(k)) e.preventDefault();
+    
+    if (k === 'w' || k === 'arrowup') keys.up = true;
+    if (k === 's' || k === 'arrowdown') keys.down = true;
+    if (k === 'a' || k === 'arrowleft') keys.left = true;
+    if (k === 'd' || k === 'arrowright') keys.right = true;
+    
+    if (k === ' ') {
+        keys.space = true;
+        if (state === ST_TITLE || state === ST_OVER) {
+            startGame();
+        } else if (state === ST_PLAY) {
+            state = ST_PAUSE;
+        } else if (state === ST_PAUSE) {
+            state = ST_PLAY;
+        }
+    }
+});
+
+window.addEventListener('keyup', e => {
+    let k = e.key.toLowerCase();
+    if (k === 'w' || k === 'arrowup') keys.up = false;
+    if (k === 's' || k === 'arrowdown') keys.down = false;
+    if (k === 'a' || k === 'arrowleft') keys.left = false;
+    if (k === 'd' || k === 'arrowright') keys.right = false;
+    if (k === ' ') keys.space = false;
+    
+    // Clear last input lock when direction is released
+    if (!keys.up && !keys.down && !keys.left && !keys.right) lastInput = null;
+});
+
+// --- Logic ---
+function applyInput() {
+    if (state !== ST_PLAY) return;
+    
+    let hopDir = null;
+    if (keys.up && lastInput !== 'up') hopDir = 'up';
+    else if (keys.down && lastInput !== 'down') hopDir = 'down';
+    else if (keys.left && lastInput !== 'left') hopDir = 'left';
+    else if (keys.right && lastInput !== 'right') hopDir = 'right';
+    
+    if (hopDir) {
+        lastInput = hopDir;
+        frog.facing = hopDir;
+        
+        let nr = frog.r;
+        let nc = frog.c;
+        // frog.x is currently absolute pixel. We need to decouple it from log drift if we hop.
+        // Actually, classic Frogger: hopping left/right while on a moving log just shifts you 1 tile left/right relative to world, NOT log.
+        // Let's standardise position on hop based on nearest column
+        
+        if (hopDir === 'up' && frog.r > 1) nr--;
+        if (hopDir === 'down' && frog.r < R_START) nr++;
+        if (hopDir === 'left') {
+            // Un-drift x to grid
+            frog.x -= TS; 
+        }
+        if (hopDir === 'right') {
+            // Un-drift x 
+            frog.x += TS;
+        }
+        
+        // Vertical move jumps absolute Y
+        if (hopDir === 'up' || hopDir === 'down') {
+            frog.r = nr;
+            frog.y = nr * TS + TS/2;
+            
+            // If hopped off log/turtle, snap X to grid
+            if (frog.r >= R_ROAD_ST || frog.r === R_MEDIAN || frog.r === R_START) {
+                frog.c = Math.max(0, Math.min(COLS-1, Math.round((frog.x - TS/2) / TS)));
+                frog.x = frog.c * TS + TS/2;
+                frog.vx = 0; // stop drifting
+            }
+            
+            // Forward score
+            if (frog.r < maxRowRendered) {
+                score += 10;
+                scoreEl.innerText = score;
+                maxRowRendered = frog.r;
+            }
+        }
+        
+        // Horizontal bounds
+        if (frog.x < TS/2) frog.x = TS/2;
+        if (frog.x > W - TS/2) frog.x = W - TS/2;
+        
+        // Column update
+        frog.c = Math.floor(frog.x / TS);
+        
+        // Check Home Bay entry
+        if (frog.r === R_HOME) {
+            checkHomeBay();
+        }
+    }
+}
+
+function checkHomeBay() {
+    // Only certain slots are open. Map col to home index
+    // 1, 4, 7, 10, 13
+    let mapped = -1;
+    if (Math.abs(frog.x - (1 * TS + TS/2)) < TS/2) mapped = 0;
+    else if (Math.abs(frog.x - (4 * TS + TS/2)) < TS/2) mapped = 1;
+    else if (Math.abs(frog.x - (7 * TS + TS/2)) < TS/2) mapped = 2;
+    else if (Math.abs(frog.x - (10 * TS + TS/2)) < TS/2) mapped = 3;
+    else if (Math.abs(frog.x - (13 * TS + TS/2)) < TS/2) mapped = 4;
+    
+    if (mapped !== -1) {
+        if (homes[mapped].filled) {
+            // Bumped into occupied home
+            die();
+        } else {
+            // Success
+            homes[mapped].filled = true;
+            score += 50 + Math.floor(timeLeft) * 10;
+            scoreEl.innerText = score;
+            
+            if (homes.every(h => h.filled)) {
+                state = ST_LEVEL_CLEAR;
+                stateTimer = 2.0;
+            } else {
+                state = ST_WIN_SLOT;
+                stateTimer = 1.0;
+            }
+        }
+    } else {
+        // Hit the wall between bays
+        die();
+    }
+}
+
+function die() {
+    if (state === ST_DEAD) return;
+    state = ST_DEAD;
+    stateTimer = 2.0;
+}
+
+function update(dt) {
+    if (state === ST_TITLE || state === ST_OVER || state === ST_PAUSE) return;
+
+    if (state === ST_DEAD || state === ST_WIN_SLOT || state === ST_LEVEL_CLEAR) {
+        stateTimer -= dt;
+        // Let environment move
+        updateEnvironment(dt);
+        
+        if (stateTimer <= 0) {
+            if (state === ST_DEAD) {
+                lives--;
+                livesEl.innerText = lives;
+                if (lives <= 0) state = ST_OVER;
+                else { spawnFrog(); state = ST_PLAY; }
+            } else if (state === ST_WIN_SLOT) {
+                spawnFrog();
+                state = ST_PLAY;
+            } else if (state === ST_LEVEL_CLEAR) {
+                score += 1000; // Bonus
+                scoreEl.innerText = score;
+                level++;
+                initLevel();
+                state = ST_PLAY;
+            }
+        }
+        return; // Don't process input or logic while dead/win
+    }
+
+    // --- PLAY STATE ---
+
+    // Timer
+    timeLeft -= dt;
+    timeEl.innerText = Math.max(0, Math.ceil(timeLeft));
+    if (timeLeft <= 0) {
+        die();
+        return;
+    }
+
+    applyInput();
+    updateEnvironment(dt);
+    
+    // Apply environmental drift to frog
+    if (frog.r >= R_WATER_ST && frog.r <= R_WATER_END) {
+        frog.x += frog.vx * dt * 60; // scale roughly to 60fps frame delta
+        // Bounds check while drifting
+        if (frog.x < 0 || frog.x > W) {
+            die(); // drifted off screen
+            return;
+        }
+    }
+    
+    checkCollisions();
+}
+
+function updateEnvironment(dt) {
+    const fpsScale = dt * 60;
+    
+    for (let o of obstacles) {
+        o.x += o.vx * fpsScale;
+        
+        // Wrap
+        if (o.vx > 0 && o.x > W) o.x = -o.w;
+        else if (o.vx < 0 && o.x + o.w < 0) o.x = W;
+        
+        // Turtle dive cycle
+        if (o.type === 'turtle') {
+            o.cycle += fpsScale;
+            if (o.cycle > 240) o.cycle = 0;
+            // 0-140 surfaced, 140-180 submerging visual warning, 180-240 sunken
+            o.sunken = (o.cycle > 180 && o.cycle < 240);
+        }
+    }
+}
+
+function AABB(x1, y1, w1, h1, x2, y2, w2, h2) {
+    return x1 < x2 + w2 && x1 + w1 > x2 && y1 < y2 + h2 && y1 + h1 > y2;
+}
+
+function checkCollisions() {
+    let fAABB = { x: frog.x - TS/2 + 5, y: frog.y - TS/2 + 5, w: TS - 10, h: TS - 10 }; // Slighly forgiving hitbox
+
+    // ROAD
+    if (frog.r >= R_ROAD_ST && frog.r <= R_ROAD_END) {
+        for (let o of obstacles) {
+            if (o.r === frog.r) {
+                if (AABB(fAABB.x, fAABB.y, fAABB.w, fAABB.h, o.x, o.y, o.w, o.h)) {
+                    die(); // Hit by car
+                    return;
+                }
+            }
+        }
+    }
+    
+    // WATER
+    if (frog.r >= R_WATER_ST && frog.r <= R_WATER_END) {
+        let safe = false;
+        frog.vx = 0; // Default to drowning unless on object
+        
+        for (let o of obstacles) {
+            if (o.r === frog.r && !o.sunken) { // Must be on same row and not fully under water
+                // Check if frog center is horizontally within object bounds
+                if (frog.x > o.x && frog.x < o.x + o.w) {
+                    safe = true;
+                    frog.vx = o.vx; // Ride it!
+                    break;
+                }
+            }
+        }
+        
+        if (!safe) {
+            die(); // Drowned
+        }
+    }
+}
+
+// --- Render ---
+
+function drawFrog(fx, fy, dir, isDead) {
+    ctx.save();
+    ctx.translate(Math.floor(fx), Math.floor(fy));
+    
+    if (isDead) {
+        // Red splatter/skull
+        ctx.fillStyle = '#F00';
+        ctx.fillRect(-15, -15, 30, 30);
+        ctx.fillStyle = '#FFF';
+        ctx.fillRect(-10, -10, 8, 8); ctx.fillRect(2, -10, 8, 8);
+    } else {
+        // Rot
+        if (dir === 'up') ctx.rotate(0);
+        else if (dir === 'right') ctx.rotate(Math.PI/2);
+        else if (dir === 'down') ctx.rotate(Math.PI);
+        else if (dir === 'left') ctx.rotate(-Math.PI/2);
+        
+        ctx.fillStyle = '#0F0';
+        ctx.beginPath(); ctx.ellipse(0, 0, 14, 18, 0, 0, Math.PI*2); ctx.fill(); // Body
+        ctx.fillRect(-18, -12, 8, 8); ctx.fillRect(10, -12, 8, 8); // Front legs
+        ctx.fillRect(-18, 8, 8, 8); ctx.fillRect(10, 8, 8, 8); // Back legs
+        
+        // Eyes
+        ctx.fillStyle = '#FFF';
+        ctx.beginPath(); ctx.arc(-7, -14, 4, 0, Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.arc(7, -14, 4, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#000';
+        ctx.beginPath(); ctx.arc(-7, -15, 2, 0, Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.arc(7, -15, 2, 0, Math.PI*2); ctx.fill();
+    }
+    
+    ctx.restore();
+}
+
+function render() {
+    // Backdrop
+    ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+    
+    // Zones
+    ctx.fillStyle = '#1E90FF'; // Water
+    ctx.fillRect(0, R_WATER_ST * TS, W, (R_WATER_END - R_WATER_ST + 1) * TS);
+    
+    ctx.fillStyle = '#333'; // Road
+    ctx.fillRect(0, R_ROAD_ST * TS, W, (R_ROAD_END - R_ROAD_ST + 1) * TS);
+    
+    ctx.fillStyle = '#111'; // Start/Med/End padding
+    ctx.fillRect(0, R_MEDIAN * TS, W, TS);
+    ctx.fillRect(0, R_START * TS, W, TS * 2);
+    
+    // Home Bays (Green with blue cutouts)
+    ctx.fillStyle = '#228B22'; // Bank grass
+    ctx.fillRect(0, TS, W, TS);
+    
+    for(let i=0; i<5; i++) {
+        let cIdx = 1 + i*3;
+        let x = cIdx * TS;
+        ctx.fillStyle = '#1E90FF'; // Water slot
+        ctx.fillRect(x, TS, TS, TS);
+        
+        // If occupied
+        if (homes[i] && homes[i].filled) {
+            drawFrog(x + TS/2, TS + TS/2, 'down', false);
+        }
+    }
+
+    if (state === ST_TITLE) {
+        ctx.fillStyle = '#0F0'; ctx.textAlign = 'center'; ctx.font = 'bold 50px monospace';
+        ctx.fillText("FROGGER", W/2, H/3);
+        let blink = Math.floor(performance.now()/500)%2===0;
+        if (blink) {
+            ctx.fillStyle = '#FFF'; ctx.font = '20px monospace';
+            ctx.fillText("PRESS SPACE TO START", W/2, H/2 + 20);
+        }
+        return;
+    }
+
+    // Objects
+    for (let o of obstacles) {
+        let MathX = Math.floor(o.x);
+        let MathY = Math.floor(o.y);
+        
+        if (o.type === 'log') {
+            ctx.fillStyle = '#8B4513';
+            ctx.beginPath(); ctx.roundRect(MathX, MathY + 4, o.w, o.h - 8, 8); ctx.fill();
+            // texture
+            ctx.strokeStyle = '#5c2e0b'; ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.moveTo(MathX + 10, MathY + 12); ctx.lineTo(MathX + o.w - 10, MathY + 12); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(MathX + 10, MathY + 28); ctx.lineTo(MathX + o.w - 10, MathY + 28); ctx.stroke();
+        } 
+        else if (o.type === 'turtle') {
+            if (o.sunken) continue; // don't draw
+            
+            let alpha = 1;
+            if (o.cycle > 140 && o.cycle < 180) { // Submerging blink
+                alpha = Math.floor(performance.now() / 100) % 2 === 0 ? 1 : 0.5;
+            }
+            
+            ctx.globalAlpha = alpha;
+            let qty = o.w / TS;
+            for(let i=0; i<qty; i++) {
+                let tx = MathX + i * TS + TS/2;
+                let ty = MathY + TS/2;
+                ctx.fillStyle = '#2E8B57';
+                ctx.beginPath(); ctx.arc(tx, ty, 16, 0, Math.PI*2); ctx.fill(); // Shell
+                // Head
+                ctx.fillStyle = '#556B2F';
+                if (o.dir > 0) ctx.fillRect(tx + 12, ty - 6, 8, 12);
+                else ctx.fillRect(tx - 20, ty - 6, 8, 12);
+            }
+            ctx.globalAlpha = 1;
+        }
+        else if (o.type === 'car' || o.type === 'truck') {
+            ctx.fillStyle = o.type === 'truck' ? '#FFF' : '#F00';
+            // Alternate colors roughly
+            if (o.type === 'car' && (o.r===9 || o.r===11)) ctx.fillStyle = '#0FF';
+            
+            let pad = 6;
+            ctx.beginPath(); ctx.roundRect(MathX, MathY + pad, o.w, o.h - pad*2, 4); ctx.fill();
+            
+            // Windshield
+            ctx.fillStyle = '#111';
+            if (o.dir > 0) ctx.fillRect(MathX + o.w - 12, MathY + pad + 2, 8, o.h - pad*2 - 4); // Right
+            else ctx.fillRect(MathX + 4, MathY + pad + 2, 8, o.h - pad*2 - 4); // Left
+        }
+    }
+
+    // Main Frog
+    if (frog && state !== ST_LEVEL_CLEAR) {
+        // Draw real frog if not in WIN_SLOT animation (since it draws in HOME slot overlay)
+        if (state !== ST_WIN_SLOT) {
+            drawFrog(frog.x, frog.y, frog.facing, state === ST_DEAD);
+        }
+    }
+
+    // Overlays
+    ctx.textAlign = 'center';
+    if (state === ST_LEVEL_CLEAR) {
+        ctx.fillStyle = 'rgba(0,0,0,0.7)'; ctx.fillRect(0,0,W,H);
+        ctx.fillStyle = '#0F0'; ctx.font = 'bold 40px monospace';
+        ctx.fillText("LEVEL COMPLETE!", W/2, H/2 - 20);
+        ctx.fillStyle = '#FFF'; ctx.font = '20px monospace';
+        ctx.fillText("BONUS 1000 PTS", W/2, H/2 + 20);
+    } else if (state === ST_DEAD) {
+        ctx.fillStyle = 'rgba(255,0,0,0.3)'; ctx.fillRect(0,0,W,H);
+    } else if (state === ST_OVER) {
+        ctx.fillStyle = 'rgba(0,0,0,0.8)'; ctx.fillRect(0,0,W,H);
+        ctx.fillStyle = '#F00'; ctx.font = 'bold 50px monospace';
+        ctx.fillText("GAME OVER", W/2, H/2 - 20);
+        let blink = Math.floor(performance.now()/500)%2===0;
+        if (blink) {
+            ctx.fillStyle = '#FFF'; ctx.font = '20px monospace';
+            ctx.fillText("PRESS SPACE TO RESTART", W/2, H/2 + 30);
+        }
+    } else if (state === ST_PAUSE) {
+        ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0,0,W,H);
+        ctx.fillStyle = '#FFF'; ctx.font = 'bold 40px monospace';
+        ctx.fillText("PAUSED", W/2, H/2);
+    }
+
+    // Level string bottom
+    ctx.fillStyle = '#FFF'; ctx.font = 'bold 20px monospace'; ctx.textAlign = 'right';
+    ctx.fillText(`LEVEL ${level}`, W - 10, H - 10);
+}
+
+// Polyfill roundRect
+if (!CanvasRenderingContext2D.prototype.roundRect) {
+    CanvasRenderingContext2D.prototype.roundRect = function (x, y, w, h, r) {
+        if (w < 2 * r) r = w / 2;
+        if (h < 2 * r) r = h / 2;
+        this.beginPath();
+        this.moveTo(x+r, y);
+        this.arcTo(x+w, y,   x+w, y+h, r);
+        this.arcTo(x+w, y+h, x,   y+h, r);
+        this.arcTo(x,   y+h, x,   y,   r);
+        this.arcTo(x,   y,   x+w, y,   r);
+        this.closePath();
+        return this;
+    }
+}
+
+// --- Loop ---
+let lastTime = 0;
+function loop(ts) {
+    let dt = (ts - lastTime) / 1000;
+    lastTime = ts;
+    if (dt > 0.1) dt = 0.016; // Clamp lag
+    
+    update(dt);
+    render();
+    
+    requestAnimationFrame(loop);
+}
+
+requestAnimationFrame(loop);
+
+</script>
+</body>
+</html>

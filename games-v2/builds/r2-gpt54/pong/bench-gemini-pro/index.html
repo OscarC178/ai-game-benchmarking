@@ -1,0 +1,413 @@
+<!--
+  GAME:      Pong
+  RUN:       r2-gpt54
+  BUILDER:   google/gemini-3-pro-preview
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pong</title>
+<style>
+body {
+    margin: 0;
+    padding: 0;
+    background-color: #111;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    color: white;
+    font-family: monospace;
+}
+canvas {
+    background-color: #000;
+    box-shadow: 0 0 20px rgba(255, 255, 255, 0.1);
+    image-rendering: crisp-edges;
+    max-width: 100%;
+    max-height: 100vh;
+    object-fit: contain;
+}
+</style>
+</head>
+<body>
+
+<canvas id="gameCanvas" width="800" height="600"></canvas>
+
+<script>
+// --- Audio System (Web Audio API) ---
+const audio = {
+    ctx: null,
+    init() {
+        if (!this.ctx) {
+            this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (this.ctx.state === 'suspended') {
+            this.ctx.resume();
+        }
+    },
+    playTone(freq, type, duration, vol = 0.1) {
+        if (!this.ctx) return;
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+        osc.type = type;
+        osc.frequency.setValueAtTime(freq, this.ctx.currentTime);
+        gain.gain.setValueAtTime(vol, this.ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + duration);
+        osc.connect(gain);
+        gain.connect(this.ctx.destination);
+        osc.start();
+        osc.stop(this.ctx.currentTime + duration);
+    },
+    paddleHit() { this.playTone(440, 'square', 0.1); },
+    wallHit() { this.playTone(220, 'triangle', 0.1); },
+    score() { this.playTone(150, 'sawtooth', 0.4, 0.15); },
+    win() { 
+        [440, 554, 659, 880].forEach((f, i) => {
+            setTimeout(() => this.playTone(f, 'square', 0.15, 0.1), i * 150);
+        });
+    },
+    lose() {
+        [300, 250, 200, 150].forEach((f, i) => {
+            setTimeout(() => this.playTone(f, 'sawtooth', 0.2, 0.1), i * 200);
+        });
+    }
+};
+
+// --- Game Constants & Setup ---
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const W = canvas.width;
+const H = canvas.height;
+
+const PADDLE_W = 12;
+const PADDLE_H = 84;
+const BALL_SIZE = 12;
+const WIN_SCORE = 7;
+
+const PLAYER_SPEED = 420;
+const CPU_SPEED = 320;
+const BALL_START_SPEED = 340;
+const BALL_MAX_SPEED = 620;
+const BALL_SPEED_INC = 22;
+
+const STATE_TITLE = 0;
+const STATE_SERVE = 1;
+const STATE_PLAY = 2;
+const STATE_PAUSED = 3;
+const STATE_GAMEOVER = 4;
+
+// --- Game State ---
+let gameState = STATE_TITLE;
+let lastTime = 0;
+let serveDelayTimer = 0;
+let serveDirection = 1; // 1 to CPU, -1 to Player
+
+const keys = {
+    ArrowUp: false, ArrowDown: false,
+    KeyW: false, KeyS: false
+};
+
+const scores = { player: 0, cpu: 0 };
+
+const player = {
+    x: 32,
+    y: 258,
+    w: PADDLE_W,
+    h: PADDLE_H,
+    scoreParams: { x: W / 4, y: 80 }
+};
+
+const cpu = {
+    x: 756,
+    y: 258,
+    w: PADDLE_W,
+    h: PADDLE_H,
+    targetY: 258,
+    reactionTimer: 0,
+    scoreParams: { x: W * 3 / 4, y: 80 }
+};
+
+const ball = {
+    x: 0, y: 0, w: BALL_SIZE, h: BALL_SIZE,
+    vx: 0, vy: 0, speed: 0
+};
+
+// --- Input Handling ---
+window.addEventListener('keydown', e => {
+    audio.init(); 
+    if (e.code in keys) {
+        keys[e.code] = true;
+        e.preventDefault();
+    }
+    
+    if (e.code === 'Enter') {
+        if (gameState === STATE_TITLE) {
+            startGame();
+        } else if (gameState === STATE_GAMEOVER) {
+            startGame();
+        }
+    } else if (e.code === 'KeyP') {
+        if (gameState === STATE_PLAY) {
+            gameState = STATE_PAUSED;
+        } else if (gameState === STATE_PAUSED) {
+            gameState = STATE_PLAY;
+            lastTime = performance.now(); // Prevent delta spike
+        }
+    }
+});
+
+window.addEventListener('keyup', e => {
+    if (e.code in keys) keys[e.code] = false;
+});
+
+// --- Game Logic ---
+function resetPaddles() {
+    player.y = H / 2 - PADDLE_H / 2;
+    cpu.y = H / 2 - PADDLE_H / 2;
+    cpu.targetY = cpu.y;
+}
+
+function resetBall(direction) {
+    ball.x = W / 2 - BALL_SIZE / 2;
+    ball.y = H / 2 - BALL_SIZE / 2;
+    ball.speed = BALL_START_SPEED;
+    
+    // Launch angle between -28 and +28 degrees (approx -0.5 to 0.5 radians)
+    const angle = (Math.random() * 56 - 28) * (Math.PI / 180);
+    
+    ball.vx = ball.speed * Math.cos(angle) * direction;
+    ball.vy = ball.speed * Math.sin(angle);
+}
+
+function startGame() {
+    scores.player = 0;
+    scores.cpu = 0;
+    serveDirection = Math.random() < 0.5 ? 1 : -1;
+    startServe();
+}
+
+function startServe() {
+    resetPaddles();
+    resetBall(serveDirection);
+    gameState = STATE_SERVE;
+    serveDelayTimer = 1.0; // 1 second wait
+}
+
+function update(dt) {
+    if (gameState === STATE_SERVE) {
+        serveDelayTimer -= dt;
+        if (serveDelayTimer <= 0) {
+            gameState = STATE_PLAY;
+        }
+        return; // No movement during serve delay
+    }
+
+    if (gameState !== STATE_PLAY) return;
+
+    // --- Player Movement ---
+    if (keys.ArrowUp || keys.KeyW) player.y -= PLAYER_SPEED * dt;
+    if (keys.ArrowDown || keys.KeyS) player.y += PLAYER_SPEED * dt;
+    
+    // Clamp Player
+    if (player.y < 0) player.y = 0;
+    if (player.y + player.h > H) player.y = H - player.h;
+
+    // --- CPU Movement (Reaction AI) ---
+    cpu.reactionTimer += dt;
+    if (cpu.reactionTimer > 0.08) { // 80ms reaction delay
+        cpu.reactionTimer = 0;
+        if (ball.vx > 0) { // Ball moving towards CPU
+            // Aim for center of ball
+            cpu.targetY = ball.y + ball.h/2 - cpu.h/2;
+            // Add slight imperfection
+            cpu.targetY += (Math.random() * 20 - 10);
+        } else {
+            // Drift to center when ball moves away
+            cpu.targetY = H/2 - cpu.h/2; 
+        }
+    }
+
+    // Move CPU towards target
+    if (cpu.y < cpu.targetY - 5) {
+        cpu.y += CPU_SPEED * dt;
+    } else if (cpu.y > cpu.targetY + 5) {
+        cpu.y -= CPU_SPEED * dt;
+    }
+
+    // Clamp CPU
+    if (cpu.y < 0) cpu.y = 0;
+    if (cpu.y + cpu.h > H) cpu.y = H - cpu.h;
+
+    // --- Ball Movement ---
+    ball.x += ball.vx * dt;
+    ball.y += ball.vy * dt;
+
+    // Top/Bottom Wall Collisions
+    if (ball.y < 0) {
+        ball.y = 0;
+        ball.vy = Math.abs(ball.vy);
+        audio.wallHit();
+    } else if (ball.y + ball.h > H) {
+        ball.y = H - ball.h;
+        ball.vy = -Math.abs(ball.vy);
+        audio.wallHit();
+    }
+
+    // Paddle Collisions
+    const bCX = ball.x + ball.w / 2;
+    const bCY = ball.y + ball.h / 2;
+
+    // Player Paddle (Left)
+    if (ball.vx < 0 && rectIntersect(ball, player)) {
+        ball.x = player.x + player.w; // Reposition to avoid sticking
+        handlePaddleHit(player, 1);
+    }
+    // CPU Paddle (Right)
+    else if (ball.vx > 0 && rectIntersect(ball, cpu)) {
+        ball.x = cpu.x - ball.w; // Reposition
+        handlePaddleHit(cpu, -1);
+    }
+
+    // --- Scoring ---
+    if (ball.x < 0) {
+        scores.cpu++;
+        serveDirection = -1; // Serve to loser
+        checkPoint();
+    } else if (ball.x + ball.w > W) {
+        scores.player++;
+        serveDirection = 1;
+        checkPoint();
+    }
+}
+
+function rectIntersect(r1, r2) {
+    return r1.x < r2.x + r2.w &&
+           r1.x + r1.w > r2.x &&
+           r1.y < r2.y + r2.h &&
+           r1.y + r1.h > r2.y;
+}
+
+function handlePaddleHit(paddle, dirMatrix) {
+    audio.paddleHit();
+    
+    // Relative intersect Y (-1 at top, 0 at center, 1 at bottom)
+    const hitY = (ball.y + ball.h/2) - (paddle.y + paddle.h/2);
+    let normalizedHitY = hitY / (paddle.h / 2);
+    // Clamp just in case it hits very edge
+    normalizedHitY = Math.max(-1, Math.min(1, normalizedHitY));
+
+    // Calculate bounce angle (max ~60 degrees)
+    const maxBounceAngle = 60 * (Math.PI / 180);
+    const bounceAngle = normalizedHitY * maxBounceAngle;
+
+    // Increase speed
+    ball.speed += BALL_SPEED_INC;
+    if (ball.speed > BALL_MAX_SPEED) ball.speed = BALL_MAX_SPEED;
+
+    ball.vx = ball.speed * Math.cos(bounceAngle) * dirMatrix;
+    ball.vy = ball.speed * Math.sin(bounceAngle);
+}
+
+function checkPoint() {
+    audio.score();
+    if (scores.player >= WIN_SCORE) {
+        gameState = STATE_GAMEOVER;
+        audio.win();
+    } else if (scores.cpu >= WIN_SCORE) {
+        gameState = STATE_GAMEOVER;
+        audio.lose();
+    } else {
+        startServe();
+    }
+}
+
+// --- Rendering ---
+function drawRect(x, y, w, h, color = 'white') {
+    ctx.fillStyle = color;
+    ctx.fillRect(Math.floor(x), Math.floor(y), w, h);
+}
+
+function drawText(text, x, y, size, align = 'center') {
+    ctx.fillStyle = 'white';
+    ctx.font = `${size}px monospace`;
+    ctx.textAlign = align;
+    ctx.fillText(text, x, y);
+}
+
+function drawCenterLine() {
+    ctx.fillStyle = 'white';
+    const dashH = 16;
+    const gapH = 10;
+    const w = 4;
+    const x = W / 2 - w / 2;
+    for (let y = 0; y < H; y += dashH + gapH) {
+        ctx.fillRect(x, y, w, dashH);
+    }
+}
+
+function render() {
+    // Clear Screen
+    drawRect(0, 0, W, H, '#000');
+
+    if (gameState === STATE_TITLE) {
+        drawText("PONG", W / 2, H / 2 - 60, 80);
+        drawText("Player: Up/Down or W/S", W / 2, H / 2 + 20, 20);
+        drawText("P to Pause", W / 2, H / 2 + 50, 20);
+        drawText("Press Enter to Start", W / 2, H / 2 + 120, 24);
+        return;
+    }
+
+    // Draw Game Elements
+    drawCenterLine();
+    
+    // Scores
+    drawText(scores.player.toString(), player.scoreParams.x, player.scoreParams.y, 60);
+    drawText(scores.cpu.toString(), cpu.scoreParams.x, cpu.scoreParams.y, 60);
+
+    // Paddles & Ball
+    drawRect(player.x, player.y, player.w, player.h);
+    drawRect(cpu.x, cpu.y, cpu.w, cpu.h);
+    drawRect(ball.x, ball.y, ball.w, ball.h);
+
+    // Overlays
+    if (gameState === STATE_SERVE) {
+        // Optional subtle ready indicator
+        drawText("READY", W / 2, H / 2 + 50, 20);
+    } else if (gameState === STATE_PAUSED) {
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+        ctx.fillRect(0, 0, W, H);
+        drawText("PAUSED", W / 2, H / 2, 40);
+    } else if (gameState === STATE_GAMEOVER) {
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+        ctx.fillRect(0, 0, W, H);
+        const winText = scores.player >= WIN_SCORE ? "PLAYER WINS" : "CPU WINS";
+        drawText(winText, W / 2, H / 2 - 40, 60);
+        drawText(`Final Score: ${scores.player} - ${scores.cpu}`, W / 2, H / 2 + 20, 24);
+        drawText("Press Enter to Restart", W / 2, H / 2 + 100, 20);
+    }
+}
+
+// --- Main Loop ---
+function gameLoop(timestamp) {
+    if (!lastTime) lastTime = timestamp;
+    let dt = (timestamp - lastTime) / 1000;
+    
+    // Clamp delta time to prevent massive jumps (e.g. from tab shifting)
+    if (dt > 0.1) dt = 0.1;
+    
+    lastTime = timestamp;
+
+    update(dt);
+    render();
+
+    requestAnimationFrame(gameLoop);
+}
+
+// Start Loop
+requestAnimationFrame(gameLoop);
+
+</script>
+</body>
+</html>

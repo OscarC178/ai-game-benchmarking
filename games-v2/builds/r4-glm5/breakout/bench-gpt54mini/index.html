@@ -1,0 +1,165 @@
+<!--
+  GAME:      Breakout
+  RUN:       r4-glm5
+  BUILDER:   openai/gpt-5.4-mini
+-->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Breakout</title>
+<style>
+  html,body{height:100%;margin:0;background:#000;display:flex;align-items:center;justify-content:center}
+  #wrap{width:100vmin;height:75vmin;max-width:800px;max-height:600px;position:relative}
+  canvas{width:100%;height:100%;display:block;background:#000}
+  #overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#fff;font-family:monospace;pointer-events:none;white-space:pre-wrap;text-align:center}
+  #hud{position:absolute;left:12px;top:8px;color:#fff;font-family:monospace;pointer-events:none}
+  #hud .right{position:absolute;right:12px;top:8px}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c" width="800" height="600"></canvas>
+  <div id="hud"><div id="score"></div><div id="meta" class="right"></div></div>
+  <div id="overlay"></div>
+</div>
+<script>
+(() => {
+  // Canvas
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  const overlay = document.getElementById('overlay');
+  const scoreEl = document.getElementById('score');
+  const metaEl = document.getElementById('meta');
+
+  // Constants
+  const W = 800, H = 600;
+  const P_W = 120, P_H = 15;
+  const P_Y = H - 30; // 30px from bottom
+  const P_SPEED = 500; // px/s
+
+  const BALL_R = 6; // radius
+  const BALL_BASE_SPEED = 400; // px/s
+  const BALL_MAX_SPEED = 600; // px/s
+  const BALL_SPEED_PER_LEVEL = 20; // px/s
+
+  const BR_ROWS = 6, BR_COLS = 10; // per spec often 10x6
+  const BR_W = 75, BR_H = 25; // as spec
+  const BR_PADDING = 3; // small gap
+  const BR_OFFSET_TOP = 50;
+  const BR_OFFSET_LEFT = 25;
+
+  const ROW_COLORS = ['#FF0000','#FF8800','#FFFF00','#00FF00','#0088FF','#8800FF'];
+  const ROW_POINTS = [70,60,50,40,30,20];
+
+  // State
+  let state = 'title'; // title, playing, paused, serve, gameover, victory
+  let paddle = { x: (W - P_W)/2, y: P_Y, w: P_W, h: P_H };
+  let ball = { x: paddle.x + P_W/2, y: paddle.y - BALL_R - 1, vx:0, vy:0, speed: BALL_BASE_SPEED, attached:true };
+  let bricks = [];
+  let score = 0, high = 0, lives = 3, level = 1;
+
+  // Input
+  const keys = { left:false, right:false };
+  window.addEventListener('keydown', e=>{
+    if(e.key==='ArrowLeft' || e.key==='a' || e.key==='A') keys.left = true;
+    if(e.key==='ArrowRight' || e.key==='d' || e.key==='D') keys.right = true;
+    if(e.key===' '){ if(state==='playing' && ball.attached) launch(); else if(state==='title') startGame(); else if(state==='gameover') startGame(); e.preventDefault(); }
+    if(e.key==='Enter'){ if(state==='title' || state==='gameover') startGame(); }
+    if(e.key==='p' || e.key==='P'){ togglePause(); }
+    if(e.key==='r' || e.key==='R'){ startGame(); }
+    if(e.key==='Escape'){ state='title'; overlayText(titleText()); }
+  });
+  window.addEventListener('keyup', e=>{ if(e.key==='ArrowLeft'||e.key==='a'||e.key==='A') keys.left=false; if(e.key==='ArrowRight'||e.key==='d'||e.key==='D') keys.right=false; });
+  // mouse control (optional)
+  window.addEventListener('mousemove', e=>{ const r = canvas.getBoundingClientRect(); const mx = (e.clientX - r.left) * (canvas.width / r.width); paddle.x = mx - paddle.w/2; clampPaddle(); if(ball.attached) ball.x = paddle.x + paddle.w/2; });
+
+  // audio
+  let audioCtx=null, audioOk=false;
+  function ensureAudio(){ if(audioOk) return; audioOk=true; audioCtx = new (window.AudioContext||window.webkitAudioContext)(); }
+  window.addEventListener('pointerdown', ensureAudio, {once:true});
+  function sfx(freq,dur=0.06,type='square'){ if(!audioOk) return; const o = audioCtx.createOscillator(); const g = audioCtx.createGain(); o.type=type; o.frequency.value=freq; o.connect(g); g.connect(audioCtx.destination); g.gain.setValueAtTime(0.0001,audioCtx.currentTime); g.gain.exponentialRampToValueAtTime(0.12,audioCtx.currentTime+0.01); o.start(); g.gain.exponentialRampToValueAtTime(0.0001,audioCtx.currentTime+dur); o.stop(audioCtx.currentTime+dur+0.02); }
+  function sfxLife(){ if(!audioOk) return; const o=audioCtx.createOscillator(); const g=audioCtx.createGain(); o.type='sawtooth'; o.frequency.setValueAtTime(200,audioCtx.currentTime); o.frequency.exponentialRampToValueAtTime(60,audioCtx.currentTime+0.5); o.connect(g); g.connect(audioCtx.destination); g.gain.setValueAtTime(0.0001,audioCtx.currentTime); g.gain.exponentialRampToValueAtTime(0.14,audioCtx.currentTime+0.01); g.gain.exponentialRampToValueAtTime(0.0001,audioCtx.currentTime+0.5); o.start(); o.stop(audioCtx.currentTime+0.52); }
+
+  // persistence
+  try{ const h = localStorage.getItem('breakout_high'); if(h) high = parseInt(h,10)||0; }catch(e){ high = 0; }
+  function saveHigh(){ try{ localStorage.setItem('breakout_high', String(high)); }catch(e){} }
+
+  // bricks
+  function buildBricks(){ bricks = []; for(let r=0;r<BR_ROWS;r++){ for(let c=0;c<BR_COLS;c++){ const x = BR_OFFSET_LEFT + c*(BR_W + BR_PADDING); const y = BR_OFFSET_TOP + r*(BR_H + BR_PADDING); bricks.push({x,y,w:BR_W,h:BR_H,row:r,col:c,alive:true,color:ROW_COLORS[r],points:ROW_POINTS[r]}); } } }
+
+  function resetPositions(){ paddle.x = (W - paddle.w)/2; clampPaddle(); ball.x = paddle.x + paddle.w/2; ball.y = paddle.y - BALL_R - 1; ball.attached = true; ball.speed = Math.min(BALL_BASE_SPEED + (level-1)*BALL_SPEED_PER_LEVEL, BALL_MAX_SPEED); ball.vx=0; ball.vy=0; }
+
+  function startGame(){ score = 0; lives = 3; level=1; buildBricks(); resetPositions(); state='playing'; overlayText(''); }
+
+  function launch(){ if(!ball.attached) return; ensureAudio(); // random angle between 60° and 120° upward in unit circle? spec had 240-300 deg; we want upward with moderate horizontal
+    const deg = 210 + Math.random()*120; const rad = deg * Math.PI/180; ball.vx = Math.cos(rad) * ball.speed; ball.vy = Math.sin(rad) * ball.speed; ball.attached = false; }
+
+  function togglePause(){ if(state==='playing'){ state='paused'; overlayText('PAUSED'); } else if(state==='paused'){ state='playing'; overlayText(''); } }
+
+  function clampPaddle(){ paddle.x = Math.max(0, Math.min(W - paddle.w, paddle.x)); if(ball.attached) ball.x = paddle.x + paddle.w/2; }
+
+  // collisions
+  function rectCircle(cx,cy,rx,ry,rw,rh){ const closestX = Math.max(rx, Math.min(cx, rx+rw)); const closestY = Math.max(ry, Math.min(cy, ry+rh)); const dx = cx - closestX; const dy = cy - closestY; return (dx*dx + dy*dy) <= r*r; }
+
+  // main loop
+  let lastTime = performance.now(); function loop(now){ const dt = Math.min(0.033,(now - lastTime)/1000); lastTime = now; if(state==='playing'){ // input
+      let mv=0; if(keys.left) mv -= 1; if(keys.right) mv +=1; paddle.x += mv * P_SPEED * dt; clampPaddle(); // ball attached
+      if(ball.attached){ ball.x = paddle.x + paddle.w/2; ball.y = paddle.y - BALL_R - 1; }
+      else { const prevX = ball.x, prevY = ball.y; ball.x += ball.vx * dt; ball.y += ball.vy * dt; // walls
+          if(ball.x - BALL_R <= 0){ ball.x = BALL_R; ball.vx = -ball.vx; sfx(300); }
+          if(ball.x + BALL_R >= W){ ball.x = W - BALL_R; ball.vx = -ball.vx; sfx(300); }
+          if(ball.y - BALL_R <= 0){ ball.y = BALL_R; ball.vy = -ball.vy; sfx(300); }
+          // paddle collision only when moving down
+          if(ball.vy > 0 && rectCircle(ball.x, ball.y, paddle.x, paddle.y, paddle.w, paddle.h)){
+            // compute hit offset
+            const hit = (ball.x - (paddle.x + paddle.w/2)) / (paddle.w/2); const maxA = Math.PI/3; const angle = hit * maxA; const vx = Math.sin(angle); const vy = -Math.cos(angle); const mag = Math.hypot(vx,vy); ball.vx = (vx/mag) * ball.speed; ball.vy = (vy/mag) * ball.speed; ball.y = paddle.y - BALL_R - 0.5; sfx(600,0.06,'square'); }
+          // brick collisions - one per frame
+          for(let i=0;i<bricks.length;i++){ const b = bricks[i]; if(!b.alive) continue; if(rectCircle(ball.x, ball.y, b.x, b.y, b.w, b.h)){
+              // determine side by previous position
+              const prevLeft = prevX + BALL_R <= b.x; const prevRight = prevX - BALL_R >= b.x + b.w; const prevTop = prevY + BALL_R <= b.y; const prevBottom = prevY - BALL_R >= b.y + b.h;
+              if(prevLeft || prevRight) ball.vx = -ball.vx; else if(prevTop || prevBottom) ball.vy = -ball.vy; else ball.vy = -ball.vy;
+              b.alive = false; score += b.points; // speed up slightly
+              const sp = Math.min(BALL_MAX_SPEED, ball.speed * 1.02); ball.speed = sp; // scale velocity to new speed preserving direction
+              const s = Math.hypot(ball.vx, ball.vy); if(s>0){ ball.vx = ball.vx / s * ball.speed; ball.vy = ball.vy / s * ball.speed; }
+              sfx(900 + b.row*30, 0.06, 'square'); break; }
+          }
+          // bottom
+          if(ball.y - BALL_R > H){ // lost life
+            lives--; sfxLife(); if(lives <= 0){ state='gameover'; overlayText('GAME OVER\nScore: '+score+'\nPress Enter to Restart'); if(score>high){ high=score; saveHigh(); } } else { resetPositions(); overlayText('Life lost - Press Space to Launch'); }
+          }
+      }
+      // level clear
+      if(bricks.every(b=>!b.alive)){ level++; buildBricks(); resetPositions(); ball.speed = Math.min(BALL_BASE_SPEED + (level-1)*BALL_SPEED_PER_LEVEL, BALL_MAX_SPEED); overlayText('Level '+level+' - Press Space to Launch'); sfx(1100,0.14); }
+    }
+    render(); requestAnimationFrame(loop);
+  }
+
+  function render(){ ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H);
+    // draw bricks
+    for(const b of bricks){ if(!b.alive) continue; ctx.fillStyle = b.color; ctx.fillRect(Math.round(b.x)+1, Math.round(b.y)+1, b.w-2, b.h-2); ctx.strokeStyle='rgba(255,255,255,0.06)'; ctx.strokeRect(Math.round(b.x)+1, Math.round(b.y)+1, b.w-2, b.h-2); }
+    // paddle
+    ctx.fillStyle = '#fff'; roundRect(ctx, Math.round(paddle.x), Math.round(paddle.y), paddle.w, paddle.h, 6); ctx.fill();
+    // ball
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(ball.x, ball.y, BALL_R, 0, Math.PI*2); ctx.fill();
+    // HUD
+    scoreEl.innerText = 'Score: '+score; metaEl.innerText = 'Lives: '+lives + '   Level: ' + level + '   High: ' + high;
+  }
+
+  function overlayText(t){ overlay.textContent = t || ''; }
+  function titleText(){ return 'BREAKOUT\n\nBounce the ball with the paddle\nBreak all bricks to clear the level\nDon\'t let the ball fall\n\nControls: ←/A, →/D, Mouse to move, Space to Launch, P to Pause\n\nPress Enter to Start'; }
+
+  function roundRect(c,x,y,w,h,r){ const m=Math.min(w,h)/2; if(r>m) r=m; c.beginPath(); c.moveTo(x+r,y); c.arcTo(x+w,y,x+w,y+h,r); c.arcTo(x+w,y+h,x,y+h,r); c.arcTo(x,y+h,x,y,r); c.arcTo(x,y,x+w,y,r); c.closePath(); }
+
+  function buildBricks(){ bricks = []; for(let r=0;r<BR_ROWS;r++){ for(let c=0;c<BR_COLS;c++){ const x = BR_OFFSET_LEFT + c*(BR_W + BR_PADDING); const y = BR_OFFSET_TOP + r*(BR_H + BR_PADDING); bricks.push({x,y,w:BR_W,h:BR_H,row:r,col:c,alive:true,color:ROW_COLORS[r]||'#888',points:ROW_POINTS[r]||10}); } } }
+
+  function resetPositions(){ paddle.x = (W - paddle.w)/2; clampPaddle(); ball.x = paddle.x + paddle.w/2; ball.y = paddle.y - BALL_R - 1; ball.attached = true; ball.speed = Math.min(BALL_BASE_SPEED + (level-1)*BALL_SPEED_PER_LEVEL, BALL_MAX_SPEED); ball.vx=0; ball.vy=0; }
+
+  // init
+  buildBricks(); resetPositions(); overlayText(titleText()); requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

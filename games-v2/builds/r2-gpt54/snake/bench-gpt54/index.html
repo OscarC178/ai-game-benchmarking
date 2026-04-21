@@ -1,0 +1,599 @@
+<!--
+  GAME:      Snake
+  RUN:       r2-gpt54
+  BUILDER:   openai/gpt-5.4
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Snake</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background: #0b0b0b;
+      overflow: hidden;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+    body {
+      display: grid;
+      place-items: center;
+    }
+    canvas {
+      display: block;
+      background: #111111;
+      image-rendering: pixelated;
+      box-shadow: 0 0 32px rgba(0, 0, 0, 0.45), 0 0 64px rgba(80, 220, 120, 0.08);
+    }
+  </style>
+</head>
+<body>
+<canvas id="game" width="600" height="600"></canvas>
+<script>
+(() => {
+  'use strict';
+
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  const SIZE = 600;
+  const GRID = 20;
+  const CELL = 30;
+  const HUD_H = 42;
+  const PLAY_Y = HUD_H;
+  const PLAY_H = CELL * GRID;
+  const START_TPS = 8;
+  const MAX_TPS = 15;
+  const TPS_GAIN = 0.5;
+  const SCORE_PER_FOOD = 10;
+  const DT_CAP = 0.1;
+
+  const STATES = {
+    TITLE: 'TITLE',
+    PLAYING: 'PLAYING',
+    PAUSED: 'PAUSED',
+    GAME_OVER: 'GAME_OVER',
+    WIN: 'WIN'
+  };
+
+  const DIRS = {
+    up: { x: 0, y: -1, opposite: 'down' },
+    down: { x: 0, y: 1, opposite: 'up' },
+    left: { x: -1, y: 0, opposite: 'right' },
+    right: { x: 1, y: 0, opposite: 'left' }
+  };
+
+  let gameState = STATES.TITLE;
+  let previousState = STATES.TITLE;
+  let snake = [];
+  let direction = 'right';
+  let queuedDirection = 'right';
+  let hasQueuedTurn = false;
+  let food = { x: 14, y: 10 };
+  let score = 0;
+  let best = loadBest();
+  let tickRate = START_TPS;
+  let tickAccumulator = 0;
+  let lastTime = 0;
+  let flashTimer = 0;
+  let foodPulse = 0;
+  let particles = [];
+  let audioCtx = null;
+  let justStarted = false;
+
+  const keysDown = Object.create(null);
+  const prevDown = Object.create(null);
+
+  function resize() {
+    const scale = Math.min(window.innerWidth / SIZE, window.innerHeight / SIZE);
+    canvas.style.width = `${Math.floor(SIZE * scale)}px`;
+    canvas.style.height = `${Math.floor(SIZE * scale)}px`;
+  }
+
+  function loadBest() {
+    try {
+      const value = parseInt(localStorage.getItem('snake_best') || '0', 10);
+      return Number.isFinite(value) ? value : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  function saveBest() {
+    try {
+      localStorage.setItem('snake_best', String(best));
+    } catch {}
+  }
+
+  function ensureAudio() {
+    if (!audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) {
+        try { audioCtx = new AC(); } catch {}
+      }
+    }
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+  }
+
+  function tone(freq, duration, gainValue, type = 'square', endFreq = null) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    const now = audioCtx.currentTime;
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, now);
+    if (endFreq !== null) osc.frequency.linearRampToValueAtTime(endFreq, now + duration);
+    gain.gain.setValueAtTime(gainValue, now);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start(now);
+    osc.stop(now + duration);
+  }
+
+  const sfx = {
+    start() { tone(320, 0.05, 0.06, 'triangle', 520); },
+    eat() { tone(680, 0.05, 0.08, 'square', 920); },
+    death() { tone(320, 0.18, 0.08, 'sawtooth', 90); },
+    pause() { tone(440, 0.04, 0.05, 'triangle', 300); },
+    win() {
+      tone(523, 0.07, 0.05, 'triangle');
+      setTimeout(() => audioCtx && tone(659, 0.07, 0.05, 'triangle'), 80);
+      setTimeout(() => audioCtx && tone(784, 0.12, 0.06, 'triangle'), 160);
+    }
+  };
+
+  function randInt(max) {
+    return Math.floor(Math.random() * max);
+  }
+
+  function keyForCell(x, y) {
+    return `${x},${y}`;
+  }
+
+  function resetGame() {
+    snake = [
+      { x: 10, y: 10 },
+      { x: 9, y: 10 },
+      { x: 8, y: 10 }
+    ];
+    direction = 'right';
+    queuedDirection = 'right';
+    hasQueuedTurn = false;
+    score = 0;
+    tickRate = START_TPS;
+    tickAccumulator = 0;
+    flashTimer = 0;
+    particles = [];
+    justStarted = true;
+    spawnFood();
+  }
+
+  function startGame() {
+    resetGame();
+    gameState = STATES.PLAYING;
+    ensureAudio();
+    sfx.start();
+  }
+
+  function spawnFood() {
+    if (snake.length >= GRID * GRID) {
+      winGame();
+      return;
+    }
+
+    const occupied = new Set(snake.map(seg => keyForCell(seg.x, seg.y)));
+    const free = [];
+    for (let y = 0; y < GRID; y++) {
+      for (let x = 0; x < GRID; x++) {
+        if (!occupied.has(keyForCell(x, y))) free.push({ x, y });
+      }
+    }
+
+    if (free.length === 0) {
+      winGame();
+      return;
+    }
+
+    food = free[randInt(free.length)];
+  }
+
+  function queueDirection(next) {
+    if (gameState !== STATES.PLAYING) return;
+    if (hasQueuedTurn) return;
+    const base = queuedDirection || direction;
+    if (next === base) return;
+    if (DIRS[next].opposite === direction) return;
+    if (DIRS[next].opposite === base) return;
+    queuedDirection = next;
+    hasQueuedTurn = true;
+  }
+
+  function updateInput() {
+    if ((keysDown.ArrowUp && !prevDown.ArrowUp) || (keysDown.KeyW && !prevDown.KeyW)) queueDirection('up');
+    if ((keysDown.ArrowDown && !prevDown.ArrowDown) || (keysDown.KeyS && !prevDown.KeyS)) queueDirection('down');
+    if ((keysDown.ArrowLeft && !prevDown.ArrowLeft) || (keysDown.KeyA && !prevDown.KeyA)) queueDirection('left');
+    if ((keysDown.ArrowRight && !prevDown.ArrowRight) || (keysDown.KeyD && !prevDown.KeyD)) queueDirection('right');
+
+    const startPressed = ((keysDown.Enter && !prevDown.Enter) || (keysDown.Space && !prevDown.Space));
+    if (startPressed) {
+      ensureAudio();
+      if (gameState === STATES.TITLE || gameState === STATES.GAME_OVER || gameState === STATES.WIN) {
+        startGame();
+      }
+    }
+
+    const pausePressed = (keysDown.KeyP && !prevDown.KeyP);
+    if (pausePressed) {
+      if (gameState === STATES.PLAYING) {
+        previousState = gameState;
+        gameState = STATES.PAUSED;
+        ensureAudio();
+        sfx.pause();
+      } else if (gameState === STATES.PAUSED) {
+        gameState = previousState;
+        hasQueuedTurn = false;
+        queuedDirection = direction;
+        ensureAudio();
+        sfx.pause();
+      }
+    }
+  }
+
+  function updateTick() {
+    if (justStarted) justStarted = false;
+
+    direction = queuedDirection;
+    hasQueuedTurn = false;
+
+    const head = snake[0];
+    const dir = DIRS[direction];
+    const next = { x: head.x + dir.x, y: head.y + dir.y };
+
+    if (next.x < 0 || next.x >= GRID || next.y < 0 || next.y >= GRID) {
+      gameOver();
+      return;
+    }
+
+    const growing = next.x === food.x && next.y === food.y;
+    const bodyToCheck = growing ? snake : snake.slice(0, snake.length - 1);
+    for (const seg of bodyToCheck) {
+      if (seg.x === next.x && seg.y === next.y) {
+        gameOver();
+        return;
+      }
+    }
+
+    snake.unshift(next);
+
+    if (growing) {
+      score += SCORE_PER_FOOD;
+      if (score > best) {
+        best = score;
+        saveBest();
+      }
+      tickRate = Math.min(MAX_TPS, tickRate + TPS_GAIN);
+      flashTimer = 0.18;
+      spawnEatParticles(next.x, next.y);
+      ensureAudio();
+      sfx.eat();
+      if (snake.length >= GRID * GRID) {
+        winGame();
+        return;
+      }
+      spawnFood();
+    } else {
+      snake.pop();
+    }
+  }
+
+  function gameOver() {
+    gameState = STATES.GAME_OVER;
+    flashTimer = 0.45;
+    spawnCrashParticles();
+    ensureAudio();
+    sfx.death();
+    if (score > best) {
+      best = score;
+      saveBest();
+    }
+  }
+
+  function winGame() {
+    gameState = STATES.WIN;
+    flashTimer = 0.6;
+    spawnWinParticles();
+    ensureAudio();
+    sfx.win();
+    if (score > best) {
+      best = score;
+      saveBest();
+    }
+  }
+
+  function spawnEatParticles(cx, cy) {
+    const px = cx * CELL + CELL / 2;
+    const py = PLAY_Y + cy * CELL + CELL / 2;
+    for (let i = 0; i < 8; i++) {
+      const a = (Math.PI * 2 * i) / 8;
+      particles.push({
+        x: px,
+        y: py,
+        vx: Math.cos(a) * (40 + Math.random() * 20),
+        vy: Math.sin(a) * (40 + Math.random() * 20),
+        life: 0.25 + Math.random() * 0.15,
+        maxLife: 0.4,
+        color: '#ff6666'
+      });
+    }
+  }
+
+  function spawnCrashParticles() {
+    const head = snake[0];
+    if (!head) return;
+    const px = head.x * CELL + CELL / 2;
+    const py = PLAY_Y + head.y * CELL + CELL / 2;
+    for (let i = 0; i < 18; i++) {
+      const a = Math.random() * Math.PI * 2;
+      particles.push({
+        x: px,
+        y: py,
+        vx: Math.cos(a) * (50 + Math.random() * 110),
+        vy: Math.sin(a) * (50 + Math.random() * 110),
+        life: 0.4 + Math.random() * 0.3,
+        maxLife: 0.7,
+        color: '#ffffff'
+      });
+    }
+  }
+
+  function spawnWinParticles() {
+    for (let i = 0; i < 36; i++) {
+      particles.push({
+        x: SIZE / 2,
+        y: SIZE / 2,
+        vx: Math.cos((Math.PI * 2 * i) / 36) * (90 + Math.random() * 70),
+        vy: Math.sin((Math.PI * 2 * i) / 36) * (90 + Math.random() * 70),
+        life: 0.6 + Math.random() * 0.5,
+        maxLife: 1.0,
+        color: i % 2 ? '#7cff9a' : '#ffffff'
+      });
+    }
+  }
+
+  function updateParticles(dt) {
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.life -= dt;
+      if (p.life <= 0) particles.splice(i, 1);
+    }
+  }
+
+  function update(dt) {
+    foodPulse += dt * 4;
+    if (flashTimer > 0) flashTimer = Math.max(0, flashTimer - dt);
+    updateParticles(dt);
+
+    if (gameState !== STATES.PLAYING) return;
+
+    tickAccumulator += dt;
+    const step = 1 / tickRate;
+    let guard = 0;
+    while (tickAccumulator >= step && guard < 5 && gameState === STATES.PLAYING) {
+      tickAccumulator -= step;
+      updateTick();
+      guard++;
+    }
+  }
+
+  function drawGrid() {
+    ctx.fillStyle = flashTimer > 0 && gameState !== STATES.PLAYING ? '#1b1b1b' : '#111111';
+    ctx.fillRect(0, PLAY_Y, SIZE, PLAY_H);
+    ctx.strokeStyle = '#1e1e1e';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= GRID; i++) {
+      const p = i * CELL + 0.5;
+      ctx.beginPath();
+      ctx.moveTo(p, PLAY_Y);
+      ctx.lineTo(p, PLAY_Y + PLAY_H);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(0, PLAY_Y + p - 0.5);
+      ctx.lineTo(SIZE, PLAY_Y + p - 0.5);
+      ctx.stroke();
+    }
+  }
+
+  function drawHUD() {
+    ctx.fillStyle = '#0d0d0d';
+    ctx.fillRect(0, 0, SIZE, HUD_H);
+    ctx.fillStyle = '#7cff9a';
+    ctx.font = 'bold 16px monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(`SCORE ${score}`, 14, 21);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#d8d8d8';
+    ctx.fillText(`BEST ${best}`, SIZE / 2, 21);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#9a9a9a';
+    ctx.fillText(`SPEED ${tickRate.toFixed(1)}`, SIZE - 14, 21);
+  }
+
+  function drawSnake() {
+    for (let i = snake.length - 1; i >= 0; i--) {
+      const seg = snake[i];
+      const px = seg.x * CELL;
+      const py = PLAY_Y + seg.y * CELL;
+      const inset = i === 0 ? 2 : 3;
+      ctx.fillStyle = i === 0 ? '#7cff9a' : '#39b85c';
+      ctx.fillRect(px + inset, py + inset, CELL - inset * 2, CELL - inset * 2);
+      if (i !== 0) continue;
+
+      const eyeColor = '#0b0b0b';
+      const dir = DIRS[direction];
+      const cx = px + CELL / 2;
+      const cy = py + CELL / 2;
+      const offsetX = dir.x * 5;
+      const offsetY = dir.y * 5;
+      if (direction === 'left' || direction === 'right') {
+        ctx.fillStyle = eyeColor;
+        ctx.fillRect(cx + offsetX - 3, cy - 6, 3, 3);
+        ctx.fillRect(cx + offsetX - 3, cy + 3, 3, 3);
+      } else {
+        ctx.fillStyle = eyeColor;
+        ctx.fillRect(cx - 6, cy + offsetY - 3, 3, 3);
+        ctx.fillRect(cx + 3, cy + offsetY - 3, 3, 3);
+      }
+    }
+  }
+
+  function drawFood() {
+    const px = food.x * CELL + CELL / 2;
+    const py = PLAY_Y + food.y * CELL + CELL / 2;
+    const pulse = 1 + Math.sin(foodPulse) * 0.08;
+    ctx.save();
+    ctx.translate(px, py);
+    ctx.scale(pulse, pulse);
+    ctx.fillStyle = '#ff4d4d';
+    ctx.beginPath();
+    ctx.arc(0, 0, 9, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#ffd2d2';
+    ctx.beginPath();
+    ctx.arc(-3, -3, 3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#62d64f';
+    ctx.fillRect(0, -12, 3, 6);
+    ctx.restore();
+  }
+
+  function drawParticles() {
+    for (const p of particles) {
+      ctx.globalAlpha = Math.max(0, p.life / p.maxLife);
+      ctx.fillStyle = p.color;
+      ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawOverlay(title, lines, accent = '#ffffff') {
+    ctx.fillStyle = 'rgba(0,0,0,0.62)';
+    ctx.fillRect(0, 0, SIZE, SIZE);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = accent;
+    ctx.font = 'bold 52px monospace';
+    ctx.fillText(title, SIZE / 2, 190);
+    ctx.font = '18px monospace';
+    ctx.fillStyle = '#d9d9d9';
+    lines.forEach((line, i) => {
+      ctx.fillText(line, SIZE / 2, 260 + i * 32);
+    });
+  }
+
+  function render() {
+    ctx.clearRect(0, 0, SIZE, SIZE);
+    drawHUD();
+    drawGrid();
+
+    if (gameState !== STATES.TITLE) {
+      drawFood();
+      drawSnake();
+    } else {
+      drawFood();
+      drawSnake();
+    }
+
+    drawParticles();
+
+    if (gameState === STATES.TITLE) {
+      drawOverlay('SNAKE', [
+        'Move with Arrow Keys or WASD',
+        'Eat food to grow and score',
+        'Avoid walls and your own body',
+        'Press Enter to Start'
+      ], '#7cff9a');
+    } else if (gameState === STATES.PAUSED) {
+      drawOverlay('PAUSED', [
+        'Simulation frozen',
+        'Press P to Resume'
+      ], '#ffffff');
+    } else if (gameState === STATES.GAME_OVER) {
+      drawOverlay('GAME OVER', [
+        `Final Score ${score}`,
+        `Best ${best}`,
+        'Press Enter to Restart'
+      ], '#ff6a6a');
+    } else if (gameState === STATES.WIN) {
+      drawOverlay('YOU WIN', [
+        'Board cleared',
+        `Final Score ${score}`,
+        'Press Enter to Play Again'
+      ], '#7cff9a');
+    }
+
+    if (gameState === STATES.PLAYING && justStarted) {
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font = '18px monospace';
+      ctx.fillStyle = '#cfcfcf';
+      ctx.fillText('EAT THE RED FOOD', SIZE / 2, SIZE - 22);
+    }
+  }
+
+  function syncPrevKeys() {
+    const watched = ['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','KeyW','KeyA','KeyS','KeyD','Enter','Space','KeyP'];
+    for (const k of watched) prevDown[k] = !!keysDown[k];
+  }
+
+  function loop(ts) {
+    if (!lastTime) lastTime = ts;
+    const dt = Math.min(DT_CAP, (ts - lastTime) / 1000);
+    lastTime = ts;
+
+    updateInput();
+    if (gameState !== STATES.PAUSED) update(dt);
+    else {
+      foodPulse += dt * 2.5;
+      updateParticles(dt);
+      if (flashTimer > 0) flashTimer = Math.max(0, flashTimer - dt);
+    }
+    render();
+    syncPrevKeys();
+    requestAnimationFrame(loop);
+  }
+
+  window.addEventListener('keydown', (e) => {
+    const handled = ['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','KeyW','KeyA','KeyS','KeyD','Enter','Space','KeyP'];
+    if (handled.includes(e.code)) e.preventDefault();
+    keysDown[e.code] = true;
+    ensureAudio();
+  }, { passive: false });
+
+  window.addEventListener('keyup', (e) => {
+    keysDown[e.code] = false;
+  });
+
+  window.addEventListener('blur', () => {
+    for (const key in keysDown) keysDown[key] = false;
+    if (gameState === STATES.PLAYING) {
+      previousState = gameState;
+      gameState = STATES.PAUSED;
+    }
+  });
+
+  window.addEventListener('resize', resize);
+  resize();
+  resetGame();
+  gameState = STATES.TITLE;
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

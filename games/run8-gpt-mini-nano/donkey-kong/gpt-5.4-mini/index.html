@@ -1,0 +1,411 @@
+<!-- donkey-kong | spec:run8-gpt-mini-nano | built-by:gpt-5.4-mini -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Donkey Kong</title>
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; background:#000; overflow:hidden; }
+  body { display:flex; align-items:center; justify-content:center; }
+  canvas { background:#000; image-rendering: pixelated; image-rendering: crisp-edges; }
+</style>
+</head>
+<body>
+<canvas id="game" width="700" height="800"></canvas>
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  const GROUND_Y = 736;
+
+  const keys = {};
+  const pressed = new Set();
+  window.addEventListener('keydown', e => {
+    if (!keys[e.code]) pressed.add(e.code);
+    keys[e.code] = true;
+    if (["ArrowLeft","ArrowRight","ArrowUp","ArrowDown","Space","Enter","KeyA","KeyD","KeyW","KeyS","KeyP"].includes(e.code)) e.preventDefault();
+    if (e.code === 'KeyP') togglePause();
+    if (e.code === 'Enter') onEnter();
+  });
+  window.addEventListener('keyup', e => { keys[e.code] = false; });
+  const down = c => !!keys[c];
+  const just = c => pressed.has(c);
+
+  const lsKey = 'donkey-kong-highscore';
+  let highScore = +localStorage.getItem(lsKey) || 0;
+
+  const state = { mode: 'IDLE', stage: 1, score: 0, lives: 3, bonus: 5000, paused: false, messageTimer: 0 };
+  let last = performance.now(), accumulator = 0;
+
+  const mario = { x:80, y:710, w:24, h:32, vx:0, vy:0, onGround:false, onLadder:false, ladder:null, facing:1, hammer:0, jumpArmed:false, lastSafeY:710, lastSafeX:80, jumpOverSet:new Set(), invuln:0 };
+  let barrels = [], pickups = [], stage = null, dkThrow = 0, spawnTimer = 0, stageClearFlash = 0;
+
+  function makeStage() {
+    const platforms = [
+      { y: 736, x1: 20, x2: 680, slope: -0.20 },
+      { y: 620, x1: 40, x2: 660, slope:  0.18 },
+      { y: 500, x1: 20, x2: 680, slope: -0.18 },
+      { y: 380, x1: 40, x2: 660, slope:  0.18 },
+      { y: 260, x1: 20, x2: 680, slope: -0.18 },
+      { y: 140, x1: 60, x2: 660, slope:  0.18 }
+    ];
+    const ladders = [
+      { x:110, y1:646, y2:736, broken:false },
+      { x:190, y1:526, y2:646, broken:false },
+      { x:305, y1:526, y2:646, broken:true  },
+      { x:420, y1:406, y2:526, broken:false },
+      { x:560, y1:406, y2:526, broken:false },
+      { x:95,  y1:286, y2:406, broken:false },
+      { x:250, y1:286, y2:406, broken:false },
+      { x:365, y1:166, y2:286, broken:true  },
+      { x:520, y1:166, y2:286, broken:false },
+      { x:610, y1: 46, y2:166, broken:false }
+    ];
+    return { platforms, ladders };
+  }
+
+  function resetStage(keepScore=true) {
+    stage = makeStage();
+    mario.x = 80; mario.y = 710; mario.vx = mario.vy = 0; mario.onGround=false; mario.onLadder=false; mario.ladder=null; mario.hammer=0; mario.invuln=0; mario.jumpArmed=false;
+    barrels = [];
+    pickups = [
+      {x:220,y:548,w:20,h:20,taken:false},
+      {x:500,y:428,w:20,h:20,taken:false}
+    ];
+    dkThrow = 0; spawnTimer = 0; stageClearFlash = 0;
+    state.bonus = 5000;
+    if (!keepScore) state.score = 0;
+  }
+
+  function startGame() {
+    state.mode = 'PLAYING';
+    state.stage = 1; state.score = 0; state.lives = 3; state.paused = false;
+    resetStage(false);
+    console.log('state: PLAYING');
+  }
+
+  function gameOver() { state.mode = 'GAME_OVER'; console.log('state: GAME_OVER'); }
+  function togglePause() { if (state.mode === 'PLAYING') { state.mode = 'PAUSED'; console.log('state: PAUSED'); } else if (state.mode === 'PAUSED') { state.mode = 'PLAYING'; console.log('state: PLAYING'); } }
+
+  function onEnter() {
+    if (state.mode === 'IDLE') startGame();
+    else if (state.mode === 'GAME_OVER') startGame();
+    else if (state.mode === 'PAUSED') togglePause();
+  }
+
+  function platformYAt(p, x) { return p.y + (x - p.x1) * p.slope; }
+  function onPlatformAt(x, y) {
+    for (const p of stage.platforms) {
+      if (x + mario.w > p.x1 && x < p.x2) {
+        const py = platformYAt(p, x);
+        if (Math.abs((y + mario.h) - py) <= 8 && mario.vy >= 0) return p;
+      }
+    }
+    return null;
+  }
+  function nearestLadder() {
+    let best = null, bestD = 9999;
+    for (const l of stage.ladders) {
+      if (l.broken) continue;
+      const mx = mario.x + mario.w/2;
+      const d = Math.abs(mx - l.x);
+      const withinY = mario.y + mario.h > l.y1 - 16 && mario.y < l.y2 + 16;
+      if (d < 16 && withinY && d < bestD) { best = l; bestD = d; }
+    }
+    return best;
+  }
+
+  function aabb(a,b){ return a.x < b.x+b.w && a.x+a.w > b.x && a.y < b.y+b.h && a.y+a.h > b.y; }
+
+  function update(dt) {
+    if (state.mode !== 'PLAYING') return;
+    if (state.paused) return;
+    state.bonus = Math.max(0, state.bonus - dt * 100);
+    if (state.bonus <= 0) { loseLife(); return; }
+
+    mario.invuln = Math.max(0, mario.invuln - dt);
+    if (mario.hammer > 0) mario.hammer = Math.max(0, mario.hammer - dt);
+
+    dkThrow += dt;
+    spawnTimer += dt;
+    if (spawnTimer > 2.2) {
+      spawnTimer = 0;
+      barrels.push({x:126,y:96,w:18,h:18,vx:0,vy:0,platform:stage.platforms[5],dir:1,ladderTarget:null,alive:true,spin:0});
+    }
+
+    if (down('ArrowLeft') || down('KeyA')) { mario.vx = -150; mario.facing = -1; }
+    else if (down('ArrowRight') || down('KeyD')) { mario.vx = 150; mario.facing = 1; }
+    else mario.vx = 0;
+
+    const wantUp = down('ArrowUp') || down('KeyW');
+    const wantDown = down('ArrowDown') || down('KeyS');
+    const doJump = just('Space');
+
+    if (mario.onLadder) {
+      mario.vy = 0;
+      if (wantUp) mario.y -= 120 * dt;
+      else if (wantDown) mario.y += 120 * dt;
+      if (!mario.ladder) mario.onLadder = false;
+      if (mario.ladder && mario.y + mario.h < mario.ladder.y1 - 4) mario.onLadder = false;
+      if (mario.ladder && mario.y > mario.ladder.y2 - mario.h + 4) mario.onLadder = false;
+    } else {
+      const ladder = nearestLadder();
+      if (ladder && (wantUp || wantDown) && Math.abs((mario.x + mario.w/2) - ladder.x) < 14) {
+        mario.onLadder = true; mario.ladder = ladder; mario.x = ladder.x - mario.w/2; mario.vy = 0;
+      }
+      if (doJump && mario.onGround) { mario.vy = -340; mario.onGround = false; mario.jumpArmed = true; }
+      mario.vy += 900 * dt;
+      mario.y += mario.vy * dt;
+      mario.x += mario.vx * dt;
+      mario.x = Math.max(0, Math.min(W - mario.w, mario.x));
+      mario.onGround = false;
+      for (const p of stage.platforms) {
+        const py = platformYAt(p, mario.x + mario.w*0.5) - mario.h;
+        if (mario.y >= py - 8 && mario.y <= py + 18 && mario.vy >= 0 && mario.x + mario.w > p.x1 && mario.x < p.x2) {
+          mario.y = py; mario.vy = 0; mario.onGround = true; mario.lastSafeX = mario.x; mario.lastSafeY = mario.y;
+        }
+      }
+      if (!mario.onGround) {
+        mario.x = Math.max(0, Math.min(W - mario.w, mario.x));
+      }
+    }
+
+    if (!mario.onLadder && !mario.onGround) {
+      const ladder = nearestLadder();
+      if (ladder && wantDown && Math.abs((mario.x + mario.w/2) - ladder.x) < 14) { mario.onLadder = true; mario.ladder = ladder; mario.x = ladder.x - mario.w/2; mario.y += 1; }
+    }
+
+    for (const p of pickups) {
+      if (!p.taken && aabb(mario, p)) { p.taken = true; mario.hammer = 9; state.score += 200; }
+    }
+
+    for (const b of barrels) {
+      if (!b.alive) continue;
+      b.spin += dt * 10;
+      if (b.platform) {
+        const py = platformYAt(b.platform, b.x + b.w/2) - b.h;
+        b.y = py;
+        b.x += 80 * dt * b.dir * (1 + (6-b.platform.y)/800);
+        if (b.dir > 0 && b.x + b.w > b.platform.x2) { b.dir = -1; b.platform = nextPlatform(b.platform); }
+        if (b.dir < 0 && b.x < b.platform.x1) { b.dir = 1; b.platform = nextPlatform(b.platform); }
+      } else {
+        b.vy += 900 * dt; b.y += b.vy * dt;
+      }
+      for (const l of stage.ladders) {
+        if (l.broken) continue;
+        if (Math.abs((b.x + b.w/2) - l.x) < 8 && b.y + b.h > l.y1 && b.y < l.y2 && Math.random() < 0.01) { b.platform = lowerPlatformAt(l.y2 + 2); }
+      }
+      if (aabb(mario, b)) {
+        if (mario.hammer > 0) { b.alive = false; state.score += 300; }
+        else if (mario.invuln <= 0) { loseLife(); }
+      }
+    }
+    barrels = barrels.filter(b => b.alive && b.y < H + 50 && b.x > -50 && b.x < W + 50);
+
+    for (const b of barrels) {
+      if (mario.jumpArmed && b.alive && !mario.onGround && mario.vy > 0 && mario.y + mario.h <= b.y + 6 && Math.abs((mario.x+mario.w/2) - (b.x+b.w/2)) < 28) {
+        if (!mario.jumpOverSet.has(b)) { state.score += 100; mario.jumpOverSet.add(b); }
+      }
+    }
+    if (mario.onGround) mario.jumpOverSet.clear();
+
+    if (mario.y < 60 && mario.x > 285 && mario.x < 345) { clearStage(); }
+    if (mario.y > H + 80) loseLife();
+  }
+
+  function nextPlatform(p) {
+    const idx = stage.platforms.indexOf(p);
+    return idx > 0 ? stage.platforms[idx - 1] : null;
+  }
+  function lowerPlatformAt(y) {
+    let best = stage.platforms[0];
+    for (const p of stage.platforms) if (p.y > y && (!best || p.y < best.y)) best = p;
+    return best;
+  }
+  function loseLife() {
+    if (mario.invuln > 0) return;
+    state.lives--;
+    mario.invuln = 1.2;
+    mario.x = 80; mario.y = 710; mario.vx = mario.vy = 0; mario.onLadder = false; mario.onGround = false; mario.ladder = null;
+    if (state.lives <= 0) gameOver();
+  }
+  function clearStage() {
+    state.score += 1000 + Math.floor(state.bonus);
+    highScore = Math.max(highScore, state.score);
+    localStorage.setItem(lsKey, highScore);
+    stageClearFlash = 1.2;
+    state.stage++;
+    resetStage(true);
+    mario.x = 80; mario.y = 710;
+    console.log('stage clear');
+  }
+
+  function drawPlatform(p) {
+    ctx.fillStyle = '#FF3366';
+    ctx.beginPath();
+    ctx.moveTo(p.x1, p.y);
+    ctx.lineTo(p.x2, p.y + (p.x2 - p.x1) * p.slope);
+    ctx.lineTo(p.x2, p.y + (p.x2 - p.x1) * p.slope + 12);
+    ctx.lineTo(p.x1, p.y + 12);
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = '#992244'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#FF99AA';
+    for (let x = p.x1+12; x < p.x2-6; x += 34) {
+      const y = platformYAt(p, x);
+      ctx.fillRect(x, y-1, 4, 4);
+    }
+  }
+
+  function drawLadder(l) {
+    ctx.strokeStyle = '#66CCFF'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(l.x-9, l.y1); ctx.lineTo(l.x-9, l.y2); ctx.moveTo(l.x+9, l.y1); ctx.lineTo(l.x+9, l.y2); ctx.stroke();
+    for (let y = l.y1 + 4; y < l.y2; y += 10) {
+      if (l.broken && y > (l.y1 + l.y2)/2 - 8 && y < (l.y1 + l.y2)/2 + 8) continue;
+      ctx.beginPath(); ctx.moveTo(l.x-9, y); ctx.lineTo(l.x+9, y); ctx.stroke();
+    }
+  }
+
+  function drawMario() {
+    ctx.save();
+    ctx.translate(mario.x, mario.y);
+    if (mario.invuln > 0 && Math.floor(performance.now()/80)%2===0) ctx.globalAlpha = 0.35;
+    ctx.fillStyle = '#DD3333'; ctx.fillRect(6, 4, 12, 10);
+    ctx.fillStyle = '#FFD39B'; ctx.fillRect(8, 0, 8, 6);
+    ctx.fillStyle = '#3366CC'; ctx.fillRect(6, 14, 12, 12);
+    ctx.fillRect(4, 14, 4, 10); ctx.fillRect(16, 14, 4, 10);
+    ctx.fillStyle = '#DD3333'; ctx.fillRect(4, 10, 4, 4); ctx.fillRect(16, 10, 4, 4);
+    ctx.fillStyle = '#000'; ctx.fillRect(10, 2, 1, 1);
+    ctx.restore();
+    if (mario.hammer > 0) {
+      const t = performance.now()/120;
+      const ox = mario.x + 18 + Math.cos(t)*12;
+      const oy = mario.y + 10 + Math.sin(t)*8;
+      drawHammer(ox, oy, true);
+    }
+  }
+
+  function drawDK() {
+    ctx.fillStyle='#8B4513'; ctx.fillRect(78, 52, 68, 54);
+    ctx.fillStyle='#D2A679'; ctx.fillRect(92, 70, 40, 24);
+    ctx.fillStyle='#8B4513'; ctx.fillRect(70, 72, 16, 16); ctx.fillRect(142, 72, 16, 16);
+    ctx.fillRect(88, 34, 12, 20); ctx.fillRect(122, 34, 12, 20);
+    ctx.fillStyle='#000'; ctx.fillRect(96, 80, 4, 4); ctx.fillRect(116, 80, 4, 4);
+    if (Math.floor(performance.now()/250)%2===0) { ctx.fillStyle='#fff'; ctx.fillRect(110, 58, 10, 3); }
+  }
+
+  function drawPauline() {
+    ctx.fillStyle='#AA5500'; ctx.fillRect(312, 44, 8, 12);
+    ctx.fillStyle='#FF5CAA'; ctx.fillRect(306, 52, 20, 24);
+    ctx.fillStyle='#AA5500'; ctx.fillRect(303, 52, 6, 18);
+    ctx.fillRect(324, 52, 6, 18);
+    ctx.fillStyle='#fff'; ctx.font='16px monospace'; ctx.fillText((Math.floor(performance.now()/300)%2===0) ? 'HELP!' : 'HELP', 280, 30);
+  }
+
+  function drawOil() {
+    ctx.fillStyle='#3366CC'; ctx.fillRect(40, 704, 28, 32);
+    ctx.fillStyle='#FF8800'; ctx.beginPath(); ctx.moveTo(54, 698); ctx.lineTo(46, 706); ctx.lineTo(62, 706); ctx.closePath(); ctx.fill();
+  }
+
+  function drawBarrel(b) {
+    ctx.save();
+    ctx.translate(b.x + b.w/2, b.y + b.h/2);
+    ctx.rotate(b.spin);
+    ctx.fillStyle='#AA6633'; ctx.fillRect(-9,-9,18,18);
+    ctx.strokeStyle='#552200'; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.arc(0,0,7,0,Math.PI*2); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(-9,0); ctx.lineTo(9,0); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0,-9); ctx.lineTo(0,9); ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawHammer(x,y,small=false){ ctx.save(); ctx.translate(x,y); ctx.fillStyle='#FFD700'; ctx.fillRect(-2,-8,4,16); ctx.fillRect(-8,-10,16,6); ctx.fillStyle='#8B5A2B'; ctx.fillRect(-1,8,2,10); ctx.restore(); }
+
+  function drawPickup(p){ if (p.taken) return; drawHammer(p.x+10, p.y+10); }
+
+  function renderHUD() {
+    ctx.fillStyle='#fff'; ctx.font='16px monospace';
+    ctx.fillText('SCORE ' + Math.floor(state.score).toString().padStart(6,'0'), 12, 20);
+    ctx.textAlign='right';
+    ctx.fillText('HI ' + Math.floor(highScore).toString().padStart(6,'0'), W-12, 20);
+    ctx.fillText('LIVES ' + state.lives, W-12, 42);
+    ctx.textAlign='left';
+    ctx.fillText('BONUS ' + Math.floor(state.bonus).toString().padStart(5,'0'), 12, 42);
+    ctx.fillText('STAGE ' + state.stage, 12, 64);
+  }
+
+  function render() {
+    ctx.clearRect(0,0,W,H);
+    if (stage) {
+      stage.platforms.forEach(drawPlatform);
+      stage.ladders.forEach(drawLadder);
+      drawOil(); drawDK(); drawPauline();
+      pickups.forEach(drawPickup);
+      barrels.forEach(drawBarrel);
+      drawMario();
+      renderHUD();
+    }
+    if (state.mode === 'IDLE') {
+      ctx.fillStyle='#FF3366'; ctx.font='48px monospace'; ctx.textAlign='center'; ctx.fillText('DONKEY KONG', W/2, 260);
+      ctx.fillStyle='#fff'; ctx.font='22px monospace'; ctx.fillText('Press Enter to Start', W/2, 310);
+      ctx.textAlign='left';
+    }
+    if (state.mode === 'PAUSED') {
+      overlay('PAUSED');
+    }
+    if (state.mode === 'GAME_OVER') {
+      overlay('GAME OVER', true);
+    }
+    if (stageClearFlash > 0) {
+      ctx.fillStyle='rgba(255,255,255,' + Math.min(0.5, stageClearFlash/2) + ')'; ctx.fillRect(0,0,W,H); stageClearFlash -= 0.02;
+    }
+  }
+
+  function overlay(title, over=false) {
+    ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(0,0,W,H);
+    ctx.textAlign='center';
+    ctx.fillStyle='#fff';
+    ctx.font='48px monospace'; ctx.fillText(title, W/2, 360);
+    if (over) {
+      ctx.font='22px monospace'; ctx.fillText('FINAL SCORE ' + Math.floor(state.score), W/2, 410);
+      ctx.fillText('Press Enter to restart', W/2, 450);
+    } else {
+      ctx.font='22px monospace'; ctx.fillText('Press P to resume', W/2, 410);
+    }
+    ctx.textAlign='left';
+  }
+
+  function loop(now) {
+    const dt = Math.min(0.033, (now - last)/1000); last = now;
+    update(dt);
+    render();
+    pressed.clear();
+    requestAnimationFrame(loop);
+  // QA state bridge (auto-injected by patch_qa_bridge.py)
+  try { window.__qa = {
+    stateNum:  typeof state !== 'undefined' ? state : (typeof gameState !== 'undefined' ? gameState : (typeof game !== 'undefined' && game.state != null ? game.state : null)),
+    pacX:      typeof pac   !== 'undefined' ? (pac.x  != null ? pac.x  : null) : null,
+    pacY:      typeof pac   !== 'undefined' ? (pac.y  != null ? pac.y  : null) : null,
+    pacDx:     typeof pac   !== 'undefined' ? (pac.dx != null ? pac.dx : null) : null,
+    pacDy:     typeof pac   !== 'undefined' ? (pac.dy != null ? pac.dy : null) : null,
+    pacNextDx: typeof pac   !== 'undefined' ? (pac.nextDx != null ? pac.nextDx : (pac.requestedDx != null ? pac.requestedDx : null)) : null,
+    pacNextDy: typeof pac   !== 'undefined' ? (pac.nextDy != null ? pac.nextDy : (pac.requestedDy != null ? pac.requestedDy : null)) : null,
+    marioX:    typeof mario !== 'undefined' ? (mario.x != null ? mario.x : null) : null,
+    marioY:    typeof mario !== 'undefined' ? (mario.y != null ? mario.y : null) : null,
+    marioVx:   typeof mario !== 'undefined' ? (mario.vx != null ? mario.vx : null) : null,
+    marioVy:   typeof mario !== 'undefined' ? (mario.vy != null ? mario.vy : null) : null,
+    score:     typeof score !== 'undefined' ? score : (typeof game !== 'undefined' && game.score != null ? game.score : null),
+    lives:     typeof lives !== 'undefined' ? lives : (typeof game !== 'undefined' && game.lives != null ? game.lives : null),
+    ts: Date.now(),
+  }; } catch(e) { window.__qaErr = String(e); }
+
+  }
+
+  resetStage(true);
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

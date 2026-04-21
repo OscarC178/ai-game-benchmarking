@@ -1,0 +1,979 @@
+<!-- tetris | spec:run7-opus-mini-nano | built-by:gpt-5.4-nano -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Tetris</title>
+  <style>
+    html, body { margin:0; padding:0; background:#111; height:100%; }
+    body { display:flex; align-items:flex-start; justify-content:center; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    canvas { background:#111111; margin-top:0; image-rendering: pixelated; }
+    .hint { position:absolute; left:-9999px; width:1px; height:1px; overflow:hidden; }
+  </style>
+</head>
+<body>
+  <canvas id="game" width="800" height="600" aria-label="Tetris game"></canvas>
+  <script>
+    // --- Spec-driven constants ---
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+
+    const BG = '#111111';
+
+    const COLS = 10, ROWS = 20;
+    const CELL = 28;
+    const GRID_LINE = '#333333';
+    const PLAYFIELD_BG = '#000000';
+    const BORDER = '#555555';
+
+    const PLAY_X = 240, PLAY_Y = 10;
+    const PLAY_W = COLS * CELL; // 280
+    const PLAY_H = ROWS * CELL; // 560
+
+    const PANEL_X = 560;
+    const PANEL_TOP = 60;
+
+    const COLORS = {
+      I: '#00FFFF',
+      O: '#FFFF00',
+      T: '#AA00FF',
+      S: '#00FF00',
+      Z: '#FF0000',
+      J: '#0000FF',
+      L: '#FF8800'
+    };
+
+    // Tetromino cell coordinates for rotation states (4 blocks each).
+    // Coordinates are within a 4x4 or small local space; we transform by adding piece position (x,y).
+    // We'll normalize to integer grid offsets.
+    //
+    // Rotation matrices via explicit shapes to avoid ambiguity.
+    // Use standard 4x4 patterns:
+    // I: ----, rotations: horizontal and vertical
+    // O: always same
+    // T, S/Z, J/L: standard.
+    const TETROMINOES = {
+      I: [
+        [[0,1],[1,1],[2,1],[3,1]], // 0
+        [[2,0],[2,1],[2,2],[2,3]], // 1
+        [[0,2],[1,2],[2,2],[3,2]], // 2
+        [[1,0],[1,1],[1,2],[1,3]]  // 3
+      ],
+      O: [
+        [[1,0],[2,0],[1,1],[2,1]],
+        [[1,0],[2,0],[1,1],[2,1]],
+        [[1,0],[2,0],[1,1],[2,1]],
+        [[1,0],[2,0],[1,1],[2,1]]
+      ],
+      T: [
+        [[1,0],[0,1],[1,1],[2,1]],
+        [[1,0],[1,1],[2,1],[1,2]],
+        [[0,1],[1,1],[2,1],[1,2]],
+        [[1,0],[0,1],[1,1],[1,2]]
+      ],
+      S: [
+        [[1,0],[2,0],[0,1],[1,1]],
+        [[1,0],[1,1],[2,1],[2,2]],
+        [[1,1],[2,1],[0,2],[1,2]],
+        [[0,0],[0,1],[1,1],[1,2]]
+      ],
+      Z: [
+        [[0,0],[1,0],[1,1],[2,1]],
+        [[2,0],[1,1],[2,1],[1,2]],
+        [[0,1],[1,1],[1,2],[2,2]],
+        [[1,0],[0,1],[1,1],[0,2]]
+      ],
+      J: [
+        [[0,0],[0,1],[1,1],[2,1]],
+        [[1,0],[2,0],[1,1],[1,2]],
+        [[0,1],[1,1],[2,1],[2,2]],
+        [[1,0],[1,1],[0,2],[1,2]]
+      ],
+      L: [
+        [[2,0],[0,1],[1,1],[2,1]],
+        [[1,0],[1,1],[1,2],[2,2]],
+        [[0,1],[1,1],[2,1],[0,2]],
+        [[0,0],[1,0],[1,1],[1,2]]
+      ]
+    };
+
+    const PIECE_TYPES = ['I','O','T','S','Z','J','L'];
+
+    // Wall-kick offsets per spec:
+    // standard tries: (0,0), (-1,0), (+1,0), (0,-1)
+    // I-piece also try (±2,0) (i.e., add (-2,0),(+2,0))
+    function getKickOffsets(type) {
+      const base = [[0,0],[-1,0],[1,0],[0,-1]];
+      if (type === 'I') base.push([-2,0],[2,0]);
+      return base;
+    }
+
+    // Game state
+    let state = 'IDLE'; // IDLE, PLAYING, PAUSED, GAME_OVER
+    let board = null;  // ROWS x COLS of placed blocks or null
+    let active = null; // current piece object {type, x, y, rot, blocks: ...}
+    let nextType = null;
+
+    let bag = [];
+    let score = 0;
+    let level = 1;
+    let linesTotal = 0;
+    let highScore = 0;
+
+    // Gravity / timing
+    let lastFrameTime = 0;
+    let gravityAccum = 0;
+    let gravityIntervalMs = 1000; // computed from level
+    let lockTimer = 0;
+    let lockActive = false;
+    let lockDelayMs = 500;
+    let lockResets = 0;
+    const lockMaxResets = 3;
+    let hardDropPendingDistance = 0; // for sound maybe
+    let softDropHeld = false;
+
+    // Line clear flash management
+    let clearing = null; // {rows:[...], t0, duration:100, done:boolean}
+    let pendingRowClear = false;
+    let rowFlashRows = [];
+
+    // Audio (optional)
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    let audioUnlocked = false;
+
+    function safeResumeAudio() {
+      if (audioUnlocked) return;
+      try {
+        audioCtx.resume().then(() => { audioUnlocked = true; }).catch(()=>{});
+      } catch(e){}
+    }
+
+    function beep({freq=440, dur=0.02, type='sine', gain=0.05, endFreq=null}) {
+      if (!audioUnlocked) return;
+      const t = audioCtx.currentTime;
+      const osc = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, t);
+      if (endFreq != null) {
+        osc.frequency.exponentialRampToValueAtTime(endFreq, t + dur);
+      }
+      g.gain.setValueAtTime(gain, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      osc.connect(g);
+      g.connect(audioCtx.destination);
+      osc.start(t);
+      osc.stop(t + dur + 0.01);
+    }
+
+    function playMoveSound() { beep({freq:220, dur:0.02, type:'square', gain:0.03, endFreq:180}); }
+    function playHardDropSound(distanceCells=4) {
+      // 110Hz thud, shorter. Add slight pitch based on distance.
+      const dur = 0.06;
+      const f = 110 + Math.min(80, distanceCells*6);
+      beep({freq:f, dur, type:'triangle', gain:0.06, endFreq:70});
+    }
+    function playRotateSound() { beep({freq:220, dur:0.02, type:'square', gain:0.03, endFreq:170}); }
+    function playLineClearSound(lines=1, isTetris=false) {
+      if (isTetris) {
+        // louder chord-ish
+        const base = 220;
+        if (!audioUnlocked) return;
+        // schedule 3 oscillators
+        const t = audioCtx.currentTime;
+        const freqs = [base*1.2, base*1.5, base*2.0];
+        freqs.forEach((f, i) => {
+          const osc = audioCtx.createOscillator();
+          const g = audioCtx.createGain();
+          osc.type = 'sawtooth';
+          osc.frequency.setValueAtTime(f, t);
+          g.gain.setValueAtTime(0.08, t);
+          g.gain.exponentialRampToValueAtTime(0.0001, t + 0.2);
+          osc.connect(g); g.connect(audioCtx.destination);
+          osc.start(t + i*0.005);
+          osc.stop(t + 0.21);
+        });
+        return;
+      }
+      // ascending tone 440 -> 880, 150ms
+      beep({freq:440, dur:0.15, type:'sine', gain:0.05, endFreq:880});
+    }
+    function playGameOverSound() {
+      // descending 440 -> 55Hz, 500ms
+      beep({freq:440, dur:0.5, type:'sine', gain:0.06, endFreq:55});
+    }
+
+    // Utility
+    function emptyBoard() {
+      const b = new Array(ROWS);
+      for (let r = 0; r < ROWS; r++) {
+        b[r] = new Array(COLS).fill(null);
+      }
+      return b;
+    }
+
+    function shuffle7Bag() {
+      const arr = PIECE_TYPES.slice();
+      for (let i = arr.length - 1; i > 0; i--) {
+        const j = (Math.random() * (i + 1)) | 0;
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+      }
+      return arr;
+    }
+
+    function getBlocks(type, rot) {
+      // returns array of [dx,dy] in local coords
+      return TETROMINOES[type][rot];
+    }
+
+    function pieceCells(piece) {
+      const blocks = getBlocks(piece.type, piece.rot);
+      return blocks.map(([dx,dy]) => [piece.x + dx, piece.y + dy]);
+    }
+
+    function isInsideCell(x,y) {
+      return x >= 0 && x < COLS && y >= 0 && y < ROWS;
+    }
+
+    function canPlace(piece) {
+      const cells = pieceCells(piece);
+      for (const [x,y] of cells) {
+        // Collision with walls
+        if (x < 0 || x >= COLS) return false;
+        // floor triggers landing (y>=ROWS not allowed)
+        if (y >= ROWS) return false;
+        // y may be negative? With our definitions, spawn y=0 so typically non-negative.
+        if (y < 0) return false;
+        if (board[y][x]) return false;
+      }
+      return true;
+    }
+
+    function canMove(piece, dx, dy) {
+      const p = { ...piece, x: piece.x + dx, y: piece.y + dy };
+      return canPlace(p);
+    }
+
+    function tryRotate(dir) {
+      if (!active || state !== 'PLAYING') return;
+      const newRot = (active.rot + (dir === 1 ? 1 : 3)) % 4; // clockwise=+1, ccw=-1 => +3
+      const offsets = getKickOffsets(active.type);
+      for (const [ox, oy] of offsets) {
+        const candidate = { ...active, rot: newRot, x: active.x + ox, y: active.y + oy };
+        if (canPlace(candidate)) {
+          active.rot = newRot;
+          active.x += ox;
+          active.y += oy;
+          scheduleLockInterrupt();
+          playRotateSound();
+          return true;
+        }
+      }
+      return false;
+    }
+
+    function scheduleLockInterrupt() {
+      // Movement or rotation during lock delay interrupts and resets timer up to max resets.
+      if (lockActive) {
+        // If piece is touching ground/stack, reset lock delay if within reset limits
+        lockResets = Math.min(lockMaxResets, lockResets + 1);
+        lockTimer = 0;
+      }
+    }
+
+    function spawnNextPiece() {
+      if (bag.length === 0) bag = shuffle7Bag();
+      const type = bag.shift();
+
+      // Starting position: centered at top of playfield (column 3–4, row 0)
+      // With our local coords, choose x so that piece appears centered.
+      // Our shapes are within a 4-wide local region for I and others.
+      // We'll set x=3 and adjust per piece to look centered.
+      let x = 3;
+      let y = 0;
+
+      // Some shapes may appear slightly off depending on their local bounds.
+      // We'll adjust by type to better center within 10 cols.
+      // Center local width:
+      // I and many pieces have local coords in 0..3 => width 4 => x=3 centers (3..6).
+      // S/Z, T, J/L, O are mostly 0..2 => shifting x=4 can center as well,
+      // but we'll pick x=3 consistently; wall-kick and ghost still correct.
+      if (type === 'O') x = 4; // O 2x2 tends to look better
+      if (type === 'I') x = 3;
+
+      const piece = { type, x, y, rot: 0 };
+      // Find nextType already set? Here we spawn from bag.
+      if (!canPlace(piece)) {
+        // Game over
+        state = 'GAME_OVER';
+        if (score > highScore) {
+          highScore = score;
+          localStorage.setItem('tetris_high_score', String(highScore));
+        }
+        playGameOverSound();
+        active = null;
+        return false;
+      }
+      active = piece;
+      lockTimer = 0;
+      lockActive = false;
+      lockResets = 0;
+      gravityAccum = 0;
+      return true;
+    }
+
+    // Prepare initial next preview: we use a pre-bag and peek.
+    function initBagAndPreview() {
+      bag = shuffle7Bag();
+      nextType = bag.shift(); // take one for preview; remaining in bag
+    }
+
+    function takeNextTypeAndRefill() {
+      // After spawning current from preview, we need another nextType.
+      // If bag empty, shuffle new bag.
+      if (bag.length === 0) bag = shuffle7Bag();
+      const t = nextType;
+      nextType = bag.shift();
+      return t;
+    }
+
+    function spawnSpecific(type) {
+      let x = 3, y = 0;
+      if (type === 'O') x = 4;
+      if (type === 'I') x = 3;
+      const piece = { type, x, y, rot: 0 };
+      if (!canPlace(piece)) {
+        state = 'GAME_OVER';
+        if (score > highScore) {
+          highScore = score;
+          localStorage.setItem('tetris_high_score', String(highScore));
+        }
+        playGameOverSound();
+        active = null;
+        return false;
+      }
+      active = piece;
+      lockTimer = 0;
+      lockActive = false;
+      lockResets = 0;
+      gravityAccum = 0;
+      return true;
+    }
+
+    function startNewGame() {
+      board = emptyBoard();
+      score = 0;
+      level = 1;
+      linesTotal = 0;
+      gravityIntervalMs = 1000;
+      gravityAccum = 0;
+      lockActive = false;
+      lockTimer = 0;
+      lockResets = 0;
+      clearing = null;
+      rowFlashRows = [];
+      pendingRowClear = false;
+
+      highScore = parseInt(localStorage.getItem('tetris_high_score') || '0', 10) || 0;
+
+      initBagAndPreview();
+
+      // Spawn current from nextType
+      const currentType = takeNextTypeAndRefill(); // returns old nextType, and sets nextType to new
+      spawnSpecific(currentType);
+      state = 'PLAYING';
+    }
+
+    function endLockIfAny() {}
+
+    function getGravityInterval(levelNow) {
+      const interval = 1000 - 75 * (levelNow - 1);
+      return Math.max(100, interval);
+    }
+
+    function lockPiece() {
+      if (!active) return;
+      const cells = pieceCells(active);
+      for (const [x,y] of cells) {
+        if (y >= 0 && y < ROWS && x >= 0 && x < COLS) {
+          board[y][x] = active.type;
+        }
+      }
+      // Check and clear lines
+      handleLineClears();
+      // Spawn next
+      const currentType = takeNextTypeAndRefill();
+      spawnSpecific(currentType);
+    }
+
+    function handleLineClears() {
+      const fullRows = [];
+      for (let r = 0; r < ROWS; r++) {
+        let full = true;
+        for (let c = 0; c < COLS; c++) {
+          if (!board[r][c]) { full = false; break; }
+        }
+        if (full) fullRows.push(r);
+      }
+      if (fullRows.length === 0) return;
+
+      rowFlashRows = fullRows.slice();
+      clearing = { rows: fullRows.slice(), t0: performance.now(), duration: 100 };
+      pendingRowClear = true;
+
+      const lines = fullRows.length;
+      const mult = lines === 1 ? 100 : lines === 2 ? 300 : lines === 3 ? 500 : 800;
+      const addScore = mult * level;
+      score += addScore;
+      linesTotal += lines;
+
+      // Level up every 10 lines cleared
+      const newLevel = 1 + Math.floor(linesTotal / 10);
+      if (newLevel !== level) {
+        level = newLevel;
+        gravityIntervalMs = getGravityInterval(level);
+      }
+
+      // Audio for line clears
+      const isTetris = lines === 4;
+      playLineClearSound(lines, isTetris);
+    }
+
+    function removeClearedRows() {
+      if (!clearing || !pendingRowClear) return;
+      const now = performance.now();
+      if (now - clearing.t0 < clearing.duration) return;
+
+      const rowsToRemove = new Set(clearing.rows);
+
+      // Build new board
+      const newBoard = emptyBoard();
+      let writeR = ROWS - 1;
+      for (let r = ROWS - 1; r >= 0; r--) {
+        if (rowsToRemove.has(r)) continue;
+        for (let c = 0; c < COLS; c++) {
+          newBoard[writeR][c] = board[r][c];
+        }
+        writeR--;
+      }
+      board = newBoard;
+
+      pendingRowClear = false;
+      clearing = null;
+      rowFlashRows = [];
+    }
+
+    function ghostYPosition(piece) {
+      // Project downward until collision.
+      let testY = piece.y;
+      while (true) {
+        const candidate = { ...piece, y: testY + 1 };
+        if (canPlace(candidate)) {
+          testY++;
+        } else {
+          break;
+        }
+      }
+      return testY;
+    }
+
+    function pieceWouldLandSoon() {
+      if (!active) return false;
+      return !canMove(active, 0, 1);
+    }
+
+    function hardDrop() {
+      if (!active || state !== 'PLAYING') return;
+      const gy = ghostYPosition(active);
+      const dist = gy - active.y;
+      if (dist <= 0) {
+        // still lock after gravity/lock rules; but hard drop is instant place anyway
+        active.y = gy;
+      } else {
+        active.y = gy;
+      }
+      // Hard drop scoring: +2 points per cell dropped
+      score += 2 * Math.max(0, dist);
+      playHardDropSound(Math.max(1, dist));
+
+      // Lock immediately (after hard drop, place)
+      // Hard drop is to ghost position: instant place -> we place now
+      lockTimer = 0;
+      lockActive = false;
+      lockResets = 0;
+      lockPiece();
+    }
+
+    function softDropStep() {
+      if (!active || state !== 'PLAYING') return;
+      if (canMove(active, 0, 1)) {
+        active.y += 1;
+        score += 1; // soft drop +1 per cell
+        // Movement resets lock delay if currently in lock window
+        if (lockActive) scheduleLockInterrupt();
+      } else {
+        // Can't move down => trigger lock timer
+        if (!lockActive && pieceWouldLandSoon()) {
+          lockActive = true;
+          lockTimer = 0;
+          lockResets = 0;
+        }
+      }
+    }
+
+    function tryMove(dx) {
+      if (!active || state !== 'PLAYING') return;
+      if (canMove(active, dx, 0)) {
+        active.x += dx;
+        scheduleLockInterrupt();
+        playMoveSound();
+        return true;
+      }
+      return false;
+    }
+
+    // Rendering helpers
+    function drawCell(x, y, color, alpha=1, isFlash=false) {
+      const px = PLAY_X + x * CELL;
+      const py = PLAY_Y + y * CELL;
+
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      // Base fill
+      ctx.fillStyle = color;
+      ctx.fillRect(px, py, CELL, CELL);
+
+      // 1px darker border for 3D effect (plus grid line already)
+      const inner = CELL - 2;
+      ctx.fillStyle = 'rgba(0,0,0,0.25)';
+      ctx.fillRect(px+1, py+1, inner, inner);
+
+      // restore stroke to show cell boundaries subtly
+      ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(px+1.5, py+1.5, CELL-3, CELL-3);
+
+      if (isFlash) {
+        ctx.fillStyle = 'rgba(255,255,255,1)';
+        ctx.globalAlpha = 1;
+        ctx.fillRect(px, py, CELL, CELL);
+        ctx.globalAlpha = alpha;
+      }
+
+      ctx.restore();
+    }
+
+    function drawBoard() {
+      // Playfield background & border
+      ctx.fillStyle = PLAYFIELD_BG;
+      ctx.fillRect(PLAY_X, PLAY_Y, PLAY_W, PLAY_H);
+
+      // Border
+      ctx.strokeStyle = BORDER;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(PLAY_X, PLAY_Y, PLAY_W, PLAY_H);
+
+      // Grid lines (1px #333333)
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = GRID_LINE;
+      for (let c = 1; c < COLS; c++) {
+        const x = PLAY_X + c * CELL;
+        ctx.beginPath();
+        ctx.moveTo(x, PLAY_Y);
+        ctx.lineTo(x, PLAY_Y + PLAY_H);
+        ctx.stroke();
+      }
+      for (let r = 1; r < ROWS; r++) {
+        const y = PLAY_Y + r * CELL;
+        ctx.beginPath();
+        ctx.moveTo(PLAY_X, y);
+        ctx.lineTo(PLAY_X + PLAY_W, y);
+        ctx.stroke();
+      }
+
+      // Draw placed blocks
+      for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+          const t = board[r][c];
+          if (t) drawCell(c, r, COLORS[t], 1, rowFlashRows.includes(r));
+        }
+      }
+    }
+
+    function drawPiece(piece, alpha=1) {
+      if (!piece) return;
+      const color = COLORS[piece.type];
+      const cells = pieceCells(piece);
+      for (const [x,y] of cells) {
+        if (y < 0 || y >= ROWS || x < 0 || x >= COLS) continue;
+        drawCell(x, y, color, alpha, false);
+      }
+    }
+
+    function drawGhost() {
+      if (!active || state !== 'PLAYING') return;
+      const gy = ghostYPosition(active);
+      const ghost = { ...active, y: gy };
+      const color = COLORS[ghost.type];
+      // 30% opacity: apply alpha 0.3 to existing render
+      drawPiece(ghost, 0.3);
+    }
+
+    function drawNextPreview() {
+      // Next label and 4x4 preview box at x=560 y=60
+      ctx.fillStyle = '#111';
+      // Draw label
+      ctx.font = '14px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+      ctx.fillStyle = '#AAAAAA';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillText('NEXT', PANEL_X, 40);
+
+      const boxX = PANEL_X;
+      const boxY = 60;
+      const boxW = 4 * CELL; // 112
+      const boxH = 4 * CELL;
+
+      // Preview background (subtle)
+      ctx.fillStyle = 'rgba(0,0,0,0.15)';
+      ctx.fillRect(boxX, boxY, boxW, boxH);
+      ctx.strokeStyle = 'rgba(85,85,85,0.9)';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(boxX, boxY, boxW, boxH);
+
+      // grid lines inside
+      ctx.strokeStyle = 'rgba(51,51,51,0.9)';
+      ctx.lineWidth = 1;
+      for (let i=1;i<4;i++){
+        ctx.beginPath();
+        ctx.moveTo(boxX+i*CELL, boxY);
+        ctx.lineTo(boxX+i*CELL, boxY+boxH);
+        ctx.stroke();
+      }
+      for (let i=1;i<4;i++){
+        ctx.beginPath();
+        ctx.moveTo(boxX, boxY+i*CELL);
+        ctx.lineTo(boxX+boxW, boxY+i*CELL);
+        ctx.stroke();
+      }
+
+      if (!nextType) return;
+      // Preview uses rotation state 0 (as spawn uses rot=0)
+      const blocks = getBlocks(nextType, 0);
+      const color = COLORS[nextType];
+
+      // Draw blocks in 4x4 grid using local coords
+      for (const [dx,dy] of blocks) {
+        const px = boxX + dx*CELL;
+        const py = boxY + dy*CELL;
+        ctx.save();
+        // reuse drawCell logic but with custom coords:
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = color;
+        ctx.fillRect(px, py, CELL, CELL);
+        ctx.fillStyle = 'rgba(0,0,0,0.25)';
+        ctx.fillRect(px+1, py+1, CELL-2, CELL-2);
+        ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(px+1.5, py+1.5, CELL-3, CELL-3);
+        ctx.restore();
+      }
+    }
+
+    function drawHUD() {
+      ctx.font = '14px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+      ctx.fillStyle = '#AAAAAA';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+
+      // SCORE
+      ctx.fillText('SCORE', PANEL_X, 200);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = '20px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+      ctx.fillText(String(score).padStart(1,' '), PANEL_X, 224);
+
+      // LEVEL
+      ctx.fillStyle = '#AAAAAA';
+      ctx.font = '14px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+      ctx.fillText('LEVEL', PANEL_X, 280);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = '20px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+      ctx.fillText(String(level), PANEL_X, 304);
+
+      // LINES
+      ctx.fillStyle = '#AAAAAA';
+      ctx.font = '14px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+      ctx.fillText('LINES', PANEL_X, 340);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = '20px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+      ctx.fillText(String(linesTotal), PANEL_X, 364);
+
+      // HIGH SCORE
+      ctx.fillStyle = '#AAAAAA';
+      ctx.font = '14px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+      ctx.fillText('HIGH SCORE', PANEL_X, 420);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = '20px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+      ctx.fillText(String(highScore), PANEL_X, 444);
+    }
+
+    function drawStartScreen() {
+      // Start overlay text and 7 piece shapes below
+      ctx.save();
+      // Playfield area label "TETRIS" y=200 48px white centered
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = '48px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillText('TETRIS', PLAY_X + PLAY_W/2, PLAY_Y + 200);
+
+      // Draw all 7 piece shapes below in their colors
+      // Layout: 4 columns x 2 rows within playfield-ish area
+      const startX = PLAY_X + 10;
+      const startY = PLAY_Y + 260;
+      const gapX = 60;
+      const gapY = 80;
+
+      const placements = [
+        {t:'I', ix:0, iy:0},
+        {t:'O', ix:1, iy:0},
+        {t:'T', ix:2, iy:0},
+        {t:'S', ix:0, iy:1},
+        {t:'Z', ix:1, iy:1},
+        {t:'J', ix:2, iy:1},
+        {t:'L', ix:3, iy:1}
+      ];
+
+      for (const p of placements) {
+        const blocks = getBlocks(p.t, 0);
+        // normalize into a 3x3-ish size for display by shifting to top-left.
+        let minX = Infinity, minY = Infinity;
+        for (const [dx,dy] of blocks) { minX = Math.min(minX, dx); minY = Math.min(minY, dy); }
+        // We'll draw at CELL=28 scale but resized to fit inside playfield area; use 18px display cell
+        const dispCell = 18;
+        const bx = startX + p.ix*gapX;
+        const by = startY + p.iy*gapY;
+        // Draw blocks
+        for (const [dx,dy] of blocks) {
+          const gx = dx - minX;
+          const gy = dy - minY;
+          const px = bx + gx*dispCell;
+          const py = by + gy*dispCell;
+
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = COLORS[p.t];
+          ctx.fillRect(px, py, dispCell, dispCell);
+          ctx.fillStyle = 'rgba(0,0,0,0.25)';
+          ctx.fillRect(px+1, py+1, dispCell-2, dispCell-2);
+          ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+          ctx.lineWidth = 1;
+          ctx.strokeRect(px+1.5, py+1.5, dispCell-3, dispCell-3);
+        }
+      }
+
+      ctx.fillStyle = '#AAAAAA';
+      ctx.font = '18px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+      ctx.fillText('Press Enter to Start', PLAY_X + PLAY_W/2, PLAY_Y + 420);
+      ctx.restore();
+    }
+
+    function drawPauseScreen() {
+      ctx.save();
+      ctx.fillStyle = '#000000CC';
+      ctx.fillRect(PLAY_X, PLAY_Y, PLAY_W, PLAY_H);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = '36px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillText('PAUSED', PLAY_X + PLAY_W/2, PLAY_Y + 280);
+      ctx.restore();
+    }
+
+    function drawGameOverScreen() {
+      ctx.save();
+      ctx.fillStyle = '#000000CC';
+      ctx.fillRect(PLAY_X, PLAY_Y, PLAY_W, PLAY_H);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = '36px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillText('GAME OVER', PLAY_X + PLAY_W/2, PLAY_Y + 200);
+
+      ctx.font = '24px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+      ctx.fillText('Score: ' + score, PLAY_X + PLAY_W/2, PLAY_Y + 260);
+
+      ctx.font = '18px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+      ctx.fillStyle = '#AAAAAA';
+      ctx.fillText('Press Enter to Restart', PLAY_X + PLAY_W/2, PLAY_Y + 420);
+      ctx.restore();
+    }
+
+    function update(dtMs) {
+      if (state !== 'PLAYING') return;
+
+      // Handle gravity tick accumulation
+      gravityIntervalMs = getGravityInterval(level);
+      const softInterval = 50;
+      const activeInterval = softDropHeld ? softInterval : gravityIntervalMs;
+
+      gravityAccum += dtMs;
+
+      // If clearing flash due, remove after 100ms
+      removeClearedRows();
+
+      // Determine lock activation
+      const touching = pieceWouldLandSoon();
+      if (touching) {
+        if (!lockActive) {
+          lockActive = true;
+          lockTimer = 0;
+          lockResets = 0;
+        }
+      } else {
+        // If not touching, clear lock
+        lockActive = false;
+        lockTimer = 0;
+        lockResets = 0;
+      }
+
+      // Gravity step
+      while (gravityAccum >= activeInterval) {
+        gravityAccum -= activeInterval;
+
+        if (!active) return;
+
+        // Attempt move down
+        if (canMove(active, 0, 1)) {
+          active.y += 1;
+          // If moving down, update lock logic will deactivate as soon as not touching
+        } else {
+          // can't move down; keep lock active and let lock delay handle
+          break;
+        }
+      }
+
+      // Lock timer handling
+      if (lockActive && active) {
+        lockTimer += dtMs;
+        if (lockTimer >= lockDelayMs) {
+          // lock piece
+          lockActive = false;
+          lockTimer = 0;
+          lockResets = 0;
+          lockPiece();
+        }
+      }
+    }
+
+    function loop(t) {
+      const now = t;
+      const dtMs = lastFrameTime ? (now - lastFrameTime) : 16.6667;
+      lastFrameTime = now;
+
+      // Background
+      ctx.fillStyle = BG;
+      ctx.fillRect(0,0,canvas.width,canvas.height);
+
+      // Draw playfield
+      drawBoard();
+
+      // Draw ghost & active
+      if (active && state === 'PLAYING') {
+        drawGhost();
+        drawPiece(active, 1);
+      } else if (active && (state === 'PAUSED')) {
+        drawPiece(active, 1);
+      } else if (active && state === 'GAME_OVER') {
+        // show last active blocks (they were already locked). active is null on gameover.
+      }
+
+      // Next preview and HUD
+      drawNextPreview();
+      drawHUD();
+
+      // Screens
+      if (state === 'IDLE') {
+        drawStartScreen();
+      } else if (state === 'PAUSED') {
+        drawPauseScreen();
+      } else if (state === 'GAME_OVER') {
+        drawGameOverScreen();
+      }
+
+      update(Math.min(50, dtMs));
+
+      requestAnimationFrame(loop);
+    }
+
+    // --- Input handling ---
+    const keys = new Set();
+    function keyDown(e) {
+      // prevent scroll (space)
+      if (['Space','ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.code)) e.preventDefault();
+      safeResumeAudio();
+
+      if (e.code === 'Enter') {
+        if (state === 'IDLE' || state === 'GAME_OVER') {
+          startNewGame();
+        } else if (state === 'PLAYING') {
+          // restart on enter as well
+          startNewGame();
+        } else if (state === 'PAUSED') {
+          // Enter acts as restart too? spec says Start/Restart; allow
+          startNewGame();
+        }
+        return;
+      }
+      if (e.code === 'KeyP') {
+        if (state === 'PLAYING') state = 'PAUSED';
+        else if (state === 'PAUSED') state = 'PLAYING';
+        return;
+      }
+
+      if (state !== 'PLAYING') {
+        // still allow pause/start only
+        return;
+      }
+
+      if (e.code === 'ArrowLeft' || e.code === 'KeyA') tryMove(-1);
+      else if (e.code === 'ArrowRight' || e.code === 'KeyD') tryMove(1);
+      else if (e.code === 'ArrowUp' || e.code === 'KeyW') tryRotate(1);
+      else if (e.code === 'KeyZ') tryRotate(-1);
+      else if (e.code === 'ArrowDown' || e.code === 'KeyS') {
+        softDropHeld = true;
+        // immediate soft step responsiveness
+        softDropStep();
+      }
+      else if (e.code === 'Space') {
+        hardDrop();
+      }
+    }
+
+    function keyUp(e) {
+      if (e.code === 'ArrowDown' || e.code === 'KeyS') {
+        softDropHeld = false;
+      }
+    }
+
+    window.addEventListener('keydown', keyDown, { passive:false });
+    window.addEventListener('keyup', keyUp, { passive:true });
+
+    // Unlock audio on first pointer interaction
+    window.addEventListener('pointerdown', () => { safeResumeAudio(); }, { once:true });
+
+    // --- Init ---
+    highScore = parseInt(localStorage.getItem('tetris_high_score') || '0', 10) || 0;
+    board = emptyBoard();
+    state = 'IDLE';
+    active = null;
+    nextType = 'I';
+
+    // initialize preview bag deterministically for start screen
+    initBagAndPreview();
+    // Since we use takeNextTypeAndRefill to spawn, for preview while idle we just show nextType from init.
+    // Ensure nextType is set.
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>

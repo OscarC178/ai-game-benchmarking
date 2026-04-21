@@ -1,0 +1,493 @@
+<!--
+  GAME:           Pac-Man
+  RUN:            run5-opus-gemini
+  BUILDER:        google/gemini-3.1-pro-preview
+  PLANNER:        anthropic/claude-opus-4-6
+  TIMESTAMP:      2026-03-31T08:39:00Z
+  TASKS DONE:     T01,T02,T03,T04,T05,T06,T07
+  FIRST FAILURE:  none
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pac-Man</title>
+    <style>
+        body {
+            background-color: #000000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            overflow: hidden;
+            font-family: monospace;
+            color: #FFFFFF;
+        }
+        canvas {
+            background-color: #000000;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas" width="700" height="780"></canvas>
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        // Constants
+        const CELL_SIZE = 24;
+        const MAZE_OFFSET_X = 14;
+        const MAZE_OFFSET_Y = 30;
+        const COLS = 28;
+        const ROWS = 31;
+        
+        const PAC_START_X = 14 * CELL_SIZE; // Col 14
+        const PAC_START_Y = 23.5 * CELL_SIZE; // Row 23.5 (approx center bottom)
+
+        // State Machine
+        const STATE = {
+            IDLE: 0,
+            READY: 1, // 2s before play
+            PLAYING: 2,
+            PAUSED: 3,
+            DYING: 4,
+            GAME_OVER: 5,
+            LEVEL_CLEAR: 6
+        };
+        let currentState = STATE.IDLE;
+        let savedStateBeforePause = STATE.IDLE;
+        let stateTimer = 0;
+
+        // Input
+        const keys = {
+            ArrowUp: false, ArrowDown: false, ArrowLeft: false, ArrowRight: false,
+            w: false, s: false, a: false, d: false,
+            W: false, S: false, A: false, D: false
+        };
+
+        window.addEventListener('keydown', (e) => {
+            if (keys.hasOwnProperty(e.key)) keys[e.key] = true;
+            if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) e.preventDefault();
+
+            if (e.key === 'Enter') {
+                if (currentState === STATE.IDLE || currentState === STATE.GAME_OVER) {
+                    initGame();
+                }
+            } else if (e.key.toLowerCase() === 'p') {
+                if (currentState === STATE.PLAYING) {
+                    savedStateBeforePause = currentState;
+                    currentState = STATE.PAUSED;
+                } else if (currentState === STATE.PAUSED) {
+                    currentState = savedStateBeforePause;
+                }
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            if (keys.hasOwnProperty(e.key)) keys[e.key] = false;
+        });
+
+        // Directions
+        const DIR = { NONE: 0, UP: 1, DOWN: 2, LEFT: 3, RIGHT: 4 };
+
+        // Game State Variables
+        let score = 0;
+        let dotsEaten = 0;
+        let map = [];
+        let timeAcc = 0; // For mouth animation at 10Hz
+
+        // Entities
+        const pacman = {
+            x: PAC_START_X,
+            y: PAC_START_Y,
+            dir: DIR.LEFT,
+            nextDir: DIR.NONE,
+            speed: 120, // px/s
+            reqDirTime: 0
+        };
+
+        // Ghost Types
+        const GHOSTS = {
+            BLINKY: { id: 0, color: '#FF0000', startC: 13.5, startR: 11 }, // Outside
+            PINKY: { id: 1, color: '#FFB8FF', startC: 13.5, startR: 14 },  // Inside
+            INKY: { id: 2, color: '#00FFFF', startC: 11.5, startR: 14 },   // Inside
+            CLYDE: { id: 3, color: '#FFB852', startC: 15.5, startR: 14 }    // Inside
+        };
+
+        let ghosts = [];
+
+        // Map Encoding
+        const initialMap = [
+            [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+            [1,2,2,2,2,2,2,2,2,2,2,2,2,1,1,2,2,2,2,2,2,2,2,2,2,2,2,1],
+            [1,2,1,1,1,1,2,1,1,1,1,1,2,1,1,2,1,1,1,1,1,2,1,1,1,1,2,1],
+            [1,3,1,1,1,1,2,1,1,1,1,1,2,1,1,2,1,1,1,1,1,2,1,1,1,1,3,1],
+            [1,2,1,1,1,1,2,1,1,1,1,1,2,1,1,2,1,1,1,1,1,2,1,1,1,1,2,1],
+            [1,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,1],
+            [1,2,1,1,1,1,2,1,1,2,1,1,1,1,1,1,1,1,2,1,1,2,1,1,1,1,2,1],
+            [1,2,1,1,1,1,2,1,1,2,1,1,1,1,1,1,1,1,2,1,1,2,1,1,1,1,2,1],
+            [1,2,2,2,2,2,2,1,1,2,2,2,2,1,1,2,2,2,2,1,1,2,2,2,2,2,2,1],
+            [1,1,1,1,1,1,2,1,1,1,1,1,0,1,1,0,1,1,1,1,1,2,1,1,1,1,1,1],
+            [0,0,0,0,0,1,2,1,1,1,1,1,0,1,1,0,1,1,1,1,1,2,1,0,0,0,0,0],
+            [0,0,0,0,0,1,2,1,1,0,0,0,0,0,0,0,0,0,0,1,1,2,1,0,0,0,0,0],
+            [1,1,1,1,1,1,2,1,1,0,1,1,1,5,5,1,1,1,0,1,1,2,1,1,1,1,1,1],
+            [6,0,0,0,0,0,2,0,0,0,1,4,4,4,4,4,4,1,0,0,0,2,0,0,0,0,0,6],
+            [1,1,1,1,1,1,2,1,1,0,1,4,4,4,4,4,4,1,0,1,1,2,1,1,1,1,1,1],
+            [0,0,0,0,0,1,2,1,1,0,1,1,1,1,1,1,1,1,0,1,1,2,1,0,0,0,0,0],
+            [0,0,0,0,0,1,2,1,1,0,0,0,0,0,0,0,0,0,0,1,1,2,1,0,0,0,0,0],
+            [1,1,1,1,1,1,2,1,1,0,1,1,1,1,1,1,1,1,0,1,1,2,1,1,1,1,1,1],
+            [1,2,2,2,2,2,2,2,2,2,2,2,2,1,1,2,2,2,2,2,2,2,2,2,2,2,2,1],
+            [1,2,1,1,1,1,2,1,1,1,1,1,2,1,1,2,1,1,1,1,1,2,1,1,1,1,2,1],
+            [1,2,1,1,1,1,2,1,1,1,1,1,2,1,1,2,1,1,1,1,1,2,1,1,1,1,2,1],
+            [1,3,2,2,1,1,2,2,2,2,2,2,2,0,0,2,2,2,2,2,2,2,1,1,2,2,3,1],
+            [1,1,1,2,1,1,2,1,1,2,1,1,1,1,1,1,1,1,2,1,1,2,1,1,2,1,1,1],
+            [1,1,1,2,1,1,2,1,1,2,1,1,1,1,1,1,1,1,2,1,1,2,1,1,2,1,1,1],
+            [1,2,2,2,2,2,2,1,1,2,2,2,2,1,1,2,2,2,2,1,1,2,2,2,2,2,2,1],
+            [1,2,1,1,1,1,1,1,1,1,1,1,2,1,1,2,1,1,1,1,1,1,1,1,1,1,2,1],
+            [1,2,1,1,1,1,1,1,1,1,1,1,2,1,1,2,1,1,1,1,1,1,1,1,1,1,2,1],
+            [1,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,1],
+            [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]
+        ];
+        initialMap.push([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]);
+        initialMap.push([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]);
+
+        function initGhosts() {
+            ghosts = [
+                { type: GHOSTS.BLINKY, x: GHOSTS.BLINKY.startC * CELL_SIZE, y: GHOSTS.BLINKY.startR * CELL_SIZE, dir: DIR.LEFT, released: true },
+                { type: GHOSTS.PINKY, x: GHOSTS.PINKY.startC * CELL_SIZE, y: GHOSTS.PINKY.startR * CELL_SIZE, dir: DIR.UP, released: true }, // exits immediately per spec
+                { type: GHOSTS.INKY, x: GHOSTS.INKY.startC * CELL_SIZE, y: GHOSTS.INKY.startR * CELL_SIZE, dir: DIR.UP, released: false }, // 30 dots
+                { type: GHOSTS.CLYDE, x: GHOSTS.CLYDE.startC * CELL_SIZE, y: GHOSTS.CLYDE.startR * CELL_SIZE, dir: DIR.UP, released: false } // 60 dots
+            ];
+        }
+
+        function initGame() {
+            map = initialMap.map(row => [...row]);
+            score = 0;
+            dotsEaten = 0;
+            
+            pacman.x = PAC_START_X;
+            pacman.y = PAC_START_Y;
+            pacman.dir = DIR.LEFT;
+            pacman.nextDir = DIR.NONE;
+
+            initGhosts();
+
+            currentState = STATE.READY;
+            stateTimer = 2; // 2 seconds delay
+            console.log("Game Started (READY state)");
+        }
+
+        function getMapCell(x, y) {
+            // Coordinate space is pixel-based relative to maze top-left (before offset)
+            const c = Math.floor(x / CELL_SIZE);
+            const r = Math.floor(y / CELL_SIZE);
+            if (r < 0 || r >= ROWS || c < -1 || c > COLS) return 1; // Out of bounds = wall
+            
+            // Handle Tunnel wrapped indices
+            if (c < 0) return (r === 14) ? 6 : 1; 
+            if (c >= COLS) return (r === 14) ? 6 : 1;
+
+            return map[r][c];
+        }
+
+        function canMove(x, y, dir) {
+            // Check if moving to this tile is valid
+            let tx = x;
+            let ty = y;
+
+            if (dir === DIR.UP) ty -= CELL_SIZE;
+            else if (dir === DIR.DOWN) ty += CELL_SIZE;
+            else if (dir === DIR.LEFT) tx -= CELL_SIZE;
+            else if (dir === DIR.RIGHT) tx += CELL_SIZE;
+
+            // Sample edges of the next tile
+            const c1 = getMapCell(tx + 2, ty + 2);
+            const c2 = getMapCell(tx + CELL_SIZE - 2, ty + CELL_SIZE - 2);
+
+            return c1 !== 1 && c2 !== 1 && c1 !== 4 && c2 !== 4; // Path, dot, pellet, tunnel, or gate are valid for pacman (well gate is wall for pacman usually, but simplified here). Let's restrict gate block later.
+        }
+
+        function isIntersectCenter(x, y, threshold = 4) { // Cornering assist 4px
+            const centerX = Math.floor(x / CELL_SIZE) * CELL_SIZE;
+            const centerY = Math.floor(y / CELL_SIZE) * CELL_SIZE;
+            return Math.abs(x - centerX) <= threshold && Math.abs(y - centerY) <= threshold;
+        }
+
+        function updatePacman(dt) {
+            // Input to nextDir
+            if (keys.ArrowUp || keys.w || keys.W) pacman.nextDir = DIR.UP;
+            else if (keys.ArrowDown || keys.s || keys.S) pacman.nextDir = DIR.DOWN;
+            else if (keys.ArrowLeft || keys.a || keys.A) pacman.nextDir = DIR.LEFT;
+            else if (keys.ArrowRight || keys.d || keys.D) pacman.nextDir = DIR.RIGHT;
+
+            let spd = pacman.speed * dt;
+            let inTunnel = getMapCell(pacman.x, pacman.y) === 6;
+            if (inTunnel) spd *= 0.6; // 60% speed in tunnel
+
+            // Try to apply nextDir if near intersection center
+            if (pacman.nextDir !== DIR.NONE && pacman.nextDir !== pacman.dir) {
+                // If it's a 180 reverse, do it instantly
+                if ((pacman.dir === DIR.LEFT && pacman.nextDir === DIR.RIGHT) || 
+                    (pacman.dir === DIR.RIGHT && pacman.nextDir === DIR.LEFT) || 
+                    (pacman.dir === DIR.UP && pacman.nextDir === DIR.DOWN) || 
+                    (pacman.dir === DIR.DOWN && pacman.nextDir === DIR.UP)) {
+                    pacman.dir = pacman.nextDir;
+                    pacman.nextDir = DIR.NONE;
+                } else if (isIntersectCenter(pacman.x, pacman.y, 4)) {
+                    // Snap to grid axis for cornering
+                    const gridX = Math.round(pacman.x / CELL_SIZE) * CELL_SIZE;
+                    const gridY = Math.round(pacman.y / CELL_SIZE) * CELL_SIZE;
+                    
+                    if (canMove(gridX, gridY, pacman.nextDir)) {
+                        pacman.x = gridX;
+                        pacman.y = gridY;
+                        pacman.dir = pacman.nextDir;
+                        pacman.nextDir = DIR.NONE;
+                    }
+                }
+            }
+
+            // Move current dir
+            let targetX = pacman.x;
+            let targetY = pacman.y;
+            
+            // Check wall collision slightly ahead
+            let canForward = true;
+            if (isIntersectCenter(pacman.x, pacman.y, 1)) {
+                 canForward = canMove(pacman.x, pacman.y, pacman.dir);
+            }
+
+            if (canForward) {
+                if (pacman.dir === DIR.UP) targetY -= spd;
+                else if (pacman.dir === DIR.DOWN) targetY += spd;
+                else if (pacman.dir === DIR.LEFT) targetX -= spd;
+                else if (pacman.dir === DIR.RIGHT) targetX += spd;
+
+                // Stop exactly at grid if next tile is wall
+                if (!canMove(pacman.x, pacman.y, pacman.dir) && isIntersectCenter(targetX, targetY, spd)) {
+                    targetX = Math.round(targetX / CELL_SIZE) * CELL_SIZE;
+                    targetY = Math.round(targetY / CELL_SIZE) * CELL_SIZE;
+                }
+
+                pacman.x = targetX;
+                pacman.y = targetY;
+            }
+
+            // Tunnel Wrap
+            if (pacman.x < -CELL_SIZE) pacman.x = COLS * CELL_SIZE;
+            if (pacman.x > COLS * CELL_SIZE) pacman.x = -CELL_SIZE;
+
+            // Eat dots
+            const cPos = Math.round(pacman.x / CELL_SIZE);
+            const rPos = Math.round(pacman.y / CELL_SIZE);
+            if (rPos >= 0 && rPos < ROWS && cPos >= 0 && cPos < COLS) {
+                if (map[rPos][cPos] === 2) { // Small dot
+                    map[rPos][cPos] = 0;
+                    score += 10;
+                    dotsEaten++;
+                } else if (map[rPos][cPos] === 3) { // Power pellet
+                    map[rPos][cPos] = 0;
+                    score += 50;
+                    dotsEaten++;
+                    // Power pellet trigger logic to come
+                }
+                
+                // Release Ghosts
+                if (!ghosts[2].released && dotsEaten >= 30) ghosts[2].released = true;
+                if (!ghosts[3].released && dotsEaten >= 60) ghosts[3].released = true;
+            }
+        }
+
+        let lastTime = 0;
+
+        function update(dt) {
+            timeAcc += dt;
+            if (currentState === STATE.READY) {
+                stateTimer -= dt;
+                if (stateTimer <= 0) {
+                    currentState = STATE.PLAYING;
+                }
+            } else if (currentState === STATE.PLAYING) {
+                updatePacman(dt);
+            }
+        }
+
+        function drawMap() {
+            ctx.save();
+            ctx.translate(MAZE_OFFSET_X, MAZE_OFFSET_Y);
+
+            for (let r = 0; r < ROWS; r++) {
+                for (let c = 0; c < COLS; c++) {
+                    const cx = c * CELL_SIZE;
+                    const cy = r * CELL_SIZE;
+                    const val = map[r][c];
+
+                    if (val === 1) {
+                        ctx.fillStyle = '#2121DE';
+                        ctx.fillRect(cx, cy, CELL_SIZE, CELL_SIZE);
+                        ctx.fillStyle = '#000000';
+                        ctx.fillRect(cx + 2, cy + 2, CELL_SIZE - 4, CELL_SIZE - 4);
+                    } else if (val === 2) {
+                        ctx.fillStyle = '#FFCC99';
+                        ctx.beginPath();
+                        ctx.arc(cx + CELL_SIZE/2, cy + CELL_SIZE/2, 2, 0, Math.PI * 2);
+                        ctx.fill();
+                    } else if (val === 3) {
+                        if (Math.floor(timeAcc * 4) % 2 === 0) {
+                            ctx.fillStyle = '#FFCC99';
+                            ctx.beginPath();
+                            ctx.arc(cx + CELL_SIZE/2, cy + CELL_SIZE/2, 5, 0, Math.PI * 2);
+                            ctx.fill();
+                        }
+                    } else if (val === 5) { // Gate
+                        ctx.fillStyle = '#FFB8FF';
+                        ctx.fillRect(cx, cy + CELL_SIZE/2 - 2, CELL_SIZE, 4);
+                    }
+                }
+            }
+            ctx.restore();
+        }
+
+        function drawPacman() {
+            ctx.save();
+            ctx.translate(MAZE_OFFSET_X + pacman.x + CELL_SIZE/2, MAZE_OFFSET_Y + pacman.y + CELL_SIZE/2);
+            
+            // Rotation based on dir
+            if (pacman.dir === DIR.DOWN) ctx.rotate(Math.PI/2);
+            else if (pacman.dir === DIR.LEFT) ctx.rotate(Math.PI);
+            else if (pacman.dir === DIR.UP) ctx.rotate(-Math.PI/2);
+            
+            // Mouth animation (10Hz wedge 45deg)
+            let mouthPhase = (Math.floor(timeAcc * 10) % 2 === 0);
+            let angleOffset = mouthPhase ? 0.25 * Math.PI : 0; // 0 to 45 deg gap
+
+            ctx.fillStyle = '#FFFF00';
+            ctx.beginPath();
+            if (angleOffset > 0) {
+                ctx.moveTo(0, 0);
+                ctx.arc(0, 0, 10, angleOffset, Math.PI * 2 - angleOffset);
+            } else {
+                ctx.arc(0, 0, 10, 0, Math.PI * 2);
+            }
+            ctx.fill();
+            
+            ctx.restore();
+        }
+
+        function drawGhosts() {
+            for (let g of ghosts) {
+                ctx.save();
+                ctx.translate(MAZE_OFFSET_X + g.x + CELL_SIZE/2, MAZE_OFFSET_Y + g.y + CELL_SIZE/2);
+
+                // Body (semicircle + drops)
+                ctx.fillStyle = g.type.color;
+                ctx.beginPath();
+                ctx.arc(0, -2, 10, Math.PI, 0); // Top dome
+                ctx.lineTo(10, 10);
+                // Wavy bottom
+                ctx.lineTo(6, 6);
+                ctx.lineTo(2, 10);
+                ctx.lineTo(-2, 6);
+                ctx.lineTo(-6, 10);
+                ctx.lineTo(-10, 6);
+                ctx.lineTo(-10, -2);
+                ctx.fill();
+
+                // Eyes
+                ctx.fillStyle = '#FFFFFF';
+                // Move eyes based on dir
+                let ex = 0, ey = 0;
+                if (g.dir === DIR.UP) ey = -2;
+                if (g.dir === DIR.DOWN) ey = 2;
+                if (g.dir === DIR.LEFT) ex = -2;
+                if (g.dir === DIR.RIGHT) ex = 2;
+
+                ctx.beginPath();
+                ctx.arc(-4 + ex, -3 + ey, 3, 0, Math.PI*2);
+                ctx.arc(4 + ex, -3 + ey, 3, 0, Math.PI*2);
+                ctx.fill();
+
+                // Pupils
+                ctx.fillStyle = '#0000FF'; // Blue pupil per spec
+                ctx.beginPath();
+                ctx.arc(-4 + ex * 1.5, -3 + ey * 1.5, 1.5, 0, Math.PI*2);
+                ctx.arc(4 + ex * 1.5, -3 + ey * 1.5, 1.5, 0, Math.PI*2);
+                ctx.fill();
+
+                ctx.restore();
+            }
+        }
+
+        function draw() {
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            if (currentState !== STATE.IDLE) {
+                drawMap();
+                drawPacman();
+                drawGhosts();
+            }
+
+            if (currentState === STATE.IDLE) {
+                ctx.fillStyle = '#FFFF00';
+                ctx.font = '52px monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText('PAC-MAN', canvas.width / 2, 300);
+                
+                ctx.fillStyle = '#AAAAAA';
+                ctx.font = '24px monospace';
+                ctx.fillText('Press Enter to Start', canvas.width / 2, 500);
+            } else if (currentState === STATE.READY) {
+                ctx.fillStyle = '#FFFF00';
+                ctx.font = '16px monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText('READY!', canvas.width / 2, MAZE_OFFSET_Y + 17 * CELL_SIZE + 12);
+            } else if (currentState === STATE.PAUSED) {
+                ctx.fillStyle = 'rgba(0,0,0,0.8)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.fillStyle = '#FFFFFF';
+                ctx.font = '36px monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText('PAUSED', canvas.width / 2, canvas.height / 2);
+            }
+            
+            // Score debug
+            if (currentState !== STATE.IDLE) {
+                ctx.fillStyle = '#FFFFFF';
+                ctx.font = '16px monospace';
+                ctx.textAlign = 'left';
+                ctx.fillText(`Score: ${score}`, 14, 20);
+            }
+        }
+
+        function loop(timestamp) {
+            const dt = lastTime ? (timestamp - lastTime) / 1000 : 0;
+            const safeDt = Math.min(dt, 0.1); 
+            lastTime = timestamp;
+
+            update(safeDt);
+            draw();
+
+            requestAnimationFrame(loop);
+  // QA state bridge (auto-injected by patch_qa_bridge.py)
+  try { window.__qa = {
+    stateNum:  typeof state !== 'undefined' ? state : (typeof gameState !== 'undefined' ? gameState : null),
+    pacX:      typeof pac   !== 'undefined' ? (pac.x  != null ? pac.x  : null) : null,
+    pacY:      typeof pac   !== 'undefined' ? (pac.y  != null ? pac.y  : null) : null,
+    pacDx:     typeof pac   !== 'undefined' ? (pac.dx != null ? pac.dx : null) : null,
+    pacDy:     typeof pac   !== 'undefined' ? (pac.dy != null ? pac.dy : null) : null,
+    pacNextDx: typeof pac   !== 'undefined' ? (pac.nextDx != null ? pac.nextDx : (pac.requestedDx != null ? pac.requestedDx : null)) : null,
+    pacNextDy: typeof pac   !== 'undefined' ? (pac.nextDy != null ? pac.nextDy : (pac.requestedDy != null ? pac.requestedDy : null)) : null,
+    score:     typeof score !== 'undefined' ? score : null,
+    lives:     typeof lives !== 'undefined' ? lives : null,
+    ts: Date.now(),
+  }; } catch(e) { window.__qaErr = String(e); }
+
+        }
+
+        requestAnimationFrame(loop);
+    </script>
+</body>
+</html>

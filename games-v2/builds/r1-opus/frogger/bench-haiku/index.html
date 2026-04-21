@@ -1,0 +1,564 @@
+<!--
+  GAME:      Frogger
+  RUN:       r1-opus
+  BUILDER:   anthropic/claude-haiku-4.5
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Frogger</title>
+  <style>
+    html, body { margin: 0; padding: 0; background: #000; display: flex; justify-content: center; align-items: center; height: 100vh; font-family: monospace; }
+    canvas { background: #000; display: block; border: 2px solid #333; }
+  </style>
+</head>
+<body>
+  <canvas id="frogger" width="644" height="740"></canvas>
+  <script>
+    'use strict';
+    const canvas = document.getElementById('frogger');
+    const ctx = canvas.getContext('2d');
+    
+    const STATES = { TITLE: 0, PLAYING: 1, PAUSED: 2, DEATH: 3, LEVEL_CLEAR: 4, GAME_OVER: 5 };
+    const CELL_W = 46, CELL_H = 46, GRID_OFFSET_Y = 26;
+    
+    let gameState = STATES.TITLE;
+    let score = 0, bestScore = parseInt(localStorage.getItem('frogger_best') || '0');
+    let lives = 3, level = 1, gameTime = 0, isPaused = false;
+    
+    let frog = { col: 7, row: 12, x: 7 * CELL_W + CELL_W / 2, y: 12 * CELL_H + GRID_OFFSET_Y + CELL_H / 2, hopStartTime: 0, hopDir: null };
+    let farthestRow = 12, timer = 30, deathTime = 0;
+    
+    let vehicles = [], logs = [], turtles = [], frogDead = false;
+    let keys = {}, keyWasPressed = {};
+    let audioCtx = null;
+    
+    function initLevel() {
+      const speedMult = Math.min(1 + (level - 1) * 0.15, 2.5);
+      const riverMult = Math.min(1 + (level - 1) * 0.1, 2);
+      
+      vehicles = [];
+      const vehicleSpecs = [
+        { row: 7, size: 42, color: '#FFCC00', dir: -1, speed: 80 * speedMult, gap: 140 },
+        { row: 8, size: 42, color: '#FF4444', dir: 1, speed: 130 * speedMult, gap: 160 },
+        { row: 9, size: 88, color: '#CCCCCC', dir: -1, speed: 60 * speedMult, gap: 200 },
+        { row: 10, size: 42, color: '#FF8800', dir: 1, speed: 100 * speedMult, gap: 120 },
+        { row: 11, size: 42, color: '#FF44FF', dir: -1, speed: 140 * speedMult, gap: 180 }
+      ];
+      
+      for (let spec of vehicleSpecs) {
+        let x = 0;
+        while (x < 800) {
+          vehicles.push({
+            x: x, row: spec.row, width: spec.size, height: 36, color: spec.color,
+            dir: spec.dir, speed: spec.speed
+          });
+          x += spec.size + spec.gap;
+        }
+      }
+      
+      logs = [];
+      const logSpecs = [
+        { row: 1, width: 138, color: '#8B4513', dir: 1, speed: 70 * riverMult },
+        { row: 3, width: 184, color: '#A0522D', dir: 1, speed: 50 * riverMult },
+        { row: 5, width: 92, color: '#6B3410', dir: 1, speed: 100 * riverMult }
+      ];
+      
+      for (let spec of logSpecs) {
+        let x = -spec.width;
+        while (x < 700) {
+          logs.push({
+            x: x, row: spec.row, width: spec.width, height: 40, color: spec.color,
+            dir: spec.dir, speed: spec.speed
+          });
+          x += spec.width + 100;
+        }
+      }
+      
+      turtles = [];
+      const turtleSpecs = [
+        { row: 2, groupWidth: 138, turtleCount: 3, dir: -1, speed: 60 * riverMult },
+        { row: 4, groupWidth: 92, turtleCount: 2, dir: -1, speed: 90 * riverMult }
+      ];
+      
+      for (let spec of turtleSpecs) {
+        let x = -spec.groupWidth;
+        let groupCount = 0;
+        while (x < 700) {
+          const isDiving = groupCount === 1;
+          turtles.push({
+            x: x, row: spec.row, width: spec.groupWidth, height: 40,
+            dir: spec.dir, speed: spec.speed, turtleCount: spec.turtleCount,
+            divePhase: isDiving ? 0 : -1, diveState: 'surfaced', diveTimer: 0
+          });
+          x += spec.groupWidth + 100;
+          groupCount++;
+        }
+      }
+      
+      frog.col = 7;
+      frog.row = 12;
+      frog.x = frog.col * CELL_W + CELL_W / 2;
+      frog.y = frog.row * CELL_H + GRID_OFFSET_Y + CELL_H / 2;
+      farthestRow = 12;
+      timer = Math.max(20, 30 - (level - 1) * 2);
+      frogDead = false;
+    }
+    
+    function updateGame(dt) {
+      if (isPaused) return;
+      
+      gameTime += dt;
+      timer -= dt;
+      if (timer <= 0) frogDead = true;
+      
+      for (let v of vehicles) {
+        v.x += v.dir * v.speed * dt;
+        if (v.dir > 0 && v.x > 700) v.x = -v.width;
+        if (v.dir < 0 && v.x < -v.width) v.x = 700;
+      }
+      
+      for (let log of logs) {
+        log.x += log.dir * log.speed * dt;
+        if (log.dir > 0 && log.x > 700) log.x = -log.width;
+        if (log.dir < 0 && log.x < -log.width) log.x = 700;
+      }
+      
+      for (let tg of turtles) {
+        tg.x += tg.dir * tg.speed * dt;
+        if (tg.dir > 0 && tg.x > 700) tg.x = -tg.width;
+        if (tg.dir < 0 && tg.x < -tg.width) tg.x = 700;
+        
+        if (tg.divePhase >= 0) {
+          tg.diveTimer += dt;
+          if (tg.diveState === 'surfaced' && tg.diveTimer > 4) {
+            tg.diveState = 'sinking';
+            tg.diveTimer = 0;
+          } else if (tg.diveState === 'sinking' && tg.diveTimer > 0.5) {
+            tg.diveState = 'submerged';
+            tg.diveTimer = 0;
+          } else if (tg.diveState === 'submerged' && tg.diveTimer > 2) {
+            tg.diveState = 'surfacing';
+            tg.diveTimer = 0;
+          } else if (tg.diveState === 'surfacing' && tg.diveTimer > 0.5) {
+            tg.diveState = 'surfaced';
+            tg.diveTimer = 0;
+          }
+        }
+      }
+      
+      if (frog.hopStartTime > 0) {
+        frog.hopStartTime -= dt;
+      }
+      
+      if (frog.row >= 1 && frog.row <= 5) {
+        let onPlatform = false;
+        
+        for (let log of logs) {
+          if (log.row === frog.row) {
+            if (frog.x >= log.x && frog.x <= log.x + log.width) {
+              onPlatform = true;
+              frog.x += log.dir * log.speed * dt;
+              break;
+            }
+          }
+        }
+        
+        if (!onPlatform) {
+          for (let tg of turtles) {
+            if (tg.row === frog.row && tg.diveState === 'surfaced') {
+              if (frog.x >= tg.x && frog.x <= tg.x + tg.width) {
+                onPlatform = true;
+                frog.x += tg.dir * tg.speed * dt;
+                break;
+              }
+            }
+          }
+        }
+        
+        if (!onPlatform) frogDead = true;
+      }
+      
+      if (frog.x < -20 || frog.x > 664) frogDead = true;
+      
+      for (let v of vehicles) {
+        if (frog.row === v.row) {
+          if (frog.x - 15 < v.x + v.width && frog.x + 15 > v.x) frogDead = true;
+        }
+      }
+      
+      if (frog.row === 0) {
+        const slots = [69, 183, 297, 411, 525];
+        let inSlot = false;
+        for (let i = 0; i < slots.length; i++) {
+          if (Math.abs(frog.x - slots[i]) < 23 && !frogHome[i]) {
+            frogHome[i] = true;
+            score += 50 + Math.floor(timer * 10);
+            if (score > bestScore) {
+              bestScore = score;
+              localStorage.setItem('frogger_best', bestScore);
+            }
+            inSlot = true;
+            
+            if (frogHome.filter(x => x).length === 5) {
+              gameState = STATES.LEVEL_CLEAR;
+              score += 1000;
+              return;
+            }
+            
+            frog.col = 7;
+            frog.row = 12;
+            frog.x = 7 * CELL_W + CELL_W / 2;
+            frog.y = 12 * CELL_H + GRID_OFFSET_Y + CELL_H / 2;
+            farthestRow = 12;
+            timer = Math.max(20, 30 - (level - 1) * 2);
+            break;
+          }
+        }
+        if (!inSlot && frog.hopStartTime <= 0) frogDead = true;
+      }
+      
+      if (frogDead) {
+        gameState = STATES.DEATH;
+        deathTime = 0.5;
+        lives--;
+      }
+    }
+    
+    function handleInput(key) {
+      if (gameState !== STATES.PLAYING || frog.hopStartTime > 0) return;
+      
+      let newCol = frog.col, newRow = frog.row;
+      let hopDir = null;
+      
+      if (key === 'ArrowUp' || key === 'KeyW') { newRow--; hopDir = 'up'; }
+      else if (key === 'ArrowDown' || key === 'KeyS') { newRow++; hopDir = 'down'; }
+      else if (key === 'ArrowLeft' || key === 'KeyA') { newCol--; hopDir = 'left'; }
+      else if (key === 'ArrowRight' || key === 'KeyD') { newCol++; hopDir = 'right'; }
+      
+      if (newCol >= 0 && newCol < 14 && newRow >= 0 && newRow <= 12) {
+        if (hopDir === 'up' && newRow < farthestRow) {
+          score += 10;
+          farthestRow = newRow;
+        }
+        
+        frog.col = newCol;
+        frog.row = newRow;
+        frog.hopStartTime = 0.08;
+        frog.hopDir = hopDir;
+      }
+    }
+    
+    function renderZones() {
+      ctx.fillStyle = '#226622';
+      ctx.fillRect(0, 26, 644, 46);
+      
+      ctx.fillStyle = '#003388';
+      ctx.fillRect(0, 26 + 46, 644, 46 * 5);
+      
+      ctx.fillStyle = '#332244';
+      ctx.fillRect(0, 26 + 46 * 6, 644, 46);
+      
+      ctx.fillStyle = '#1a1a1a';
+      ctx.fillRect(0, 26 + 46 * 7, 644, 46 * 5);
+      
+      ctx.fillStyle = '#33AA33';
+      ctx.fillRect(0, 26 + 46 * 12, 644, 46);
+    }
+    
+    function renderSlots() {
+      const slots = [69, 183, 297, 411, 525];
+      for (let i = 0; i < slots.length; i++) {
+        ctx.fillStyle = '#001a00';
+        ctx.fillRect(slots[i] - 20, 26, 40, 46);
+        
+        if (!frogHome[i]) {
+          ctx.fillStyle = '#33AA33';
+          ctx.beginPath();
+          ctx.ellipse(slots[i], 26 + 23, 10, 6, 0, 0, Math.PI * 2);
+          ctx.fill();
+        } else {
+          ctx.fillStyle = '#22CC22';
+          ctx.fillRect(slots[i] - 10, 26 + 13, 20, 20);
+        }
+      }
+    }
+    
+    function renderVehicles() {
+      for (let v of vehicles) {
+        ctx.fillStyle = v.color;
+        ctx.fillRect(v.x, 26 + v.row * 46 + 5, v.width, v.height);
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(v.x + 8, 26 + v.row * 46 + 8, 10, 16);
+      }
+    }
+    
+    function renderLogs() {
+      for (let log of logs) {
+        ctx.fillStyle = log.color;
+        ctx.fillRect(log.x, 26 + log.row * 46 + 3, log.width, log.height);
+        for (let i = 0; i < 3; i++) {
+          ctx.strokeStyle = '#5C2D0A';
+          ctx.beginPath();
+          ctx.moveTo(log.x + 20 + i * 50, 26 + log.row * 46 + 3);
+          ctx.lineTo(log.x + 20 + i * 50, 26 + log.row * 46 + 43);
+          ctx.stroke();
+        }
+      }
+    }
+    
+    function renderTurtles() {
+      for (let tg of turtles) {
+        let alpha = 1;
+        if (tg.diveState === 'sinking') alpha = 1 - (tg.diveTimer / 0.5);
+        else if (tg.diveState === 'surfacing') alpha = tg.diveTimer / 0.5;
+        else if (tg.diveState === 'submerged') alpha = 0;
+        
+        if (alpha > 0) {
+          ctx.globalAlpha = alpha;
+          for (let i = 0; i < tg.turtleCount; i++) {
+            const tx = tg.x + 10 + i * 40;
+            ctx.fillStyle = '#00AA44';
+            ctx.beginPath();
+            ctx.ellipse(tx, 26 + tg.row * 46 + 20, 14, 12, 0, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.fillStyle = '#33CC66';
+            ctx.beginPath();
+            ctx.moveTo(tx - 6, 26 + tg.row * 46 + 18);
+            ctx.lineTo(tx + 6, 26 + tg.row * 46 + 18);
+            ctx.lineTo(tx, 26 + tg.row * 46 + 12);
+            ctx.closePath();
+            ctx.fill();
+          }
+          ctx.globalAlpha = 1;
+        }
+      }
+    }
+    
+    function renderFrog() {
+      let renderX = frog.col * CELL_W + CELL_W / 2;
+      let renderY = frog.row * CELL_H + GRID_OFFSET_Y + CELL_H / 2;
+      
+      if (frog.hopStartTime > 0) {
+        const progress = 1 - (frog.hopStartTime / 0.08);
+        if (progress < 0.5) {
+          const scale = 1 - progress * 0.2;
+          renderX += (frog.col - 0.5) * CELL_W * progress * (frog.hopDir === 'left' ? -1 : 1);
+          renderY += (frog.row - 0.5) * CELL_H * progress * (frog.hopDir === 'up' ? -1 : 1);
+        } else {
+          renderX = frog.col * CELL_W + CELL_W / 2;
+          renderY = frog.row * CELL_H + GRID_OFFSET_Y + CELL_H / 2;
+        }
+      }
+      
+      if (gameState === STATES.DEATH) ctx.globalAlpha = Math.sin(gameTime * 20) > 0 ? 1 : 0.3;
+      
+      ctx.fillStyle = '#22CC22';
+      ctx.beginPath();
+      ctx.ellipse(renderX, renderY, 14, 12, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#114411';
+      ctx.beginPath();
+      ctx.ellipse(renderX - 8, renderY - 8, 2, 2, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.ellipse(renderX + 8, renderY - 8, 2, 2, 0, 0, Math.PI * 2);
+      ctx.fill();
+      
+      ctx.globalAlpha = 1;
+    }
+    
+    function renderHUD() {
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = '16px monospace';
+      ctx.textAlign = 'left';
+      ctx.fillText('Score: ' + score, 16, 20);
+      
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#888888';
+      ctx.font = '14px monospace';
+      ctx.fillText('Best: ' + bestScore, 322, 20);
+      
+      ctx.textAlign = 'right';
+      ctx.fillStyle = '#AAAAAA';
+      ctx.font = '14px monospace';
+      ctx.fillText('Lv ' + level, 620, 20);
+      
+      ctx.textAlign = 'left';
+      ctx.fillStyle = '#22CC22';
+      for (let i = 0; i < lives; i++) {
+        ctx.fillText('●', 16 + i * 15, 720);
+      }
+      
+      ctx.textAlign = 'right';
+      ctx.fillStyle = '#AAAAAA';
+      ctx.font = '11px monospace';
+      ctx.fillText('TIME', 260, 724);
+      
+      const timerW = Math.max(0, 200 * (timer / Math.max(20, 30 - (level - 1) * 2)));
+      ctx.fillStyle = timer > 10 ? '#00CC00' : (timer > 5 ? '#FFCC00' : '#FF4444');
+      ctx.fillRect(300, 718, timerW, 10);
+      ctx.strokeStyle = '#333333';
+      ctx.strokeRect(300, 718, 200, 10);
+    }
+    
+    function renderTitleScreen() {
+      renderZones();
+      renderVehicles();
+      renderLogs();
+      renderTurtles();
+      
+      ctx.fillStyle = '#22CC22';
+      ctx.font = 'bold 48px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('FROGGER', 322, 200);
+      
+      ctx.font = '18px monospace';
+      ctx.fillStyle = Math.sin(gameTime * 3) > 0 ? '#FFFFFF' : '#333333';
+      ctx.fillText('Press Enter to Start', 322, 450);
+      
+      ctx.fillStyle = '#555555';
+      ctx.font = '14px monospace';
+      ctx.fillText('Best: ' + bestScore, 322, 490);
+    }
+    
+    function renderGameOverScreen() {
+      renderZones();
+      renderVehicles();
+      renderLogs();
+      renderTurtles();
+      
+      ctx.fillStyle = '#FF4444';
+      ctx.font = '40px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('GAME OVER', 322, 300);
+      
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = '24px monospace';
+      ctx.fillText('Score: ' + score, 322, 350);
+      ctx.fillStyle = '#888888';
+      ctx.font = '16px monospace';
+      ctx.fillText('Level reached: ' + level, 322, 415);
+      
+      ctx.fillStyle = Math.sin(gameTime * 3) > 0 ? '#FFFFFF' : '#333333';
+      ctx.font = '16px monospace';
+      ctx.fillText('Enter to restart', 322, 460);
+    }
+    
+    function playSound(freq, duration) {
+      if (!audioCtx) return;
+      try {
+        const now = audioCtx.currentTime;
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0.3, now);
+        gain.gain.linearRampToValueAtTime(0, now + duration);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(now);
+        osc.stop(now + duration);
+      } catch (e) {}
+    }
+    
+    let frogHome = [false, false, false, false, false];
+    
+    function render() {
+      ctx.fillStyle = '#000000';
+      ctx.fillRect(0, 0, 644, 740);
+      
+      if (gameState === STATES.TITLE) {
+        renderTitleScreen();
+      } else if (gameState === STATES.GAME_OVER) {
+        renderGameOverScreen();
+      } else {
+        renderZones();
+        renderLogs();
+        renderTurtles();
+        renderVehicles();
+        renderSlots();
+        renderFrog();
+        renderHUD();
+        
+        if (gameState === STATES.PAUSED) {
+          ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+          ctx.fillRect(0, 0, 644, 740);
+          ctx.fillStyle = '#FFFFFF';
+          ctx.font = '36px monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText('PAUSED', 322, 350);
+        }
+      }
+    }
+    
+    let lastTime = 0;
+    function gameLoop(now) {
+      const dt = Math.min((now - lastTime) / 1000, 0.05);
+      lastTime = now;
+      
+      if (gameState === STATES.PLAYING) {
+        updateGame(dt);
+      } else if (gameState === STATES.DEATH) {
+        deathTime -= dt;
+        if (deathTime <= 0) {
+          if (lives > 0) {
+            initLevel();
+            gameState = STATES.PLAYING;
+          } else {
+            gameState = STATES.GAME_OVER;
+          }
+        }
+      } else if (gameState === STATES.LEVEL_CLEAR) {
+        if (gameTime > 1.5) {
+          level++;
+          frogHome = [false, false, false, false, false];
+          initLevel();
+          gameState = STATES.PLAYING;
+        }
+      }
+      
+      render();
+      requestAnimationFrame(gameLoop);
+    }
+    
+    document.addEventListener('keydown', e => {
+      if (!keyWasPressed[e.code]) {
+        keyWasPressed[e.code] = true;
+        
+        if (e.code === 'Enter') {
+          e.preventDefault();
+          if (gameState === STATES.TITLE) {
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            score = 0;
+            lives = 3;
+            level = 1;
+            frogHome = [false, false, false, false, false];
+            initLevel();
+            gameState = STATES.PLAYING;
+          } else if (gameState === STATES.GAME_OVER) {
+            gameState = STATES.TITLE;
+          }
+        } else if (e.code === 'KeyP' || e.code === 'Escape') {
+          e.preventDefault();
+          if (gameState === STATES.PLAYING) gameState = STATES.PAUSED;
+          else if (gameState === STATES.PAUSED) gameState = STATES.PLAYING;
+        } else if (gameState === STATES.PLAYING) {
+          handleInput(e.code);
+          if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'KeyW', 'KeyA', 'KeyS', 'KeyD'].includes(e.code)) {
+            playSound(300, 0.03);
+          }
+        }
+      }
+    });
+    
+    document.addEventListener('keyup', e => {
+      keyWasPressed[e.code] = false;
+    });
+    
+    initLevel();
+    requestAnimationFrame(gameLoop);
+  </script>
+</body>
+</html>

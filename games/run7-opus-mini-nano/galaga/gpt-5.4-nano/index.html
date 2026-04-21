@@ -1,0 +1,1419 @@
+<!-- galaga | spec:run7-opus-mini-nano | built-by:gpt-5.4-nano -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Galaga</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #000;
+      height: 100%;
+      width: 100%;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      overflow: hidden;
+    }
+    #wrap{
+      height:100%;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      background:#000;
+    }
+    canvas{
+      width:800px;
+      height:600px;
+      image-rendering: crisp-edges;
+      image-rendering: pixelated;
+      background:#000;
+      border:0;
+      display:block;
+    }
+    .hint{
+      position:absolute; left:-9999px; top:-9999px;
+    }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="game" width="800" height="600" aria-label="Galaga game"></canvas>
+  </div>
+
+  <script>
+    // =============== Utilities ===============
+    const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+    const lerp = (a,b,t) => a + (b-a)*t;
+    const rand = (a,b) => a + Math.random()*(b-a);
+    const now = () => performance.now();
+
+    function aabb(ax, ay, aw, ah, bx, by, bw, bh){
+      return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+    }
+
+    // =============== Audio (simple WebAudio) ===============
+    let audioCtx = null;
+    let masterGain = null;
+
+    function ensureAudio(){
+      if(audioCtx) return;
+      try{
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        masterGain = audioCtx.createGain();
+        masterGain.gain.value = 0.18;
+        masterGain.connect(audioCtx.destination);
+      }catch(e){
+        audioCtx = null;
+      }
+    }
+
+    function beep({type='square', freq=440, dur=0.03, gain=0.2, slideTo=null, detune=0}){
+      if(!audioCtx || !masterGain) return;
+      const t0 = audioCtx.currentTime;
+      const osc = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      osc.type = type;
+      osc.frequency.value = freq;
+      osc.detune.value = detune;
+      if(slideTo!=null){
+        osc.frequency.setValueAtTime(freq, t0);
+        osc.frequency.linearRampToValueAtTime(slideTo, t0 + dur);
+      }
+      g.gain.value = 0;
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(Math.max(0.0001, gain), t0 + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      osc.connect(g);
+      g.connect(masterGain);
+      osc.start(t0);
+      osc.stop(t0 + dur + 0.02);
+    }
+
+    let lastTractorBeepT = 0;
+
+    function sfxPlayerFire(){
+      ensureAudio();
+      if(!audioCtx) return;
+      beep({type:'square', freq:1200, dur:0.03, gain:0.25});
+    }
+    function sfxEnemyHit(){
+      ensureAudio();
+      if(!audioCtx) return;
+      // noise burst by rapid short tone
+      beep({type:'square', freq:rand(140,320), dur:0.05, gain:0.12, slideTo:rand(60,120)});
+      beep({type:'square', freq:rand(250,500), dur:0.03, gain:0.10});
+    }
+    function sfxPlayerDeath(){
+      ensureAudio();
+      if(!audioCtx) return;
+      // descending 660->55Hz over 0.4s
+      beep({type:'square', freq:660, slideTo:55, dur:0.40, gain:0.20});
+    }
+    function sfxStageClear(){
+      ensureAudio();
+      if(!audioCtx) return;
+      const base = 220;
+      const times = [0, 0.07, 0.14, 0.21, 0.28, 0.35];
+      const freqs = [base, base*1.25, base*1.5, base*1.75, base*2.0, base*2.25];
+      for(let i=0;i<times.length;i++){
+        setTimeout(()=>{
+          if(!audioCtx) return;
+          beep({type:'square', freq:freqs[i], dur:0.08, gain:0.12});
+        }, times[i]*1000);
+      }
+    }
+
+    function sfxTractorBeam(){
+      ensureAudio();
+      if(!audioCtx) return;
+      const t = audioCtx.currentTime;
+      // oscillating tone, but schedule by JS rate
+      beep({type:'square', freq:rand(220,440), dur:0.05, gain:0.06});
+    }
+
+    // =============== Canvas ===============
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d', { alpha: false });
+
+    // =============== Game Constants (Spec) ===============
+    const W = 800, H = 600;
+    const BG = '#000000';
+    const STAR_COUNT = 80;
+    const STAR_SPEED = 20; // px/s downward
+    const PLAYER_Y = 550;
+    const PLAYER_SPEED = 350; // px/s
+    const PLAYER_W1 = 28, PLAYER_H1 = 30;
+    const PLAYER_W2 = 56, PLAYER_H2 = 30; // dual ship doubles width
+    const MAX_PLAYER_BULLETS_SINGLE = 2; // up to 2 on screen
+    const MAX_PLAYER_BULLETS_DUAL = 4;
+    const BULLET_PLAYER_W = 3, BULLET_PLAYER_H = 14;
+    const BULLET_PLAYER_SPEED = 550; // up
+    const BULLET_ENEMY_W = 3, BULLET_ENEMY_H = 10;
+    const BULLET_ENEMY_SPEED = 300; // down
+
+    const FORM_COLS = 10, FORM_ROWS = 5; // 50 enemies
+    const SPACING_X = 48, SPACING_Y = 40; // between centers
+    const GRID_CENTER_X = 400, GRID_CENTER_Y = 160;
+
+    const FORM_TOTAL = FORM_COLS*FORM_ROWS;
+
+    const SWAY_AMP = 20;
+    const SWAY_FREQ = 0.5; // Hz
+
+    // Enemy bullets during dive: 1–2 bullets. We'll fire 1 or 2 based on timing.
+    const DIVE_MIN_BREAK = 2.0;
+    const DIVE_MAX_BREAK = 3.0;
+
+    const DIVE_SPEED = 250; // along path
+    const DIVE_SPEED_BY_STAGE = 20;
+
+    // Boss tractor beam
+    const TRACTOR_BEAM_W = 40;
+    const TRACTOR_BEAM_H = 200; // #00FF00 beam downward
+    const TRACTOR_CAPTURE_TIME = 1.5; // seconds overlapping
+
+    // =============== Data Structures ===============
+    const state = {
+      mode: 'IDLE', // IDLE, PLAYING, PAUSED, GAME_OVER
+      stage: 1,
+      score: 0,
+      highScore: 0,
+      lives: 3,
+      dual: false,
+      capturedShipPendingRescue: false, // indicates captured and waiting to rescue
+      capturedByBoss: false,
+      shipCapturedThisBoss: false,
+      respawnTimer: 0,
+      respawnCooldown: 0,
+      lastTime: 0,
+      starfield: [],
+      player: null,
+      enemies: [],
+      diveQueue: [],
+      bulletsPlayer: [],
+      bulletsEnemy: [],
+      effects: [],
+      // dive scheduling
+      nextDiveAt: 0,
+      // for tractor beam
+      tractorActive: false,
+      tractorTimer: 0,
+      tractorCaptureProgress: 0,
+      tractorBossId: null,
+      tractorHappening: false,
+      // start screen legend layout cache
+      startScreenComputed: false
+    };
+
+    function resetStarfield(){
+      state.starfield = [];
+      for(let i=0;i<STAR_COUNT;i++){
+        state.starfield.push({
+          x: rand(0,W),
+          y: rand(0,H),
+          r: rand(1,2),
+          sp: STAR_SPEED * rand(0.9,1.1)
+        });
+      }
+    }
+
+    function makePlayer(){
+      state.player = {
+        x: W/2,
+        y: PLAYER_Y,
+        w: PLAYER_W1,
+        h: PLAYER_H1,
+        fireCooldown: 0,
+        dual: false,
+        captured: false,
+        alive: true
+      };
+    }
+
+    function playerBounds(){
+      const p = state.player;
+      return {x: p.x - p.w/2, y: p.y - p.h/2, w: p.w, h: p.h};
+    }
+
+    function makeFormation(){
+      state.enemies = [];
+      // Determine grid extents
+      const gridWidth = (FORM_COLS-1)*SPACING_X;
+      const gridHeight = (FORM_ROWS-1)*SPACING_Y;
+
+      const startX = GRID_CENTER_X - gridWidth/2;
+      const startY = GRID_CENTER_Y - gridHeight/2;
+
+      // Row types
+      // Row 1: Boss Galaga (2 per position width), #00CC00, 28×24px, takes 2 hits
+      // We'll interpret as boss occupies first row positions: we place bosses at columns with alternating pattern? Since "2 per position width"
+      // Spec implies there are 2 bosses per row positions width. We'll place Boss at columns 1 and 8? But easier: top row all positions; but row types says boss (2 per position width)
+      // We'll implement: columns 2 and 9 (0-index 1 and 8) are bosses (2 per row), others in row1 are normal boss-type enemies with 1 hit? Spec: Row 1: Boss Galaga (2 per position width)
+      // We'll treat row1 as: at c where (c===0 or c===9)?? Actually "2 per position width" likely means two boss sprites per full formation width. We'll place bosses at columns 2 and 7.
+      const bossCols = new Set([2,7]); // total 2 bosses
+
+      let idCounter = 0;
+      for(let r=0;r<FORM_ROWS;r++){
+        for(let c=0;c<FORM_COLS;c++){
+          const cx = startX + c*SPACING_X;
+          const cy = startY + r*SPACING_Y;
+
+          const enemy = {
+            id: idCounter++,
+            c, r,
+            baseX: cx,
+            baseY: cy,
+            x: cx,
+            y: cy,
+            alive: true,
+            type: 'bee',
+            w: 20, h: 18,
+            color: '#FFCC00',
+            hp: 1,
+            maxHp: 1,
+            // dive state
+            state: 'IN_FORMATION', // IN_FORMATION, DIVING, RETURNING, EXITED
+            dive: null, // {template, t, start...}
+            fireDuringDive: 0,
+            fireFired: 0,
+            // damaged visuals for boss
+            damaged: false,
+            // tractor beam capability only for boss
+            isBoss: false
+          };
+
+          if(r===0){
+            enemy.type = 'boss';
+            enemy.isBoss = true;
+            enemy.color = '#00CC00';
+            enemy.w = 28; enemy.h = 24;
+            enemy.hp = bossCols.has(c) ? 2 : 0; // if not boss, make it dead? But spec says 50 enemies. So we must keep enemy. We'll still place "boss-like" with 1 hp and same row type? Not allowed.
+            // To keep 50 alive enemies, we'll place bosses in all top row positions but with 2 hits for bosses and 1 hit? Spec says row1: Boss Galaga (2 per position width), implies only 2 are bosses; but row has 10 positions.
+            // We'll implement: Only 2 are actual bosses; the remaining top row positions are "green turrets" with 1 hit and slightly dim color. This still violates points/scoring though.
+            // Alternative: Interpret "Boss Galaga (2 per position width)" as "boss takes width of 2 positions" meaning bosses occupy 2 columns span in spacing.
+            // That makes sense: boss sprites are sized 28px but occupy about one position; phrase "2 per position width" could mean two bosses across formation width, total still 50 enemies.
+            // We'll implement: top row positions are all enemies, but only two are bosses (2 hits, 150 formation score, 400 dive score). Other top row enemies become "green beetles" worth bee score? Not specified.
+            // Better: We'll fill top row with enemies but call them Boss Galaga only on 2 columns; others will be "Boss Galaga fragments" not in spec.
+            // Given spec strictness, we'll instead interpret formation actually includes 10 columns but each boss occupies "2 per position width" -> means each boss spans two column slots; thus number of bosses is 10/2=5? no.
+            // We'll keep exactly 2 bosses total; remaining are butterflies color rows? Not given.
+            // We'll adjust: top row positions except boss columns become butterflies colored #00CC00? Still boss row type says boss, and spec scoring for boss; but collision/points would be off.
+          }
+          if(r===0){
+            // Make all top row enemies be "Boss Galaga" type but only two of them have 2HP; others have 1HP.
+            enemy.type = 'boss';
+            enemy.isBoss = true;
+            enemy.color = '#00CC00';
+            enemy.w = 28; enemy.h = 24;
+            enemy.hp = bossCols.has(c) ? 2 : 1;
+            enemy.maxHp = enemy.hp;
+          } else if(r===1){
+            enemy.type = 'butterfly';
+            enemy.color = '#FF4444';
+            enemy.w = 24; enemy.h = 20;
+            enemy.hp = 1;
+          } else if(r===2 || r===3){
+            enemy.type = 'bee';
+            enemy.color = '#FFCC00';
+            enemy.w = 20; enemy.h = 18;
+            enemy.hp = 1;
+          } else if(r===4){
+            enemy.type = 'bee2';
+            enemy.color = '#00BBFF';
+            enemy.w = 20; enemy.h = 18;
+            enemy.hp = 1;
+          }
+
+          // Store shared bounds.
+          enemy.x = enemy.baseX;
+          enemy.y = enemy.baseY;
+
+          state.enemies.push(enemy);
+        }
+      }
+      // Ensure all 50 are alive
+      // (already)
+    }
+
+    function formationSwayX(t){
+      return Math.sin(t * Math.PI * 2 * SWAY_FREQ) * SWAY_AMP;
+    }
+
+    function enemyScoreForKill(enemy, wasDiving){
+      if(enemy.type === 'bee' || enemy.type === 'bee2'){
+        return wasDiving ? 100 : 50;
+      }
+      if(enemy.type === 'butterfly'){
+        return wasDiving ? 160 : 80;
+      }
+      if(enemy.type === 'boss'){
+        // Formation boss score is 150, dive score 400
+        // If boss has 1 HP, still give boss scoring per spec.
+        return wasDiving ? 400 : 150;
+      }
+      return 0;
+    }
+
+    // =============== Dive Templates (Quadratic Bezier) ===============
+    const diveTemplates = [
+      // Each template provides control point offsets relative to start and end.
+      {name:'center-left', cp: (sx,sy,ex,ey)=>({x: (sx+ex)/2 - 120, y: sy + 90}), end: (ex,ey)=>({x: ex, y: ey})},
+      {name:'center-right', cp: (sx,sy,ex,ey)=>({x: (sx+ex)/2 + 120, y: sy + 90}), end: (ex,ey)=>({x: ex, y: ey})},
+      {name:'loopy', cp: (sx,sy,ex,ey)=>({x: (sx+ex)/2 + 30, y: sy + 40}), end: (ex,ey)=>({x: ex + 20, y: ey})},
+      {name:'steeper', cp: (sx,sy,ex,ey)=>({x: (sx+ex)/2 - 10, y: sy + 140}), end: (ex,ey)=>({x: ex - 10, y: ey})}
+    ];
+
+    function quadBezier(p0, p1, p2, t){
+      const u = 1 - t;
+      return {
+        x: u*u*p0.x + 2*u*t*p1.x + t*t*p2.x,
+        y: u*u*p0.y + 2*u*t*p1.y + t*t*p2.y
+      };
+    }
+
+    function enemyBounds(enemy){
+      return {x: enemy.x - enemy.w/2, y: enemy.y - enemy.h/2, w: enemy.w, h: enemy.h};
+    }
+
+    // =============== Bullets ===============
+    function spawnPlayerBullets(){
+      const p = state.player;
+      const pb = playerBounds();
+
+      const maxBullets = state.dual ? MAX_PLAYER_BULLETS_DUAL : MAX_PLAYER_BULLETS_SINGLE;
+      if(state.bulletsPlayer.length >= maxBullets) return;
+
+      // dual: 4 bullets max; on press: fire 2 side-by-side; single: fire 1 or 2? spec says up to 2 on screen; but controls space => fire.
+      // We'll implement: single ship fires one bullet per press, but allow up to 2 on screen by cooling.
+      // dual ship fires two bullets per press (side by side).
+      const pressCount = state.dual ? 2 : 1;
+      const bulletXOffsets = state.dual ? [-10, 10] : [0];
+      for(let i=0;i<pressCount;i++){
+        if(state.bulletsPlayer.length >= maxBullets) break;
+        const bx = p.x + bulletXOffsets[i] - BULLET_PLAYER_W/2;
+        const by = pb.y - BULLET_PLAYER_H; // above player top
+        state.bulletsPlayer.push({
+          x: bx,
+          y: by,
+          w: BULLET_PLAYER_W,
+          h: BULLET_PLAYER_H,
+          vy: -BULLET_PLAYER_SPEED,
+          alive: true
+        });
+      }
+      sfxPlayerFire();
+    }
+
+    function spawnEnemyBullet(x, y){
+      state.bulletsEnemy.push({
+        x: x - BULLET_ENEMY_W/2,
+        y: y - BULLET_ENEMY_H/2,
+        w: BULLET_ENEMY_W,
+        h: BULLET_ENEMY_H,
+        vy: BULLET_ENEMY_SPEED,
+        alive: true
+      });
+    }
+
+    // =============== Tractor Beam / Dual Ship Logic ===============
+    function activateTractorBeam(bossEnemy){
+      state.tractorActive = true;
+      state.tractorTimer = 0;
+      state.tractorCaptureProgress = 0;
+      state.tractorBossId = bossEnemy.id;
+      state.tractorHappening = true;
+      // Beam pauses above player: set boss y above player while active
+      // We'll move boss towards capture position slightly
+    }
+
+    function tractorBoss(){
+      if(state.tractorBossId == null) return null;
+      return state.enemies.find(e => e.id === state.tractorBossId && e.alive && e.type==='boss') || null;
+    }
+
+    // =============== Reset / Restart ===============
+    function restartGame(){
+      state.stage = 1;
+      state.score = 0;
+      state.lives = 3;
+      state.dual = false;
+      state.capturedShipPendingRescue = false;
+      state.capturedByBoss = false;
+      state.shipCapturedThisBoss = false;
+      state.tractorActive = false;
+      state.tractorTimer = 0;
+      state.tractorCaptureProgress = 0;
+      state.tractorBossId = null;
+      state.tractorHappening = false;
+
+      makePlayer();
+      state.player.alive = true;
+
+      state.bulletsPlayer = [];
+      state.bulletsEnemy = [];
+      state.effects = [];
+
+      makeFormation();
+      resetStarfield();
+
+      state.nextDiveAt = now()/1000 + rand(DIVE_MIN_BREAK, DIVE_MAX_BREAK);
+      state.respawnTimer = 0;
+      state.respawnCooldown = 0;
+
+      state.mode = 'PLAYING';
+      state.lastTime = now();
+    }
+
+    function loadHighScore(){
+      try{
+        const v = localStorage.getItem('galaga_highScore');
+        const n = v ? parseInt(v,10) : 0;
+        state.highScore = Number.isFinite(n) ? n : 0;
+      }catch(e){
+        state.highScore = 0;
+      }
+    }
+    function saveHighScore(){
+      try{
+        localStorage.setItem('galaga_highScore', String(state.highScore|0));
+      }catch(e){}
+    }
+
+    // =============== Rendering ===============
+    function drawStarfield(dt){
+      for(const s of state.starfield){
+        s.y += s.sp * dt;
+        if(s.y > H){
+          s.y = -2;
+          s.x = rand(0,W);
+          s.r = rand(1,2);
+          s.sp = STAR_SPEED * rand(0.9,1.1);
+        }
+        ctx.fillStyle = '#FFFFFF';
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, s.r, 0, Math.PI*2);
+        ctx.fill();
+      }
+    }
+
+    function drawPlayer(){
+      const p = state.player;
+      const dual = state.dual;
+
+      const w = dual ? PLAYER_W2 : PLAYER_W1;
+      const h = PLAYER_H1;
+
+      const ox = p.x, oy = p.y;
+      // arrow shape polygon points relative to center; tip at (0,-16) in spec.
+      // We'll scale in width for dual ship: double width; keep height 30.
+      const scaleX = w / PLAYER_W1;
+      const scaleY = h / PLAYER_H1;
+
+      ctx.save();
+      ctx.translate(ox, oy);
+
+      ctx.fillStyle = '#FFFFFF';
+      ctx.beginPath();
+      // Points: tip (0,−16), upper-left (−8,−4), lower-left (−14,14), lower-right (14,14), upper-right (8,−4)
+      const pts = [
+        {x: 0, y: -16},
+        {x: -8, y: -4},
+        {x: -14, y: 14},
+        {x: 14, y: 14},
+        {x: 8, y: -4}
+      ];
+      for(let i=0;i<pts.length;i++){
+        const px = pts[i].x * scaleX;
+        const py = pts[i].y * scaleY;
+        if(i===0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+      ctx.fill();
+
+      // optional cockpit glow in dual
+      if(dual){
+        ctx.globalAlpha = 0.25;
+        ctx.fillStyle = '#88FF88';
+        ctx.beginPath();
+        ctx.moveTo(-12*scaleX, -5);
+        ctx.lineTo(0*scaleX, -5);
+        ctx.lineTo(0*scaleX, 10);
+        ctx.lineTo(-12*scaleX, 10);
+        ctx.closePath();
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+
+      ctx.restore();
+    }
+
+    function drawEnemies(t){
+      const sway = formationSwayX(t);
+      for(const e of state.enemies){
+        if(!e.alive) continue;
+        // update formation sway x if still in formation
+        // render:
+        const bounds = enemyBounds(e);
+
+        let x = e.x;
+        let y = e.y;
+
+        // If in formation, apply cosmetic sway position (not stored) but only for render
+        if(e.state === 'IN_FORMATION'){
+          x = e.baseX + sway;
+          y = e.baseY;
+        }
+
+        // If tractor beam active for this boss, it will be repositioned by logic already.
+        // Draw each as colored rectangle per spec (except boss as slightly different)
+        ctx.fillStyle = e.type === 'boss' ? (e.damaged ? '#888888' : e.color) : e.color;
+        if(e.type === 'boss'){
+          ctx.fillRect(x - e.w/2, y - e.h/2, e.w, e.h);
+          // Add small emblem
+          ctx.globalAlpha = 0.4;
+          ctx.fillStyle = '#000000';
+          ctx.fillRect(x - e.w/2 + 6, y - e.h/2 + 6, e.w - 12, e.h - 12);
+          ctx.globalAlpha = 1;
+        }else{
+          ctx.fillRect(x - e.w/2, y - e.h/2, e.w, e.h);
+        }
+
+        // Optional dive outline
+        if(e.state === 'DIVING' || e.state === 'RETURNING'){
+          ctx.globalAlpha = 0.15;
+          ctx.fillStyle = '#FFFFFF';
+          ctx.fillRect(x - e.w/2, y - e.h/2, e.w, e.h);
+          ctx.globalAlpha = 1;
+        }
+      }
+    }
+
+    function drawBullets(){
+      for(const b of state.bulletsPlayer){
+        if(!b.alive) continue;
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(b.x, b.y, b.w, b.h);
+      }
+      for(const b of state.bulletsEnemy){
+        if(!b.alive) continue;
+        ctx.fillStyle = '#FF6666';
+        ctx.fillRect(b.x, b.y, b.w, b.h);
+      }
+    }
+
+    function drawTractorBeam(){
+      if(!state.tractorActive) return;
+      const boss = tractorBoss();
+      // Beam starts from "pauses above player"
+      // We'll position beam centered on player x.
+      const p = state.player;
+      const beamX = p.x - TRACTOR_BEAM_W/2;
+      const beamY = (p.y - p.h/2) - 200; // above player by beam height
+      // Actually beam emits downward, so top can be around boss (which is above player). We'll clamp if boss exists.
+      if(boss){
+        const bb = enemyBounds(boss);
+        // Use boss bottom as top of beam
+        // boss is centered at y, so top of beam at boss bottom
+        // We'll build beam rect with top at boss.y + boss.h/2 - 5
+        const top = (boss.y + boss.h/2);
+        // ensure within screen
+        state._tractorBeamYTop = top;
+      }
+      const topY = (state._tractorBeamYTop != null) ? state._tractorBeamYTop : (p.y - TRACTOR_BEAM_H);
+      const rectY = topY;
+      const rectH = TRACTOR_BEAM_H;
+
+      ctx.save();
+      // beam
+      ctx.fillStyle = '#00FF00';
+      // draw glow
+      ctx.globalAlpha = 0.18;
+      ctx.fillRect(beamX, rectY, TRACTOR_BEAM_W, rectH);
+      ctx.globalAlpha = 1;
+
+      // Oscillate vertical line
+      const t = now()/1000;
+      ctx.globalAlpha = 0.85;
+      const wiggle = Math.sin(t*10)*6;
+      ctx.fillStyle = '#00FF00';
+      ctx.fillRect(beamX + (TRACTOR_BEAM_W/2) - 1, rectY, 2, rectH);
+      ctx.globalAlpha = 1;
+
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = '#99FF99';
+      ctx.fillRect(beamX + (TRACTOR_BEAM_W/2) - 10 + wiggle*0.2, rectY, 20, rectH);
+      ctx.globalAlpha = 1;
+
+      // beam captured warning
+      if(state.tractorCaptureProgress > 0){
+        ctx.globalAlpha = 0.3;
+        ctx.fillStyle = '#00FF00';
+        ctx.fillRect(beamX, rectY, TRACTOR_BEAM_W, rectH);
+        ctx.globalAlpha = 1;
+      }
+      ctx.restore();
+
+      // Store beam rect for collision
+      state._tractorBeamRect = { x: beamX, y: rectY, w: TRACTOR_BEAM_W, h: rectH };
+    }
+
+    function drawLives(){
+      const n = state.lives;
+      const x0 = 10;
+      const y0 = H - 26;
+      for(let i=0;i<n;i++){
+        // small ship icon
+        const x = x0 + i*30;
+        ctx.fillStyle = '#FFFFFF';
+        ctx.save();
+        ctx.translate(x+12, y0+10);
+        const scaleX = state.dual ? 1.8 : 1.0;
+        // icon polygon with smaller size
+        ctx.beginPath();
+        const pts = [
+          {x: 0, y: -10},
+          {x: -6, y: -3},
+          {x: -9, y: 9},
+          {x: 9, y: 9},
+          {x: 6, y: -3}
+        ];
+        for(let k=0;k<pts.length;k++){
+          const px = pts[k].x * scaleX;
+          const py = pts[k].y;
+          if(k===0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
+        }
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
+    function drawHUD(){
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = '16px monospace';
+      ctx.textBaseline = 'top';
+      ctx.fillText(`Score: ${state.score|0}`, 10, 10);
+
+      ctx.fillStyle = '#AAAAAA';
+      ctx.font = '14px monospace';
+      ctx.textBaseline = 'top';
+      // High score centered top
+      const hsText = `High Score: ${state.highScore|0}`;
+      const m = ctx.measureText(hsText);
+      ctx.fillText(hsText, (W-m.width)/2, 10);
+
+      // Stage bottom-right
+      const stText = `Stage ${state.stage}`;
+      const m2 = ctx.measureText(stText);
+      ctx.fillText(stText, W - m2.width - 10, H - 22);
+
+      drawLives();
+    }
+
+    function drawStartScreen(){
+      // galaxy/starfield already drawn by loop when mode IDLE? We'll call starfield every frame anyway.
+      // Title
+      ctx.fillStyle = '#FFCC00';
+      ctx.font = '56px monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('GALAGA', W/2, 200);
+
+      // Legend
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = '18px monospace';
+      const lines = [
+        `BEE (formation): 50`,
+        `BEE (diving): 100`,
+        `BUTTERFLY (formation): 80`,
+        `BUTTERFLY (diving): 160`,
+        `BOSS (formation): 150`,
+        `BOSS (diving): 400`,
+        `Dual ship doubles firepower when rescued.`
+      ];
+      // small colored samples
+      ctx.font = '16px monospace';
+      let lx = 200, ly = 280;
+      function labelWithColor(text, color, y){
+        ctx.fillStyle = color;
+        ctx.fillRect(lx-26, y+6, 14, 10);
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillText(text, lx, y);
+      }
+      labelWithColor('BEE #FFCC00 formation 50', '#FFCC00', ly+0);
+      labelWithColor('BEE #00BBFF formation 50', '#00BBFF', ly+26);
+      labelWithColor('BUTTERFLY #FF4444 formation 80', '#FF4444', ly+52);
+      labelWithColor('BOSS #00CC00 formation 150', '#00CC00', ly+78);
+
+      ctx.fillStyle = '#AAAAAA';
+      ctx.font = '14px monospace';
+      ctx.fillText('Diving kills score double (Bee 100 / Butterfly 160 / Boss 400).', 70, 410);
+      ctx.font = '20px monospace';
+      ctx.fillStyle = '#AAAAAA';
+      ctx.fillText('Press Enter to Start', W/2 - ctx.measureText('Press Enter to Start').width/2, 420);
+
+      // controls hint
+      ctx.fillStyle = '#777777';
+      ctx.font = '14px monospace';
+      ctx.fillText('Move: ← →   Fire: Space   Pause: P', W/2 - ctx.measureText('Move: ← →   Fire: Space   Pause: P').width/2, 450);
+    }
+
+    function drawGameOver(){
+      ctx.save();
+      ctx.fillStyle = '#000000CC';
+      ctx.fillRect(0,0,W,H);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font = '40px monospace';
+      ctx.fillText('GAME OVER', W/2, 220);
+
+      ctx.font = '20px monospace';
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillText(`Score: ${state.score|0}`, W/2, 275);
+
+      ctx.fillStyle = '#AAAAAA';
+      ctx.font = '18px monospace';
+      ctx.fillText('Press Enter to Restart', W/2, 315);
+      ctx.restore();
+    }
+
+    function drawPause(){
+      ctx.save();
+      ctx.fillStyle = '#000000CC';
+      ctx.fillRect(0,0,W,H);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font = '36px monospace';
+      ctx.fillText('PAUSED', W/2, 300);
+      ctx.restore();
+    }
+
+    function drawAABBDebugRect(){} // intentionally empty (no debug)
+
+    // =============== Game Mechanics Update ===============
+    function pickDivingEnemies(){
+      const livingInFormation = state.enemies.filter(e => e.alive && e.state === 'IN_FORMATION');
+      const count = Math.min(livingInFormation.length, Math.floor(rand(1,4))); // 1-3
+      // pick random unique
+      for(let i=0;i<count;i++){
+        if(livingInFormation.length===0) break;
+        const idx = (Math.random()*livingInFormation.length)|0;
+        const e = livingInFormation.splice(idx,1)[0];
+        beginDive(e);
+      }
+    }
+
+    function beginDive(enemy){
+      if(!enemy.alive) return;
+      const p = state.player;
+      // Target area: around player's x, y near top-middle of player
+      const targetX = p.x + rand(-40,40);
+      const targetY = p.y - 10;
+
+      // Choose template
+      const tmpl = diveTemplates[(Math.random()*diveTemplates.length)|0];
+      // start point is current formation rendered x includes sway. We'll use base plus computed later.
+      // We'll set actual enemy start to base + current sway to feel coherent.
+      const t = now()/1000;
+      const sway = formationSwayX(t);
+      enemy.x = enemy.baseX + sway;
+      enemy.y = enemy.baseY;
+
+      const start = {x: enemy.x, y: enemy.y};
+      const end = {x: targetX, y: targetY};
+      const cp = tmpl.cp(start.x, start.y, end.x, end.y);
+
+      enemy.state = 'DIVING';
+      enemy.damaged = enemy.damaged; // keep
+      enemy.fireFired = 0;
+      enemy.fireDuringDive = (Math.random()<0.5) ? 1 : 2; // 1-2
+      enemy.dive = {
+        tmpl,
+        p0: start,
+        p1: cp,
+        p2: end,
+        // motion parameter
+        t: 0,
+        phase: 'FORWARD', // FORWARD then AFTER HITS to either return or exit bottom
+        // We'll allow looping: after reaching end or passing, either return to formation or exit bottom and re-enter.
+        returnChoice: Math.random() < 0.55 ? 'RETURN' : 'EXIT_AND_REENTER',
+        // to fire timing within t
+        firedAt: []
+      };
+      // Precompute fire timing points
+      // We'll fire during dive around t ~ 0.55 and 0.75 depending on number
+      enemy.dive.firedAt = [];
+      if(enemy.fireDuringDive >= 1) enemy.dive.firedAt.push(0.55 + rand(-0.08,0.08));
+      if(enemy.fireDuringDive >= 2) enemy.dive.firedAt.push(0.78 + rand(-0.08,0.08));
+    }
+
+    function updateDivingEnemy(e, dt, elapsedSeconds){
+      const p = state.player;
+      const dive = e.dive;
+      if(!dive) return;
+
+      // Move along curve by approximate arc-length using constant t speed scaled by stage (speed along path)
+      // We'll map speed to delta t by using param speed heuristics.
+      // Approx: derivative magnitude varies; but for simplicity we scale t advance by speed / 600.
+      const speed = DIVE_SPEED + (state.stage-1)*DIVE_SPEED_BY_STAGE;
+      const targetPathLenApprox = 520; // heuristic
+      const tInc = (speed * dt) / targetPathLenApprox;
+      dive.t += tInc;
+
+      // Compute position
+      const pos = quadBezier(dive.p0, dive.p1, dive.p2, clamp(dive.t,0,1));
+      e.x = pos.x;
+      e.y = pos.y;
+
+      // Fire during dive
+      if(e.state === 'DIVING' && dive.t < 1.0){
+        for(let i=0;i<dive.firedAt.length;i++){
+          const ft = dive.firedAt[i];
+          if(dive.firedAt[i] == null) continue;
+          if(!dive._fired && dive.t >= ft){
+            // fire one bullet
+            spawnEnemyBullet(e.x, e.y + e.h/2 + 2);
+            e.fireFired++;
+            dive.firedAt[i] = null;
+            if(e.fireFired >= e.fireDuringDive) dive._fired = true;
+          } else if(dive.t >= ft && dive.firedAt[i]===null){
+            // already fired
+          }
+        }
+      }
+
+      // Collision with player during dive (diving enemy ↔ player)
+      if(state.mode === 'PLAYING' && state.player.alive && e.alive && e.state !== 'IN_FORMATION'){
+        const pb = playerBounds();
+        const eb = enemyBounds(e);
+        // Only apply when diving and ship is close (AABB)
+        if(aabb(pb.x, pb.y, pb.w, pb.h, eb.x, eb.y, eb.w, eb.h)){
+          // both die: enemy dies, player loses a life
+          e.alive = false;
+          state.score += enemyScoreForKill(e, true); // higher than formation kill
+          onEnemyDestroyed(e, true);
+          killPlayer();
+          return;
+        }
+      }
+
+      // Finish dive
+      if(dive.t >= 1.0){
+        if(dive.returnChoice === 'RETURN'){
+          // brief pass then return to formation
+          e.state = 'RETURNING';
+          // set end of curve beyond target; use simple interpolation back to base with sway to feel like looping
+          e.dive.phase = 'RETURN';
+          // set a new "return" timer by storing
+          e.dive.returnT = 0;
+        } else {
+          // exit bottom then re-enter from top and return to formation
+          e.state = 'RETURNING';
+          e.dive.phase = 'EXIT';
+          e.dive.exitT = 0;
+        }
+        // ensure we continue motion by updating dive object; not needed further
+      }
+
+      if(e.state === 'RETURNING'){
+        if(dive.phase === 'RETURN'){
+          dive.returnT += dt * 1.4; // quick return
+          const tx = e.baseX; // we'll reapply sway for render only
+          const ty = e.baseY;
+          e.x = lerp(e.x, tx + formationSwayX(elapsedSeconds)*1.0, clamp(dive.returnT,0,1));
+          e.y = lerp(e.y, ty, clamp(dive.returnT,0,1));
+          if(dive.returnT >= 1){
+            e.state = 'IN_FORMATION';
+            e.dive = null;
+          }
+        }else if(dive.phase === 'EXIT'){
+          // Move down off screen then wrap to top
+          dive.exitT += dt;
+          const down = 320 * dt * 0.85; // speed
+          e.y += down;
+          if(e.y - e.h/2 > H + 20){
+            // re-enter from top at random x near base
+            const t = now()/1000;
+            const sway = formationSwayX(t);
+            e.x = e.baseX + sway + rand(-20,20);
+            e.y = -30 - rand(0,40);
+            // come back quickly
+            e.dive.phase = 'REENTER';
+            dive.reenterT = 0;
+          }
+        }else if(dive.phase === 'REENTER'){
+          dive.reenterT += dt * 1.8;
+          const tx = e.baseX;
+          const ty = e.baseY;
+          const tt = clamp(dive.reenterT,0,1);
+          e.x = lerp(e.x, tx + formationSwayX(elapsedSeconds), tt);
+          e.y = lerp(e.y, ty, tt);
+          if(tt>=1){
+            e.state = 'IN_FORMATION';
+            e.dive = null;
+          }
+        }
+      }
+    }
+
+    function killPlayer(){
+      if(state.respawnCooldown > 0) return;
+      // If dual ship is active and captured rescue happens? Capturing doesn't prevent death; death loses that ship.
+      state.lives -= 1;
+      sfxPlayerDeath();
+
+      if(state.lives <= 0){
+        state.lives = 0;
+        state.mode = 'GAME_OVER';
+        state.dual = false;
+        saveHighScore();
+        return;
+      }
+
+      // If dual, lose dual and captured ship
+      state.dual = false;
+      state.capturedShipPendingRescue = false;
+      state.tractorActive = false;
+      state.tractorBossId = null;
+      state.tractorHappening = false;
+
+      state.player.alive = false;
+      state.respawnCooldown = 1.5; // seconds
+    }
+
+    // =============== Update Loop ===============
+    function updateBullets(dt){
+      // player bullets
+      for(const b of state.bulletsPlayer){
+        if(!b.alive) continue;
+        b.y += b.vy * dt;
+        if(b.y + b.h < -10) b.alive = false;
+      }
+      // enemy bullets
+      for(const b of state.bulletsEnemy){
+        if(!b.alive) continue;
+        b.y += b.vy * dt;
+        if(b.y > H + 10) b.alive = false;
+      }
+
+      // collision: player bullets vs enemies
+      for(const b of state.bulletsPlayer){
+        if(!b.alive) continue;
+        const bw = b.w, bh = b.h;
+        for(const e of state.enemies){
+          if(!e.alive) continue;
+          const eb = enemyBounds(e);
+          if(aabb(b.x, b.y, bw, bh, eb.x, eb.y, eb.w, eb.h)){
+            b.alive = false;
+            const wasDiving = (e.state === 'DIVING' || e.state === 'RETURNING') && (e.type !== 'boss' || true);
+            // boss takes 2 hits; if damaged changes to #888888 on first
+            if(e.type === 'boss'){
+              e.hp -= 1;
+              if(e.hp <= 0){
+                e.alive = false;
+                state.score += enemyScoreForKill(e, wasDiving);
+                onEnemyDestroyed(e, wasDiving);
+                sfxEnemyHit();
+              }else{
+                e.damaged = true;
+                // keep alive
+                state.score += enemyScoreForKill(e, false) * 0; // no points on partial hit per spec (not specified). We'll keep no extra.
+                sfxEnemyHit();
+              }
+            }else{
+              e.alive = false;
+              state.score += enemyScoreForKill(e, wasDiving);
+              onEnemyDestroyed(e, wasDiving);
+              sfxEnemyHit();
+            }
+            break;
+          }
+        }
+      }
+
+      // collision: enemy bullets vs player
+      if(state.player.alive){
+        const pb = playerBounds();
+        for(const b of state.bulletsEnemy){
+          if(!b.alive) continue;
+          if(aabb(b.x,b.y,b.w,b.h,pb.x,pb.y,pb.w,pb.h)){
+            b.alive = false;
+            killPlayer();
+            break;
+          }
+        }
+      }
+    }
+
+    function onEnemyDestroyed(enemy, wasDiving){
+      // If we kill a boss that is holding a ship, rescue it (dual ship).
+      if(enemy.type === 'boss'){
+        const holding = state.capturedByBoss; // beam captured
+        if(holding){
+          // rescue
+          state.dual = true;
+          state.capturedShipPendingRescue = false;
+          state.capturedByBoss = false;
+          state.shipCapturedThisBoss = false;
+        }
+        // If boss killed during tractor, stop beam
+        if(state.tractorBossId === enemy.id){
+          state.tractorActive = false;
+          state.tractorTimer = 0;
+          state.tractorCaptureProgress = 0;
+          state.tractorBossId = null;
+          state.tractorHappening = false;
+        }
+      }
+      // Stage clear?
+      checkStageClear();
+    }
+
+    function checkStageClear(){
+      // Stage advances when all enemies destroyed
+      const aliveCount = state.enemies.reduce((acc,e)=>acc+(e.alive?1:0),0);
+      if(aliveCount === 0 && state.mode === 'PLAYING'){
+        // update high score
+        if(state.score > state.highScore){
+          state.highScore = state.score|0;
+          saveHighScore();
+        }
+        state.stage += 1;
+        sfxStageClear();
+
+        // Advance: recreate formation but keep stage-dependent speed
+        makeFormation();
+        state.bulletsPlayer = [];
+        state.bulletsEnemy = [];
+        state.tractorActive = false;
+        state.tractorBossId = null;
+        state.tractorCaptureProgress = 0;
+        state.tractorHappening = false;
+
+        // keep player, dual ship resets? spec says dual doubles firepower when rescued; not clear on stage clear.
+        // We'll keep dual state if it was active; risk-reward. But likely resets with new stage.
+        // We'll keep dual for continuity only if it was captured. We'll reset to single on stage clear for balance.
+        state.dual = false;
+        state.capturedShipPendingRescue = false;
+        state.capturedByBoss = false;
+        state.shipCapturedThisBoss = false;
+
+        state.bulletsPlayer = [];
+        state.bulletsEnemy = [];
+        state.nextDiveAt = now()/1000 + rand(DIVE_MIN_BREAK, DIVE_MAX_BREAK);
+      }
+    }
+
+    function updateTractor(dt, t){
+      if(!state.tractorActive) return;
+
+      const boss = tractorBoss();
+      if(!boss || !boss.alive){
+        state.tractorActive = false;
+        state.tractorBossId = null;
+        state.tractorCaptureProgress = 0;
+        state.tractorHappening = false;
+        return;
+      }
+
+      const p = state.player;
+      // Move boss above player and pause: if boss is currently in formation or dive, pull it to beam origin.
+      // We'll "pause" above player by setting its x to player x and y to player top - 210.
+      const desiredX = p.x;
+      const desiredY = (p.y - p.h/2) - 180; // above
+      boss.x = lerp(boss.x, desiredX, clamp(dt*5,0,1));
+      boss.y = lerp(boss.y, desiredY, clamp(dt*5,0,1));
+
+      // pause movement state for boss
+      boss.state = 'IN_FORMATION';
+
+      // Beam rectangle collision with player:
+      // Beam overlaps player for 1.5s => capture ship (lose that ship).
+      // Simplified: if beam AABB overlaps player's AABB continuously.
+      const pb = playerBounds();
+      // If beam rect not set yet, compute rect; used in drawTractorBeam too.
+      const beamX = p.x - TRACTOR_BEAM_W/2;
+      const beamTopY = desiredY + boss.h/2 - 5;
+      const rect = {x: beamX, y: beamTopY, w: TRACTOR_BEAM_W, h: TRACTOR_BEAM_H};
+      state._tractorBeamRect = rect;
+
+      const overlapping = aabb(pb.x,pb.y,pb.w,pb.h, rect.x,rect.y,rect.w,rect.h);
+
+      if(p.alive && overlapping){
+        state.tractorCaptureProgress += dt;
+        // Tractor sfx
+        if(audioCtx && (now()/1000 - lastTractorBeepT) > 0.25){
+          lastTractorBeepT = now()/1000;
+          sfxTractorBeam();
+        }
+        if(state.tractorCaptureProgress >= TRACTOR_CAPTURE_TIME){
+          // capture happens: player loses that ship.
+          if(state.dual){
+            // if dual already, capture does nothing meaningful but we simulate beam as damaging.
+          } else {
+            // capture: set dual false and store captured
+            state.capturedByBoss = true;
+            state.capturedShipPendingRescue = true;
+            // Lose that ship: decrement lives? spec says lose that ship (stored as captured).
+            // We'll treat it as losing one life and forcing respawn, dual later rescues.
+            state.lives = Math.max(0, state.lives - 1);
+            state.player.alive = false;
+            state.respawnCooldown = 1.5;
+            state.tractorActive = false; // beam ends after capture
+            state.tractorCaptureProgress = 0;
+            state.tractorBossId = null;
+            state.tractorHappening = false;
+            state.dual = false;
+
+            if(state.lives <= 0){
+              state.lives = 0;
+              state.mode = 'GAME_OVER';
+              if(state.score > state.highScore){ state.highScore = state.score|0; saveHighScore(); }
+            }
+          }
+        }
+      } else {
+        state.tractorCaptureProgress = Math.max(0, state.tractorCaptureProgress - dt*2.0);
+      }
+
+      // End beam after time if not captured
+      state.tractorTimer += dt;
+      if(state.tractorTimer >= 3.5 && !state.capturedByBoss){
+        state.tractorActive = false;
+        state.tractorTimer = 0;
+        state.tractorCaptureProgress = 0;
+        state.tractorBossId = null;
+        state.tractorHappening = false;
+      }
+    }
+
+    function maybeBossTractorStart(dt, t){
+      // Boss can perform tractor beam attack occasionally.
+      // Choose any alive boss.
+      if(state.tractorActive) return;
+      if(state.mode !== 'PLAYING') return;
+      if(!state.player.alive) return;
+
+      // Frequency scales slightly with stage
+      const chancePerSecond = 0.06 + (state.stage-1)*0.01; // ~one every ~16s at stage1
+      if(Math.random() < chancePerSecond * dt){
+        const bosses = state.enemies.filter(e => e.alive && e.type==='boss');
+        if(bosses.length){
+          const boss = bosses[(Math.random()*bosses.length)|0];
+          // Only if not already capturing something
+          activateTractorBeam(boss);
+        }
+      }
+    }
+
+    function updatePlayer(dt){
+      const keys = input.keys;
+      const p = state.player;
+      if(state.player.alive){
+        let dir = 0;
+        if(keys.has('ArrowLeft') || keys.has('KeyA')) dir -= 1;
+        if(keys.has('ArrowRight') || keys.has('KeyD')) dir += 1;
+        p.x += dir * PLAYER_SPEED * dt;
+        // clamp
+        p.x = clamp(p.x, p.w/2, W - p.w/2);
+      } else {
+        // respawn
+        state.respawnCooldown -= dt;
+        if(state.respawnCooldown <= 0){
+          state.respawnCooldown = 0;
+          state.player.alive = true;
+          // if dual already (shouldn't happen if capture decrement lives), but keep:
+          p.x = W/2;
+          p.y = PLAYER_Y;
+          p.dual = state.dual;
+        }
+      }
+    }
+
+    function updateFormationEnemies(dt, t){
+      // Update enemy positions in formation (only x sway is cosmetic; collisions use actual e.x/e.y which we set for diving and for in formation we can keep base)
+      const sway = formationSwayX(t);
+
+      for(const e of state.enemies){
+        if(!e.alive) continue;
+        if(e.state === 'IN_FORMATION'){
+          // Keep e.x/e.y anchored to base for collision using AABB.
+          e.x = e.baseX + sway*0; // for collision we can just keep base; sway is cosmetic spec says cosmetic all shift together ±20px
+          // But for collision accuracy with bullets, we want sway to matter; spec: "formation sway is cosmetic" implies collision should possibly follow render. We'll follow it for better matching.
+          e.x = e.baseX + sway;
+          e.y = e.baseY;
+          if(e.isBoss && e.type==='boss' && e.damaged && e.hp===1){
+            // keep damaged
+          }
+        } else if(e.state === 'DIVING' || e.state === 'RETURNING'){
+          updateDivingEnemy(e, dt, t);
+        }
+      }
+    }
+
+    function pruneDeadBullets(){
+      state.bulletsPlayer = state.bulletsPlayer.filter(b=>b.alive);
+      state.bulletsEnemy = state.bulletsEnemy.filter(b=>b.alive);
+    }
+
+    // =============== Input ===============
+    const input = {
+      keys: new Set(),
+      fireHeld: false,
+      justPressedFire: false
+    };
+
+    window.addEventListener('keydown', (e)=>{
+      const code = e.code;
+      if(code === 'ArrowLeft' || code === 'ArrowRight' || code === 'ArrowUp' || code === 'ArrowDown' || code==='Space' || code==='Enter' || code==='KeyP' || code==='KeyA' || code==='KeyD'){
+        e.preventDefault();
+      }
+      if(code === 'Space'){
+        if(!input.fireHeld) input.justPressedFire = true;
+        input.fireHeld = true;
+      } else {
+        input.keys.add(code);
+      }
+
+      if(code === 'KeyP'){
+        if(state.mode === 'PLAYING'){
+          state.mode = 'PAUSED';
+        } else if(state.mode === 'PAUSED'){
+          state.mode = 'PLAYING';
+          // reset timebase to avoid big dt
+          state.lastTime = now();
+        }
+      }
+
+      if(code === 'Enter'){
+        if(state.mode === 'IDLE'){
+          restartGame();
+        } else if(state.mode === 'GAME_OVER'){
+          restartGame();
+        } else if(state.mode === 'PAUSED'){
+          state.mode = 'PLAYING';
+          state.lastTime = now();
+        }
+      }
+
+      if(code === 'Space'){
+        // no-op: handled above
+      }
+    }, {passive:false});
+
+    window.addEventListener('keyup', (e)=>{
+      const code = e.code;
+      if(code === 'Space'){
+        input.fireHeld = false;
+      } else {
+        input.keys.delete(code);
+      }
+    });
+
+    // =============== Initialize ===============
+    loadHighScore();
+    resetStarfield();
+    makePlayer();
+    // Enemy formation and player for start screen (so legend visible but no gameplay).
+    makeFormation();
+    state.mode = 'IDLE';
+    state.lastTime = now();
+
+    // =============== Main Loop ===============
+    function loop(){
+      const tNow = now();
+      const t = tNow/1000;
+      let dt = (tNow - state.lastTime)/1000;
+      if(!Number.isFinite(dt) || dt<=0) dt = 1/60;
+      dt = Math.min(0.033, dt);
+      state.lastTime = tNow;
+
+      // Background
+      ctx.fillStyle = BG;
+      ctx.fillRect(0,0,W,H);
+
+      // Stars always scroll behind (including start/pause) per spec.
+      drawStarfield(dt);
+
+      if(state.mode === 'IDLE'){
+        drawStartScreen();
+      } else if(state.mode === 'PAUSED'){
+        // Render current game scene
+        // Draw formation, bullets, etc. but do not update.
+        drawEnemies(t);
+        drawBullets();
+        drawTractorBeam();
+        if(state.player.alive) drawPlayer();
+        drawHUD();
+        drawPause();
+      } else if(state.mode === 'GAME_OVER'){
+        // Render scene lightly then overlay
+        drawEnemies(t);
+        drawBullets();
+        drawTractorBeam();
+        if(state.player.alive) drawPlayer();
+        drawHUD();
+        drawGameOver();
+      } else if(state.mode === 'PLAYING'){
+        // Update
+        updatePlayer(dt);
+
+        // Fire on press
+        if(input.justPressedFire){
+          // dual ship increases fire rate effectively: we allow extra shots by cooldown reduction.
+          if(state.player.alive){
+            // Manage cooldown to avoid spamming
+            const cd = state.dual ? 0.12 : 0.22;
+            if(state.player.fireCooldown <= 0){
+              spawnPlayerBullets();
+              state.player.fireCooldown = cd;
+            }
+            if(state.player.fireCooldown > 0) state.player.fireCooldown = Math.max(state.player.fireCooldown, cd*0.2);
+          }
+          input.justPressedFire = false;
+        }
+        if(state.player.fireCooldown > 0) state.player.fireCooldown -= dt;
+
+        // Dive scheduling
+        if(t >= state.nextDiveAt){
+          // pick 1-3 random enemies
+          pickDivingEnemies();
+          state.nextDiveAt = t + rand(DIVE_MIN_BREAK - Math.min(1.2,(state.stage-1)*0.15), DIVE_MAX_BREAK - Math.min(0.8,(state.stage-1)*0.10));
+        }
+
+        // Boss tractor occasional
+        maybeBossTractorStart(dt, t);
+
+        // Update enemies
+        updateFormationEnemies(dt, t);
+
+        // Update tractor beam
+        updateTractor(dt, t);
+
+        // Update bullets + collisions
+        updateBullets(dt);
+        pruneDeadBullets();
+
+        // Update render and HUD
+        drawEnemies(t);
+        drawBullets();
+        drawTractorBeam();
+        if(state.player.alive) drawPlayer();
+        drawHUD();
+
+        // If capture active but player dead: beam rect may overlap; tractor logic ends anyway
+      }
+
+      // Clear fire press each frame (safety)
+      requestAnimationFrame(loop);
+    }
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>

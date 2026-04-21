@@ -1,0 +1,409 @@
+<!--
+  GAME:      Snake
+  RUN:       r3-gemini-pro
+  BUILDER:   openai/gpt-5.4
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Snake</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background: #000;
+      overflow: hidden;
+      font-family: 'Courier New', monospace;
+    }
+    body {
+      display: grid;
+      place-items: center;
+    }
+    canvas {
+      display: block;
+      background: #0a140a;
+      box-shadow: 0 0 30px rgba(255,255,255,0.08);
+      image-rendering: pixelated;
+    }
+  </style>
+</head>
+<body>
+<canvas id="game" width="600" height="600"></canvas>
+<script>
+(() => {
+  'use strict';
+
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  const SIZE = 600;
+  const CELL = 20;
+  const COLS = 30;
+  const ROWS = 30;
+  const HUD_H = 36;
+  const DT_CAP = 0.05;
+  const MIN_TICK = 0.055;
+
+  const STATES = {
+    START: 'START',
+    PLAYING: 'PLAYING',
+    GAME_OVER: 'GAME_OVER'
+  };
+
+  const DIRS = {
+    up: { x: 0, y: -1 },
+    down: { x: 0, y: 1 },
+    left: { x: -1, y: 0 },
+    right: { x: 1, y: 0 }
+  };
+
+  const OPPOSITE = {
+    up: 'down',
+    down: 'up',
+    left: 'right',
+    right: 'left'
+  };
+
+  let state = STATES.START;
+  let lastTime = 0;
+  let accumulator = 0;
+  let tickTime = 0.1;
+  let score = 0;
+  let best = loadBest();
+  let audioCtx = null;
+
+  const keys = Object.create(null);
+  const prevKeys = Object.create(null);
+
+  let snake = [];
+  let food = { x: 0, y: 0 };
+  let direction = 'right';
+  let lastProcessedDirection = 'right';
+  let inputQueue = [];
+
+  function resize() {
+    const scale = Math.min(window.innerWidth / SIZE, window.innerHeight / SIZE);
+    canvas.style.width = `${Math.floor(SIZE * scale)}px`;
+    canvas.style.height = `${Math.floor(SIZE * scale)}px`;
+  }
+
+  function loadBest() {
+    try {
+      const n = parseInt(localStorage.getItem('snake_best_r3_gemini_pro') || '0', 10);
+      return Number.isFinite(n) ? n : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  function saveBest() {
+    try { localStorage.setItem('snake_best_r3_gemini_pro', String(best)); } catch {}
+  }
+
+  function updateBest() {
+    if (score > best) {
+      best = score;
+      saveBest();
+    }
+  }
+
+  function ensureAudio() {
+    if (!audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) {
+        try { audioCtx = new AC(); } catch {}
+      }
+    }
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+  }
+
+  function tone(startFreq, endFreq, duration, type = 'square', volume = 0.04) {
+    if (!audioCtx) return;
+    try {
+      const now = audioCtx.currentTime;
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(startFreq, now);
+      osc.frequency.exponentialRampToValueAtTime(Math.max(1, endFreq), now + duration);
+      gain.gain.setValueAtTime(volume, now);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start(now);
+      osc.stop(now + duration);
+    } catch {}
+  }
+
+  function sfxEat() {
+    tone(400, 800, 0.1, 'triangle', 0.05);
+  }
+
+  function sfxCrash() {
+    tone(200, 50, 0.4, 'sawtooth', 0.05);
+  }
+
+  function justPressed(code) {
+    return !!keys[code] && !prevKeys[code];
+  }
+
+  function resetGame() {
+    snake = [
+      { x: 15, y: 15 },
+      { x: 14, y: 15 },
+      { x: 13, y: 15 },
+      { x: 12, y: 15 }
+    ];
+    direction = 'right';
+    lastProcessedDirection = 'right';
+    inputQueue = [];
+    score = 0;
+    tickTime = 0.1;
+    accumulator = 0;
+    spawnFood();
+  }
+
+  function startGame() {
+    resetGame();
+    state = STATES.PLAYING;
+  }
+
+  function restartGame() {
+    resetGame();
+    state = STATES.PLAYING;
+  }
+
+  function spawnFood() {
+    let x, y, valid = false;
+    while (!valid) {
+      x = Math.floor(Math.random() * COLS);
+      y = Math.floor(Math.random() * ROWS);
+      valid = !snake.some(seg => seg.x === x && seg.y === y);
+    }
+    food = { x, y };
+  }
+
+  function queueDirection(dirName) {
+    const lastQueued = inputQueue.length ? inputQueue[inputQueue.length - 1] : direction;
+    if (dirName === lastQueued) return;
+    const base = inputQueue.length ? inputQueue[inputQueue.length - 1] : lastProcessedDirection;
+    if (dirName === OPPOSITE[base]) return;
+    if (DIRS[dirName].x === DIRS[base].x && DIRS[dirName].y === DIRS[base].y) return;
+    inputQueue.push(dirName);
+    if (inputQueue.length > 3) inputQueue.shift();
+  }
+
+  function processInput() {
+    if (!inputQueue.length) return;
+    const next = inputQueue[0];
+    if (next !== OPPOSITE[lastProcessedDirection]) {
+      direction = next;
+      inputQueue.shift();
+    } else {
+      inputQueue.shift();
+    }
+  }
+
+  function tick() {
+    processInput();
+    lastProcessedDirection = direction;
+
+    const dir = DIRS[direction];
+    const head = snake[0];
+    const newHead = { x: head.x + dir.x, y: head.y + dir.y };
+
+    if (newHead.x < 0 || newHead.x >= COLS || newHead.y < 0 || newHead.y >= ROWS) {
+      gameOver();
+      return;
+    }
+
+    const eating = newHead.x === food.x && newHead.y === food.y;
+    const bodyToCheck = eating ? snake : snake.slice(0, -1);
+    if (bodyToCheck.some(seg => seg.x === newHead.x && seg.y === newHead.y)) {
+      gameOver();
+      return;
+    }
+
+    snake.unshift(newHead);
+
+    if (eating) {
+      score += 10;
+      updateBest();
+      spawnFood();
+      tickTime = Math.max(MIN_TICK, tickTime - 0.002);
+      ensureAudio();
+      sfxEat();
+    } else {
+      snake.pop();
+    }
+  }
+
+  function gameOver() {
+    ensureAudio();
+    sfxCrash();
+    updateBest();
+    state = STATES.GAME_OVER;
+  }
+
+  function update(dt) {
+    if (state !== STATES.PLAYING) return;
+    accumulator += dt;
+    while (accumulator >= tickTime) {
+      accumulator -= tickTime;
+      tick();
+      if (state !== STATES.PLAYING) break;
+    }
+  }
+
+  function drawGrid() {
+    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+    ctx.lineWidth = 1;
+    for (let x = 0; x <= COLS; x++) {
+      ctx.beginPath();
+      ctx.moveTo(x * CELL + 0.5, 0);
+      ctx.lineTo(x * CELL + 0.5, SIZE);
+      ctx.stroke();
+    }
+    for (let y = 0; y <= ROWS; y++) {
+      ctx.beginPath();
+      ctx.moveTo(0, y * CELL + 0.5);
+      ctx.lineTo(SIZE, y * CELL + 0.5);
+      ctx.stroke();
+    }
+  }
+
+  function drawFood() {
+    const px = food.x * CELL;
+    const py = food.y * CELL;
+    ctx.fillStyle = '#ff0000';
+    ctx.beginPath();
+    ctx.arc(px + CELL / 2, py + CELL / 2, 7, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#73ff73';
+    ctx.fillRect(px + 10, py + 5, 3, 5);
+  }
+
+  function drawSnake() {
+    for (let i = snake.length - 1; i >= 0; i--) {
+      const seg = snake[i];
+      const px = seg.x * CELL;
+      const py = seg.y * CELL;
+      ctx.fillStyle = i === 0 ? '#ffff00' : '#00cc00';
+      ctx.fillRect(px + 2, py + 2, CELL - 4, CELL - 4);
+      if (i === 0) {
+        ctx.fillStyle = '#0a140a';
+        const eyeOffsetX = direction === 'right' ? 12 : direction === 'left' ? 4 : 6;
+        const eyeOffsetY = direction === 'down' ? 12 : direction === 'up' ? 4 : 6;
+        if (direction === 'left' || direction === 'right') {
+          ctx.fillRect(px + eyeOffsetX, py + 5, 2, 2);
+          ctx.fillRect(px + eyeOffsetX, py + 13, 2, 2);
+        } else {
+          ctx.fillRect(px + 5, py + eyeOffsetY, 2, 2);
+          ctx.fillRect(px + 13, py + eyeOffsetY, 2, 2);
+        }
+      }
+    }
+  }
+
+  function drawHUD() {
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '20px "Courier New", monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText(`SCORE ${score}`, 10, 8);
+    ctx.textAlign = 'right';
+    ctx.fillText(`BEST ${best}`, SIZE - 10, 8);
+  }
+
+  function drawOverlay(title, subtitle, extra = '') {
+    ctx.fillStyle = 'rgba(0,0,0,0.65)';
+    ctx.fillRect(0, 0, SIZE, SIZE);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 56px "Courier New", monospace';
+    ctx.fillText(title, SIZE / 2, 210);
+    ctx.font = '26px "Courier New", monospace';
+    ctx.fillText(subtitle, SIZE / 2, 300);
+    if (extra) {
+      ctx.font = '18px "Courier New", monospace';
+      ctx.fillText(extra, SIZE / 2, 340);
+    }
+  }
+
+  function render() {
+    ctx.fillStyle = '#0a140a';
+    ctx.fillRect(0, 0, SIZE, SIZE);
+    drawGrid();
+    drawFood();
+    drawSnake();
+    drawHUD();
+
+    if (state === STATES.START) {
+      drawOverlay('SNAKE', 'Press Space to Start', 'Arrow Keys or WASD to turn');
+    } else if (state === STATES.GAME_OVER) {
+      drawOverlay('GAME OVER', `Final Score ${score}`, 'Press Space to Restart');
+    }
+  }
+
+  function handleActions() {
+    const map = {
+      ArrowUp: 'up', KeyW: 'up',
+      ArrowDown: 'down', KeyS: 'down',
+      ArrowLeft: 'left', KeyA: 'left',
+      ArrowRight: 'right', KeyD: 'right'
+    };
+    for (const [code, dir] of Object.entries(map)) {
+      if (justPressed(code) && state === STATES.PLAYING) queueDirection(dir);
+    }
+
+    if (justPressed('Space')) {
+      ensureAudio();
+      if (state === STATES.START) startGame();
+      else if (state === STATES.GAME_OVER) restartGame();
+    }
+  }
+
+  function syncPrev() {
+    const watched = ['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','KeyW','KeyA','KeyS','KeyD','Space'];
+    for (const k of watched) prevKeys[k] = !!keys[k];
+  }
+
+  function frame(ts) {
+    if (!lastTime) lastTime = ts;
+    const dt = Math.min(DT_CAP, (ts - lastTime) / 1000);
+    lastTime = ts;
+
+    handleActions();
+    update(dt);
+    render();
+    syncPrev();
+    requestAnimationFrame(frame);
+  }
+
+  window.addEventListener('keydown', (e) => {
+    const handled = ['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','KeyW','KeyA','KeyS','KeyD','Space'];
+    if (handled.includes(e.code)) e.preventDefault();
+    keys[e.code] = true;
+    if (handled.includes(e.code)) ensureAudio();
+  }, { passive: false });
+
+  window.addEventListener('keyup', (e) => {
+    keys[e.code] = false;
+  });
+
+  window.addEventListener('blur', () => {
+    for (const k in keys) keys[k] = false;
+  });
+
+  window.addEventListener('resize', resize);
+  resize();
+  resetGame();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

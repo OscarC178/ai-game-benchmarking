@@ -1,0 +1,553 @@
+<!--
+  GAME:      Donkey Kong
+  RUN:       r1-opus
+  BUILDER:   anthropic/claude-haiku-4.5
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Donkey Kong</title>
+  <style>
+    html, body { margin: 0; padding: 0; background: #000; display: flex; justify-content: center; align-items: center; height: 100vh; font-family: monospace; }
+    canvas { background: #000; display: block; border: 2px solid #333; }
+  </style>
+</head>
+<body>
+  <canvas id="donkeykong" width="672" height="768"></canvas>
+  <script>
+    'use strict';
+    const canvas = document.getElementById('donkeykong');
+    const ctx = canvas.getContext('2d');
+    
+    const STATES = { TITLE: 0, INTRO: 1, PLAYING: 2, PAUSED: 3, DEATH: 4, LEVEL_CLEAR: 5, GAME_OVER: 6 };
+    const DIRS = { LEFT: -1, RIGHT: 1, NONE: 0, UP: -1, DOWN: 1 };
+    
+    let gameState = STATES.TITLE;
+    let score = 0, bestScore = parseInt(localStorage.getItem('donkeykong_best') || '0');
+    let lives = 3, level = 1, gameTime = 0;
+    
+    const girders = [
+      { left: 56, right: 616, leftY: 640, rightY: 628, index: 0 },
+      { left: 56, right: 616, leftY: 544, rightY: 556, index: 1 },
+      { left: 56, right: 616, leftY: 460, rightY: 448, index: 2 },
+      { left: 56, right: 616, leftY: 364, rightY: 376, index: 3 },
+      { left: 56, right: 616, leftY: 280, rightY: 268, index: 4 },
+      { left: 56, right: 456, leftY: 188, rightY: 180, index: 5 },
+      { left: 220, right: 452, leftY: 98, rightY: 98, index: 6 }
+    ];
+    
+    const ladders = [
+      { x: 120, fromGirder: 0, toGirder: 1, broken: false },
+      { x: 320, fromGirder: 0, toGirder: 1, broken: true },
+      { x: 540, fromGirder: 1, toGirder: 2, broken: false },
+      { x: 200, fromGirder: 1, toGirder: 2, broken: true },
+      { x: 120, fromGirder: 2, toGirder: 3, broken: false },
+      { x: 420, fromGirder: 2, toGirder: 3, broken: false },
+      { x: 540, fromGirder: 3, toGirder: 4, broken: false },
+      { x: 280, fromGirder: 3, toGirder: 4, broken: true },
+      { x: 120, fromGirder: 4, toGirder: 5, broken: false },
+      { x: 400, fromGirder: 5, toGirder: 6, broken: false }
+    ];
+    
+    let mario = { x: 560, y: 0, vx: 0, vy: 0, onGirder: 0, climbing: null, dir: 1, airborne: false, walkFrame: 0, jumpTime: 0, hammerTime: 0 };
+    let dk = { x: 100, y: 140, throwTime: 0, throwNext: 3 };
+    let pauline = { x: 336, y: 66 };
+    
+    let barrels = [];
+    let fireballs = [];
+    let hammers = [ { x: 130, y: 0, collected: false, girder: 2 }, { x: 130, y: 0, collected: false, girder: 4 } ];
+    
+    let bonusTimer = 5000;
+    let lastBarrelThrow = 0;
+    let keys = {}, keyWasPressed = {};
+    let audioCtx = null;
+    
+    function getGirderY(girderIdx, x) {
+      const g = girders[girderIdx];
+      const t = (x - g.left) / (g.right - g.left);
+      return g.leftY + t * (g.rightY - g.leftY);
+    }
+    
+    function getGirderAtY(y) {
+      for (let g of girders) {
+        const minY = Math.min(g.leftY, g.rightY) - 12;
+        const maxY = Math.max(g.leftY, g.rightY) + 8;
+        if (y >= minY && y <= maxY) return g.index;
+      }
+      return -1;
+    }
+    
+    function initLevel() {
+      mario = { x: 560, y: getGirderY(0, 560), vx: 0, vy: 0, onGirder: 0, climbing: null, dir: 1, airborne: false, walkFrame: 0, jumpTime: 0, hammerTime: 0 };
+      barrels = [];
+      fireballs = [];
+      bonusTimer = 5000;
+      lastBarrelThrow = gameTime;
+      hammers[0].collected = false;
+      hammers[1].collected = false;
+      hammers[0].y = getGirderY(2, 130) - 12;
+      hammers[1].y = getGirderY(4, 130) - 12;
+    }
+    
+    function updateMario(dt) {
+      if (mario.hammerTime > 0) mario.hammerTime -= dt;
+      
+      const moveSpeed = 100 * (mario.hammerTime > 0 ? 0.8 : 1);
+      
+      if (mario.climbing) {
+        if (keys['ArrowUp'] || keys['KeyW']) mario.y -= 80 * dt;
+        if (keys['ArrowDown'] || keys['KeyS']) mario.y += 80 * dt;
+        
+        const topGirder = mario.climbing.toGirder;
+        const bottomGirder = mario.climbing.fromGirder;
+        const topY = getGirderY(topGirder, mario.climbing.x);
+        const bottomY = getGirderY(bottomGirder, mario.climbing.x);
+        
+        if (mario.y < topY - 8) {
+          mario.climbing = null;
+          mario.onGirder = topGirder;
+          mario.y = topY;
+          mario.airborne = false;
+        } else if (mario.y > bottomY + 8) {
+          mario.climbing = null;
+          mario.onGirder = bottomGirder;
+          mario.y = bottomY;
+          mario.airborne = false;
+        }
+      } else {
+        if (keys['ArrowLeft'] || keys['KeyA']) { mario.x -= moveSpeed * dt; mario.dir = -1; }
+        if (keys['ArrowRight'] || keys['KeyD']) { mario.x += moveSpeed * dt; mario.dir = 1; }
+        
+        mario.x = Math.max(girders[mario.onGirder].left, Math.min(girders[mario.onGirder].right, mario.x));
+        
+        if (!mario.airborne) {
+          mario.y = getGirderY(mario.onGirder, mario.x);
+          mario.walkFrame = (mario.walkFrame + 0.15) % 2;
+          
+          if (!keyWasPressed['Space']) {
+            if (keys['Space']) {
+              mario.vy = -280;
+              mario.airborne = true;
+              keyWasPressed['Space'] = true;
+              playSound(300, 0.08);
+            }
+          } else if (!keys['Space']) {
+            keyWasPressed['Space'] = false;
+          }
+          
+          if (keys['ArrowUp'] || keys['KeyW']) {
+            for (let ladder of ladders) {
+              if (Math.abs(mario.x - ladder.x) < 8 && ladder.fromGirder === mario.onGirder && !ladder.broken) {
+                mario.climbing = ladder;
+                mario.airborne = false;
+                break;
+              }
+            }
+          }
+        } else {
+          mario.vy = Math.min(mario.vy + 700 * dt, 400);
+          mario.y += mario.vy * dt;
+          
+          if (mario.y > getGirderY(mario.onGirder, mario.x)) {
+            mario.y = getGirderY(mario.onGirder, mario.x);
+            mario.vy = 0;
+            mario.airborne = false;
+          }
+        }
+      }
+    }
+    
+    function updateBarrels(dt) {
+      if (gameTime - lastBarrelThrow > dk.throwNext) {
+        barrels.push({ x: 100, y: getGirderY(5, 100), vx: 80 + level * 12, girder: 5, falling: false, onLadder: null });
+        lastBarrelThrow = gameTime;
+        dk.throwNext = 2.5 + Math.random() * (4 - 2.5 - (level - 1) * 0.3);
+        playSound(80, 0.1);
+      }
+      
+      for (let i = barrels.length - 1; i >= 0; i--) {
+        let b = barrels[i];
+        
+        if (b.onLadder) {
+          b.y += 100 * dt;
+          const ladder = b.onLadder;
+          const bottomY = getGirderY(ladder.fromGirder, ladder.x);
+          if (b.y >= bottomY) {
+            b.onLadder = null;
+            b.girder = ladder.fromGirder;
+            b.x = ladder.x;
+            b.y = bottomY;
+            b.falling = false;
+          }
+        } else if (b.falling) {
+          b.vy = Math.min(b.vy + 700 * dt, 400);
+          b.y += b.vy * dt;
+          b.x += 30 * (b.vx > 0 ? 1 : -1) * 0.3 * dt;
+          
+          const nextGirder = girders.find(g => Math.abs(g.index - b.girder) === 1);
+          if (nextGirder && b.y > getGirderY(nextGirder.index, b.x)) {
+            b.girder = nextGirder.index;
+            b.y = getGirderY(b.girder, b.x);
+            b.falling = false;
+            b.vx = b.x < 300 ? 80 + level * 12 : -(80 + level * 12);
+          }
+        } else {
+          b.x += (b.vx > 0 ? 1 : -1) * (80 + level * 12) * dt;
+          
+          const g = girders[b.girder];
+          if (b.x < g.left || b.x > g.right) {
+            if (b.x < 80) {
+              if (fireballs.length < (2 + level)) fireballs.push({ x: 70, y: getGirderY(0, 70), girder: 0, dir: 1, speed: 50 + level * 10 });
+              barrels.splice(i, 1);
+              continue;
+            }
+            b.falling = true;
+            b.vy = 0;
+          } else {
+            b.y = getGirderY(b.girder, b.x);
+            
+            if (Math.random() < 0.2) {
+              const ladder = ladders.find(l => l.fromGirder === b.girder && Math.abs(l.x - b.x) < 30);
+              if (ladder) {
+                b.onLadder = ladder;
+                b.falling = true;
+              }
+            }
+          }
+        }
+        
+        if (Math.abs(mario.x - b.x) < 18 && Math.abs(mario.y - b.y) < 20 && mario.hammerTime <= 0) {
+          gameState = STATES.DEATH;
+        }
+      }
+    }
+    
+    function updateFireballs(dt) {
+      for (let i = fireballs.length - 1; i >= 0; i--) {
+        let f = fireballs[i];
+        
+        f.x += f.dir * f.speed * dt;
+        if (f.x < girders[f.girder].left) f.x = girders[f.girder].left;
+        if (f.x > girders[f.girder].right) { f.dir *= -1; f.x = girders[f.girder].right; }
+        
+        f.y = getGirderY(f.girder, f.x);
+        
+        if (Math.abs(mario.x - f.x) < 18 && Math.abs(mario.y - f.y) < 20 && mario.hammerTime <= 0) {
+          gameState = STATES.DEATH;
+        }
+      }
+    }
+    
+    function updateHammers(dt) {
+      for (let h of hammers) {
+        if (!h.collected && Math.abs(mario.x - h.x) < 24 && Math.abs(mario.y - h.y) < 24) {
+          h.collected = true;
+          mario.hammerTime = 10;
+          playSound(440, 0.08);
+        }
+      }
+    }
+    
+    function renderGirders() {
+      for (let g of girders) {
+        ctx.fillStyle = '#CC4400';
+        ctx.beginPath();
+        ctx.moveTo(g.left, g.leftY);
+        ctx.lineTo(g.right, g.rightY);
+        ctx.lineTo(g.right, g.rightY + 8);
+        ctx.lineTo(g.left, g.leftY + 8);
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
+    
+    function renderLadders() {
+      for (let l of ladders) {
+        if (l.broken && Math.sin(gameTime * 2) < 0) continue;
+        ctx.strokeStyle = '#66CCFF';
+        ctx.lineWidth = 2;
+        const g1 = girders[l.fromGirder];
+        const g2 = girders[l.toGirder];
+        const y1 = getGirderY(l.fromGirder, l.x);
+        const y2 = getGirderY(l.toGirder, l.x);
+        ctx.beginPath();
+        ctx.moveTo(l.x - 6, y1);
+        ctx.lineTo(l.x - 6, y2);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(l.x + 6, y1);
+        ctx.lineTo(l.x + 6, y2);
+        ctx.stroke();
+        for (let y = y1; y <= y2; y += 10) {
+          ctx.beginPath();
+          ctx.moveTo(l.x - 6, y);
+          ctx.lineTo(l.x + 6, y);
+          ctx.stroke();
+        }
+      }
+    }
+    
+    function renderMario() {
+      if (gameState === STATES.DEATH) return;
+      ctx.fillStyle = '#0000AA';
+      ctx.fillRect(mario.x - 8, mario.y - 16, 16, 22);
+      ctx.fillStyle = '#CC0000';
+      ctx.fillRect(mario.x - 8, mario.y - 20, 16, 6);
+      ctx.fillStyle = '#FFAA77';
+      ctx.beginPath();
+      ctx.arc(mario.x, mario.y - 22, 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    
+    function renderDK() {
+      ctx.fillStyle = '#8B4513';
+      ctx.beginPath();
+      ctx.arc(100, 140, 24, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#CD853F';
+      ctx.fillRect(85, 135, 30, 20);
+      ctx.fillStyle = '#000000';
+      ctx.fillRect(95, 125, 10, 8);
+    }
+    
+    function renderPauline() {
+      ctx.fillStyle = '#FF69B4';
+      ctx.fillRect(330, 60, 12, 20);
+      ctx.fillStyle = '#FFAA77';
+      ctx.beginPath();
+      ctx.arc(336, 50, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = Math.sin(gameTime * 3) > 0 ? '#FF69B4' : '#00FFFF';
+      ctx.font = '12px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('HELP!', 336, 35);
+    }
+    
+    function renderBarrels() {
+      for (let b of barrels) {
+        ctx.fillStyle = '#CD853F';
+        ctx.fillRect(b.x - 8, b.y - 7, 16, 14);
+        ctx.strokeStyle = '#8B4513';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(b.x - 8, b.y - 1);
+        ctx.lineTo(b.x + 8, b.y - 1);
+        ctx.stroke();
+      }
+    }
+    
+    function renderFireballs() {
+      for (let f of fireballs) {
+        ctx.fillStyle = '#FF4400';
+        ctx.beginPath();
+        ctx.arc(f.x, f.y, 6, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    
+    function renderHammers() {
+      for (let h of hammers) {
+        if (h.collected) continue;
+        ctx.fillStyle = '#8B4513';
+        ctx.fillRect(h.x - 2, h.y, 4, 12);
+        ctx.fillStyle = '#AAAAAA';
+        ctx.fillRect(h.x - 7, h.y - 8, 14, 10);
+      }
+    }
+    
+    function renderHUD() {
+      ctx.fillStyle = '#FF0000';
+      ctx.font = '12px monospace';
+      ctx.fillText('SCORE', 20, 14);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = '16px monospace';
+      ctx.fillText(String(score).padStart(6, '0'), 20, 30);
+      
+      ctx.fillStyle = '#FF0000';
+      ctx.font = '12px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('HIGH SCORE', 336, 14);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = '16px monospace';
+      ctx.fillText(String(bestScore).padStart(6, '0'), 336, 30);
+      
+      ctx.fillStyle = '#00CCFF';
+      ctx.font = '12px monospace';
+      ctx.textAlign = 'right';
+      ctx.fillText('BONUS', 620, 14);
+      ctx.fillStyle = bonusTimer < 1000 ? '#FF4444' : '#FFFFFF';
+      ctx.font = '16px monospace';
+      ctx.fillText(String(Math.max(0, Math.floor(bonusTimer))).padStart(5, '0'), 620, 30);
+      
+      ctx.textAlign = 'left';
+    }
+    
+    function renderTitleScreen() {
+      renderGirders();
+      renderLadders();
+      renderDK();
+      renderPauline();
+      
+      ctx.fillStyle = '#FF4400';
+      ctx.font = 'bold 42px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('DONKEY KONG', 336, 350);
+      
+      ctx.font = '18px monospace';
+      ctx.fillStyle = Math.sin(gameTime * 3) > 0 ? '#FFFFFF' : '#333333';
+      ctx.fillText('Press Enter to Start', 336, 500);
+      
+      ctx.fillStyle = '#555555';
+      ctx.font = '14px monospace';
+      ctx.fillText('Best: ' + bestScore, 336, 540);
+    }
+    
+    function renderGameOverScreen() {
+      ctx.fillStyle = '#FF0000';
+      ctx.font = '40px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('GAME OVER', 336, 320);
+      
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = '24px monospace';
+      ctx.fillText('Score: ' + score, 336, 370);
+      
+      ctx.fillStyle = '#AAAAAA';
+      ctx.font = '16px monospace';
+      ctx.fillText('Level: ' + level, 336, 435);
+      
+      ctx.fillStyle = Math.sin(gameTime * 3) > 0 ? '#FFFFFF' : '#333333';
+      ctx.font = '16px monospace';
+      ctx.fillText('Enter to play again', 336, 480);
+    }
+    
+    function playSound(freq, dur) {
+      if (!audioCtx) return;
+      try {
+        const now = audioCtx.currentTime;
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0.3, now);
+        gain.gain.linearRampToValueAtTime(0, now + dur);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(now);
+        osc.stop(now + dur);
+      } catch (e) {}
+    }
+    
+    function render() {
+      ctx.fillStyle = '#000000';
+      ctx.fillRect(0, 0, 672, 768);
+      
+      if (gameState === STATES.TITLE) {
+        renderTitleScreen();
+      } else if (gameState === STATES.GAME_OVER) {
+        renderGameOverScreen();
+      } else {
+        renderGirders();
+        renderLadders();
+        renderBarrels();
+        renderFireballs();
+        renderHammers();
+        renderMario();
+        renderDK();
+        renderPauline();
+        renderHUD();
+        
+        if (mario.hammerTime > 0) {
+          ctx.fillStyle = (mario.hammerTime < 2 && Math.sin(gameTime * 8) > 0) ? '#FF0000' : '#FFFF00';
+          ctx.font = '12px monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText('HAMMER', mario.x, mario.y - 40);
+        }
+        
+        if (gameState === STATES.PAUSED) {
+          ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+          ctx.fillRect(0, 36, 672, 696);
+          ctx.fillStyle = '#FFFFFF';
+          ctx.font = '36px monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText('PAUSED', 336, 400);
+        }
+      }
+    }
+    
+    let lastTime = 0;
+    function gameLoop(now) {
+      const dt = Math.min((now - lastTime) / 1000, 0.05);
+      lastTime = now;
+      gameTime += dt;
+      
+      if (gameState === STATES.TITLE) {
+        // idle
+      } else if (gameState === STATES.PLAYING) {
+        bonusTimer -= 50 * dt;
+        if (bonusTimer <= 0) gameState = STATES.DEATH;
+        
+        updateMario(dt);
+        updateBarrels(dt);
+        updateFireballs(dt);
+        updateHammers(dt);
+        
+        if (mario.y < 90 && mario.x > 220 && mario.x < 452) {
+          gameState = STATES.LEVEL_CLEAR;
+          score += Math.floor(bonusTimer);
+          if (score > bestScore) {
+            bestScore = score;
+            localStorage.setItem('donkeykong_best', bestScore);
+          }
+        }
+      } else if (gameState === STATES.DEATH) {
+        lives--;
+        if (lives >= 0) {
+          initLevel();
+          gameState = STATES.PLAYING;
+        } else {
+          gameState = STATES.GAME_OVER;
+        }
+      } else if (gameState === STATES.LEVEL_CLEAR) {
+        level++;
+        initLevel();
+        gameState = STATES.PLAYING;
+      }
+      
+      render();
+      requestAnimationFrame(gameLoop);
+    }
+    
+    document.addEventListener('keydown', e => {
+      keys[e.code] = true;
+      
+      if (e.code === 'Enter') {
+        e.preventDefault();
+        if (gameState === STATES.TITLE) {
+          if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          score = 0;
+          lives = 3;
+          level = 1;
+          initLevel();
+          gameState = STATES.PLAYING;
+        } else if (gameState === STATES.GAME_OVER) {
+          gameState = STATES.TITLE;
+        }
+      } else if (e.code === 'KeyP' || e.code === 'Escape') {
+        e.preventDefault();
+        if (gameState === STATES.PLAYING) gameState = STATES.PAUSED;
+        else if (gameState === STATES.PAUSED) gameState = STATES.PLAYING;
+      }
+    });
+    
+    document.addEventListener('keyup', e => {
+      keys[e.code] = false;
+    });
+    
+    initLevel();
+    gameState = STATES.TITLE;
+    requestAnimationFrame(gameLoop);
+  </script>
+</body>
+</html>

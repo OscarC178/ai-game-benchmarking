@@ -1,0 +1,266 @@
+<!--
+  GAME:      Pong
+  RUN:       r4-glm5
+  BUILDER:   openai/gpt-5.4-mini
+-->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>PONG</title>
+<style>
+  html,body{height:100%;margin:0;background:#000;display:flex;align-items:center;justify-content:center}
+  #container{width:100vmin;height:75vmin;max-width:800px;max-height:600px;position:relative}
+  canvas{width:100%;height:100%;display:block;background:#000}
+  #overlay{position:absolute;left:0;top:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center;color:#fff;font-family:'Courier New',monospace;pointer-events:none;white-space:pre-wrap;text-align:center}
+</style>
+</head>
+<body>
+<div id="container">
+  <canvas id="c" width="800" height="600"></canvas>
+  <div id="overlay" aria-hidden="true"></div>
+</div>
+<script>
+(() => {
+  // Constants (canvas coordinates fixed)
+  const W = 800, H = 600;
+  const P_W = 15, P_H = 100;
+  const LEFT_X = 30, RIGHT_X = 800 - 30 - P_W; // 755
+  const BALL_SIZE = 15;
+  // speeds given in px/frame in spec: convert to px/sec using 60fps baseline
+  const BASE_FRAME = 60;
+  const PADDLE_SPEED_FRAME = 8; // px/frame
+  const PADDLE_SPEED = PADDLE_SPEED_FRAME * BASE_FRAME; // px/s
+  const BALL_SPEED_FRAME = 5; const BALL_SPEED = BALL_SPEED_FRAME * BASE_FRAME; // px/s
+  const BALL_MAX_FRAME = 12; const BALL_MAX_SPEED = BALL_MAX_FRAME * BASE_FRAME; // px/s
+  const SPEED_INCREASE = 1.03; // 3% per paddle hit
+  const MAX_BOUNCE_ANGLE = (30*Math.PI)/180; // spec initial said 30-60 deg, but for bounce we choose 60? Spec earlier used 45; this time use 60? The spec wants angle between 30-60 for serve. For bounce we'll use 60 deg max
+  const BOUNCE_ANGLE = (60*Math.PI)/180;
+  const SCORE_TO_WIN = 11;
+  const SERVE_PAUSE = 700; // ms pause after score
+
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+  const overlay = document.getElementById('overlay');
+
+  // State
+  let state = 'title'; // title, playing, paused, serve, gameover
+  let lastTime = performance.now();
+  let serveAt = 0;
+  let servingTo = 1; // 1 = left (player1) conceded, 2 = right conceded
+
+  // Entities
+  const p1 = { x: LEFT_X, y: (H - P_H)/2, w: P_W, h: P_H, vy:0, flash:0 };
+  const p2 = { x: RIGHT_X, y: (H - P_H)/2, w: P_W, h: P_H, vy:0, flash:0 };
+  const ball = { x: W/2 - BALL_SIZE/2, y: H/2 - BALL_SIZE/2, w: BALL_SIZE, h: BALL_SIZE, vx:0, vy:0, speed: BALL_SPEED };
+  const score = { left:0, right:0 };
+
+  // visuals
+  let trail = [];
+  const TRAIL_MAX = 6;
+  let particles = [];
+
+  // Input
+  const keys = { w:false, s:false, ArrowUp:false, ArrowDown:false, Space:false };
+  window.addEventListener('keydown', e=>{
+    const k = e.key;
+    if(k==='w' || k==='W') keys.w = true;
+    if(k==='s' || k==='S') keys.s = true;
+    if(k==='ArrowUp') keys.ArrowUp = true;
+    if(k==='ArrowDown') keys.ArrowDown = true;
+    if(k===' '){ keys.Space = true; e.preventDefault(); }
+    if(k==='r' || k==='R'){ if(state==='gameover' || state==='playing' || state==='paused') restartGame(); }
+    if(k==='Escape'){ toTitle(); }
+    // handle space actions
+    if(k===' ' || k==='Enter'){
+      if(state==='title'){ startGame(); }
+      else if(state==='serve'){ serve(); }
+      else if(state==='playing'){ togglePause(); }
+      else if(state==='paused'){ togglePause(); }
+    }
+  });
+  window.addEventListener('keyup', e=>{
+    const k = e.key;
+    if(k==='w' || k==='W') keys.w = false;
+    if(k==='s' || k==='S') keys.s = false;
+    if(k==='ArrowUp') keys.ArrowUp = false;
+    if(k==='ArrowDown') keys.ArrowDown = false;
+    if(k===' ') keys.Space = false;
+  });
+  window.addEventListener('blur', ()=>{ // reset keys
+    for(const k in keys) keys[k]=false;
+  });
+
+  // Audio (simple beeps)
+  let audioCtx = null, audioOk=false;
+  function unlockAudio(){ if(audioOk) return; audioOk=true; audioCtx = new (window.AudioContext||window.webkitAudioContext)(); }
+  window.addEventListener('pointerdown', unlockAudio, {once:true});
+  window.addEventListener('keydown', (e)=>{ if(e.key===' '||e.key==='Enter') unlockAudio(); }, {once:true});
+  function beep(freq, dur=0.1, type='square'){ if(!audioOk) return; const o = audioCtx.createOscillator(); const g = audioCtx.createGain(); o.type = type; o.frequency.value = freq; o.connect(g); g.connect(audioCtx.destination); g.gain.setValueAtTime(0.0001, audioCtx.currentTime); g.gain.exponentialRampToValueAtTime(0.12, audioCtx.currentTime+0.01); o.start(); g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime+dur); o.stop(audioCtx.currentTime+dur+0.02); }
+
+  // Utilities
+  function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
+  function aabb(a,b){ return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y; }
+
+  // Game control
+  function startGame(){ score.left = 0; score.right = 0; resetPositions(); state = 'serve'; overlayText('Press Space to Serve'); }
+  function restartGame(){ score.left = 0; score.right = 0; resetPositions(); state='serve'; overlayText('Press Space to Serve'); }
+  function toTitle(){ resetPositions(); score.left=0; score.right=0; state='title'; overlayText('PONG\nPress Space to Start\nW/S - Player 1   ↑/↓ - Player 2'); }
+  function resetPositions(){ p1.y = (H - P_H)/2; p2.y = (H - P_H)/2; p1.vy = p2.vy = 0; p1.flash=0; p2.flash=0; ball.x = W/2 - BALL_SIZE/2; ball.y = H/2 - BALL_SIZE/2; ball.speed = BALL_SPEED; ball.vx = ball.vy = 0; trail = []; particles = []; }
+
+  function serve(){ // choose direction toward player who conceded last point (servingTo). If none, random
+    let dirX = Math.random() < 0.5 ? -1 : 1;
+    if(typeof servingTo === 'number'){
+      // servingTo indicates who conceded (1=left conceded -> serve toward left, so dirX = -1)
+      dirX = (servingTo===1)? -1 : 1;
+    }
+    // angle between 30 and 60 degrees
+    const angleDeg = 30 + Math.random() * 30; const angle = angleDeg * Math.PI/180;
+    const up = Math.random() < 0.5 ? -1 : 1;
+    ball.speed = BALL_SPEED;
+    ball.vx = Math.cos(angle) * ball.speed * dirX;
+    ball.vy = Math.sin(angle) * ball.speed * up;
+    state = 'playing'; overlayText('');
+  }
+
+  function togglePause(){ if(state==='playing'){ state='paused'; overlayText('PAUSED\nPress Space to Resume'); } else if(state==='paused'){ state='playing'; overlayText(''); }
+  }
+
+  function scorePoint(scoredLeft){ // scoredLeft true means left scored (ball passed right)
+    if(scoredLeft){ score.left += 1; servingTo = 2; } else { score.right += 1; servingTo = 1; }
+    // visual & audio
+    beep(150,0.4,'sawtooth');
+    // check win
+    if(score.left >= SCORE_TO_WIN || score.right >= SCORE_TO_WIN){ state='gameover'; overlayText((score.left>score.right? 'PLAYER 1 WINS!':'PLAYER 2 WINS!') + '\nPress R to Play Again\nEsc for Title'); }
+    else {
+      state='serve'; overlayText('Press Space to Serve'); // reset positions but keep scores
+      resetPositions(); // ball centered
+    }
+  }
+
+  // Collisions
+  function handleCollisions(dt){ // wall collisions
+    if(ball.y <= 0){ ball.y = 0; ball.vy = -ball.vy; createWallParticles(ball.x+ball.w/2, 0); beep(300,0.08,'square'); }
+    if(ball.y + ball.h >= H){ ball.y = H - ball.h; ball.vy = -ball.vy; createWallParticles(ball.x+ball.w/2, H); beep(300,0.08,'square'); }
+    // paddle collisions - use continuous-ish detection by checking overlap
+    // left paddle
+    if(aabb(ball, p1) && ball.vx < 0){ // compute intersection
+      // compute offset: (ballCenter - paddleCenter)
+      const intersectY = (ball.y + ball.h/2) - (p1.y + p1.h/2);
+      const normalized = clamp(intersectY / (p1.h/2), -1, 1);
+      const bounceAngle = normalized * BOUNCE_ANGLE;
+      // set direction right
+      ball.speed = Math.min(BALL_MAX_SPEED, ball.speed * SPEED_INCREASE);
+      const dir = 1;
+      ball.vx = Math.cos(bounceAngle) * ball.speed * dir;
+      ball.vy = Math.sin(bounceAngle) * ball.speed * -1; // invert so positive normalized -> up => negative vy
+      // reposition
+      ball.x = p1.x + p1.w + 0.5;
+      p1.flash = 6; // frames
+      createPaddleParticles(p1.x + p1.w, ball.y + ball.h/2);
+      beep(600,0.08,'square');
+    }
+    // right paddle
+    if(aabb(ball, p2) && ball.vx > 0){
+      const intersectY = (ball.y + ball.h/2) - (p2.y + p2.h/2);
+      const normalized = clamp(intersectY / (p2.h/2), -1, 1);
+      const bounceAngle = normalized * BOUNCE_ANGLE;
+      ball.speed = Math.min(BALL_MAX_SPEED, ball.speed * SPEED_INCREASE);
+      const dir = -1;
+      ball.vx = Math.cos(bounceAngle) * ball.speed * dir;
+      ball.vy = Math.sin(bounceAngle) * ball.speed * -1;
+      ball.x = p2.x - ball.w - 0.5;
+      p2.flash = 6;
+      createPaddleParticles(p2.x, ball.y + ball.h/2);
+      beep(600,0.08,'square');
+    }
+    // scoring
+    if(ball.x + ball.w < 0){ // passed left
+      scorePoint(false); // right scores
+    } else if(ball.x > W){ // passed right
+      scorePoint(true); // left scores
+    }
+  }
+
+  function createWallParticles(x,y){ for(let i=0;i<10;i++){ particles.push({x:x + (Math.random()-0.5)*30, y:y + (Math.random()-0.5)*10, vx:(Math.random()-0.5)*80, vy:(Math.random()-0.5)*80, life:30}); } }
+  function createPaddleParticles(x,y){ for(let i=0;i<8;i++){ particles.push({x:x, y:y, vx:(Math.random()-0.5)*120, vy:(Math.random()-0.5)*80, life:24}); } }
+
+  // Update
+  function update(dt){ if(state==='title' || state==='gameover') return; if(state==='serve'){
+      // allow both players to move paddles while ball centered
+      updatePaddles(dt);
+      return;
+    }
+    if(state==='paused') return;
+    // playing
+    updatePaddles(dt);
+    // move ball
+    ball.x += ball.vx * dt;
+    ball.y += ball.vy * dt;
+    // trail
+    trail.unshift({x:ball.x, y:ball.y, a:1}); if(trail.length>TRAIL_MAX) trail.pop();
+    // collisions
+    handleCollisions(dt);
+    // particles
+    for(let i=particles.length-1;i>=0;i--){ const p = particles[i]; p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 200*dt; p.life -= 1; if(p.life<=0) particles.splice(i,1); }
+    // flash decay
+    if(p1.flash>0) p1.flash--; if(p2.flash>0) p2.flash--;
+  }
+
+  function updatePaddles(dt){ // p1: W/S
+    let dy1=0; if(keys.w && !keys.s) dy1 = -PADDLE_SPEED; else if(keys.s && !keys.w) dy1 = PADDLE_SPEED; p1.y += dy1 * dt; p1.y = clamp(p1.y, 0, H - p1.h);
+    // p2: arrows
+    let dy2=0; if(keys.ArrowUp && !keys.ArrowDown) dy2 = -PADDLE_SPEED; else if(keys.ArrowDown && !keys.ArrowUp) dy2 = PADDLE_SPEED; p2.y += dy2 * dt; p2.y = clamp(p2.y, 0, H - p2.h);
+  }
+
+  // Render
+  function render(){ // clear
+    ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H);
+    // center dashed line
+    ctx.fillStyle = 'rgba(255,255,255,0.6)'; const dash=20, gap=10; const midX = W/2 - 1;
+    for(let y=20;y<H-20;y+=dash+gap){ ctx.fillRect(midX, y, 2, dash); }
+    // score
+    ctx.fillStyle = '#fff'; ctx.font = '48px "Courier New", monospace'; ctx.textAlign='center'; ctx.fillText(score.left + '     ' + score.right, W/2, 40);
+    // paddles (flash effect)
+    ctx.fillStyle = p1.flash>0 ? '#ffea8a' : '#fff'; ctx.fillRect(Math.round(p1.x), Math.round(p1.y), p1.w, p1.h);
+    ctx.fillStyle = p2.flash>0 ? '#ffea8a' : '#fff'; ctx.fillRect(Math.round(p2.x), Math.round(p2.y), p2.w, p2.h);
+    // ball trail
+    for(let i=trail.length-1;i>=0;i--){ const t = trail[i]; const alpha = (i+1)/trail.length * 0.5; ctx.fillStyle = 'rgba(255,255,255,'+alpha+')'; ctx.fillRect(Math.round(t.x), Math.round(t.y), ball.w, ball.h); }
+    // ball
+    ctx.fillStyle = '#fff'; ctx.fillRect(Math.round(ball.x), Math.round(ball.y), ball.w, ball.h);
+    // particles
+    for(const p of particles){ ctx.fillStyle = 'rgba(255,255,255,'+ (p.life/30) +')'; ctx.fillRect(Math.round(p.x), Math.round(p.y), 2,2); }
+    // overlays
+    if(state==='title'){
+      ctx.fillStyle = '#fff'; ctx.font='84px "Courier New", monospace'; ctx.textAlign='center'; ctx.fillText('PONG', W/2, H/2 - 60);
+      ctx.font='18px "Courier New", monospace'; ctx.fillText('W/S - Player 1    ↑/↓ - Player 2', W/2, H/2 + 10);
+      ctx.fillText('Press Space to Start', W/2, H/2 + 40);
+    }
+    if(state==='serve'){
+      ctx.fillStyle='rgba(0,0,0,0.4)'; ctx.fillRect(0,0,W,H);
+      ctx.fillStyle='#fff'; ctx.font='24px "Courier New", monospace'; ctx.textAlign='center'; ctx.fillText('Press Space to Serve', W/2, H/2 - 10);
+    }
+    if(state==='paused'){
+      ctx.fillStyle='rgba(0,0,0,0.5)'; ctx.fillRect(0,0,W,H);
+      ctx.fillStyle='#fff'; ctx.font='48px "Courier New", monospace'; ctx.textAlign='center'; ctx.fillText('PAUSED', W/2, H/2 - 20);
+      ctx.font='18px "Courier New", monospace'; ctx.fillText('Press Space to Resume    R to Restart', W/2, H/2 + 20);
+    }
+    if(state==='gameover'){
+      ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(0,0,W,H);
+      ctx.fillStyle='#fff'; ctx.font='48px "Courier New", monospace'; ctx.textAlign='center'; const winner = score.left>score.right? 'PLAYER 1 WINS!':'PLAYER 2 WINS!'; ctx.fillText(winner, W/2, H/2 - 20);
+      ctx.font='18px "Courier New", monospace'; ctx.fillText('Press R to Play Again    Esc for Title', W/2, H/2 + 20);
+    }
+  }
+
+  // Main loop
+  function frame(ts){ const dt = Math.min(0.05, (ts - lastTime)/1000); lastTime = ts; update(dt); render(); requestAnimationFrame(frame); }
+
+  // Start
+  toTitle(); lastTime = performance.now(); requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>

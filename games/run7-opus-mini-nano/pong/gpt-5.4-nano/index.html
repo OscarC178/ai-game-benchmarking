@@ -1,0 +1,557 @@
+<!-- pong | spec:run7-opus-mini-nano | built-by:gpt-5.4-nano -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <title>Pong</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #000;
+      height: 100%;
+      overflow: hidden;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+    .wrap {
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    canvas {
+      width: 800px;
+      height: 600px;
+      image-rendering: pixelated;
+      display: block;
+      background: #000;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <canvas id="c" width="800" height="600" aria-label="Pong game" role="application"></canvas>
+  </div>
+
+  <script>
+    <!-- Pong | spec:run1-opus-plan | built-by:gpt-5.4-nano -->
+    (() => {
+      const canvas = document.getElementById('c');
+      const ctx = canvas.getContext('2d', { alpha: false });
+
+      const W = canvas.width, H = canvas.height;
+      const BG = '#000000';
+
+      // Game settings
+      const WIN_SCORE = 7;
+
+      // Paddle specs
+      const PADDLE_W = 12, PADDLE_H = 80;
+      const PLAYER_X = 30;
+      const CPU_X = 758;
+
+      // Ball
+      const BALL_SIZE = 12;
+      const BALL_CENTER_X = 394, BALL_CENTER_Y = 294;
+      const INITIAL_BALL_SPEED = 350;
+      const BALL_SPEED_INC = 25;
+      const BALL_SPEED_CAP = 600;
+
+      // Controls
+      const keys = new Set();
+      let mouseMoved = false;
+
+      // Audio (optional)
+      let audioCtx = null;
+      function ensureAudio() {
+        if (!audioCtx) {
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+      }
+      function playTone(freq, durationMs, type = 'square', gainValue = 0.05, startTimeOffset = 0) {
+        try {
+          ensureAudio();
+          const now = audioCtx.currentTime + startTimeOffset;
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = type;
+          osc.frequency.setValueAtTime(freq, now);
+          gain.gain.setValueAtTime(gainValue, now);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + durationMs / 1000);
+          osc.connect(gain).connect(audioCtx.destination);
+          osc.start(now);
+          osc.stop(now + durationMs / 1000 + 0.02);
+        } catch (e) {
+          // ignore audio errors
+        }
+      }
+      function playHit() {
+        playTone(440, 50, 'square', 0.05);
+      }
+      function playWall() {
+        playTone(220, 50, 'square', 0.045);
+      }
+      function playScoreTone() {
+        // descending tone 660->330Hz over 200ms
+        try {
+          ensureAudio();
+          const now = audioCtx.currentTime;
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = 'square';
+          osc.frequency.setValueAtTime(660, now);
+          osc.frequency.exponentialRampToValueAtTime(330, now + 0.2);
+          gain.gain.setValueAtTime(0.06, now);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.2);
+          osc.connect(gain).connect(audioCtx.destination);
+          osc.start(now);
+          osc.stop(now + 0.2 + 0.03);
+        } catch (e) {}
+      }
+
+      // State machine
+      const State = { IDLE: 'IDLE', PLAYING: 'PLAYING', PAUSED: 'PAUSED', GAME_OVER: 'GAME_OVER' };
+      let state = State.IDLE;
+
+      // High score storage (wins by player)
+      const HS_KEY = 'pong_highscore_v1';
+      function loadHighScore() {
+        const v = localStorage.getItem(HS_KEY);
+        const n = Number(v);
+        return Number.isFinite(n) ? n : 0;
+      }
+      function saveHighScore(score) {
+        try {
+          const current = loadHighScore();
+          if (score > current) localStorage.setItem(HS_KEY, String(score));
+        } catch (e) {}
+      }
+      let highScore = loadHighScore();
+
+      // Entities
+      const player = {
+        x: PLAYER_X,
+        y: 260,
+        vx: 0,
+        vy: 0,
+        w: PADDLE_W,
+        h: PADDLE_H
+      };
+
+      const cpu = {
+        x: CPU_X,
+        y: 260,
+        vy: 0,
+        w: PADDLE_W,
+        h: PADDLE_H
+      };
+
+      const ball = {
+        x: BALL_CENTER_X,
+        y: BALL_CENTER_Y,
+        vx: 0,
+        vy: 0,
+        size: BALL_SIZE,
+        speed: INITIAL_BALL_SPEED
+      };
+
+      // Timing
+      let lastTs = 0;
+      let pausedOverlayAlpha = 0;
+
+      // Scoring / delays
+      let scorePlayer = 0;
+      let scoreCPU = 0;
+      let serveTimer = 0; // delay after scoring
+      let lastScoredSide = null; // 'player'|'cpu' indicates who should receive serve? spec: reset then relaunch toward player who was scored upon
+      // meaning: if CPU scored (ball passed left), player scored? Actually: CPU scores +1 when ball passes left edge. Then ball should launch toward the player who was scored upon -> towards CPU paddle. If CPU scored, ball was at left edge, so launch toward player who was scored upon = CPU (since CPU just scored and "was scored upon" doesn't quite match). Let's align with text: "launches toward the player who was scored upon". When CPU scores, the player was scored upon? CPU got point, so player is scored upon. So launch toward player (left). When player scores, CPU is scored upon -> launch toward CPU (right).
+      // We'll implement accordingly:
+      // if left edge crossed -> CPU score++, launch toward LEFT (player).
+      // if right edge crossed -> player score++, launch toward RIGHT (CPU).
+      // That matches "toward player who was scored upon."
+
+      // Helpers
+      function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+      function resetPaddles() {
+        player.y = 260;
+        cpu.y = 260;
+      }
+
+      function resetBallToCenter() {
+        ball.x = BALL_CENTER_X;
+        ball.y = BALL_CENTER_Y;
+        ball.speed = INITIAL_BALL_SPEED;
+        ball.vx = 0;
+        ball.vy = 0;
+      }
+
+      function randomAngleSign() {
+        // Random angle ±30 degrees
+        const deg = 30 * (Math.random() < 0.5 ? -1 : 1);
+        return deg;
+      }
+
+      function launchBall(toward) {
+        // toward: 'left' or 'right' indicates horizontal direction of launch
+        // Random angle within ±30° from horizontal
+        const angleDeg = randomAngleSign() * (Math.random() * 0.5 + 0.5); // slightly varied within 15-30 degrees magnitude
+        const angleRad = angleDeg * Math.PI / 180;
+
+        // speed uses ball.speed current (but spec: initial speed 350 each point reset; and increases per paddle hit).
+        const sp = ball.speed;
+
+        const dirX = toward === 'left' ? -1 : 1;
+
+        // angle relative to horizontal: vy = sin(angle)*speed, vx = cos(angle)*speed
+        ball.vx = dirX * Math.cos(angleRad) * sp;
+        ball.vy = Math.sin(angleRad) * sp;
+      }
+
+      function startGame() {
+        scorePlayer = 0;
+        scoreCPU = 0;
+        serveTimer = 0;
+        lastScoredSide = null;
+        resetPaddles();
+        resetBallToCenter();
+        ball.speed = INITIAL_BALL_SPEED;
+        // Ball launches random angle toward a random side at start
+        const toward = Math.random() < 0.5 ? 'left' : 'right';
+        launchBall(toward);
+        state = State.PLAYING;
+      }
+
+      function endGame() {
+        state = State.GAME_OVER;
+        saveHighScore(scorePlayer);
+      }
+
+      function togglePause() {
+        if (state === State.PLAYING) state = State.PAUSED;
+        else if (state === State.PAUSED) state = State.PLAYING;
+      }
+
+      function handleServeDirectionAfterPoint() {
+        // lastScoredSide indicates who scored: 'cpu' or 'player'
+        // if cpu scored (ball passed left edge), launch toward LEFT (player).
+        // if player scored (ball passed right edge), launch toward RIGHT (cpu).
+        if (lastScoredSide === 'cpu') launchBall('left');
+        else launchBall('right');
+      }
+
+      // Input
+      window.addEventListener('keydown', (e) => {
+        const k = e.key;
+        if (k === 'ArrowUp' || k === 'ArrowDown' || k === 'w' || k === 'W' || k === 's' || k === 'S' || k === 'Enter' || k === 'p' || k === 'P') {
+          e.preventDefault();
+        }
+
+        if (k === 'ArrowUp' || k === 'ArrowDown' || k === 'w' || k === 'W' || k === 's' || k === 'S') {
+          keys.add(k);
+        }
+
+        if (k === 'Enter') {
+          // Start / Restart
+          if (state === State.IDLE) {
+            playScoreTone(); // subtle feedback
+            startGame();
+          } else if (state === State.GAME_OVER) {
+            playScoreTone();
+            state = State.IDLE;
+            // start immediately
+            startGame();
+          }
+        }
+        if (k === 'p' || k === 'P') {
+          if (state === State.PLAYING || state === State.PAUSED) togglePause();
+        }
+
+        if (audioCtx && audioCtx.state === 'suspended') {
+          // Attempt to resume on user gesture
+          audioCtx.resume().catch(() => {});
+        }
+      }, { passive: false });
+
+      window.addEventListener('keyup', (e) => {
+        const k = e.key;
+        if (k === 'ArrowUp' || k === 'ArrowDown' || k === 'w' || k === 'W' || k === 's' || k === 'S') {
+          keys.delete(k);
+        }
+      });
+
+      // Ensure audio starts on first interaction
+      window.addEventListener('pointerdown', () => {
+        try {
+          ensureAudio();
+          if (audioCtx.state === 'suspended') audioCtx.resume();
+        } catch (e) {}
+      }, { passive: true });
+
+      // Rendering
+      function drawCenterLine() {
+        const lineX = 400;
+        ctx.fillStyle = '#444444';
+        // spec: segments 15px with 10px gaps, 4px wide line
+        const seg = 15, gap = 10, w = 4;
+        for (let y = 0; y < H; y += seg + gap) {
+          ctx.fillRect(lineX - w/2, y, w, seg);
+        }
+      }
+
+      function drawPaddle(p) {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(p.x - p.w/2 + p.w/2 ? p.x : p.x, p.y, p.w, p.h);
+      }
+
+      function drawBall() {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(ball.x, ball.y, ball.size, ball.size);
+      }
+
+      function drawScores() {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+
+        ctx.font = '48px monospace';
+        ctx.fillText(String(scorePlayer), 300, 50);
+        ctx.fillText(String(scoreCPU), 500, 50);
+
+        // High score
+        highScore = loadHighScore();
+        ctx.fillStyle = '#888888';
+        ctx.font = '12px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        const hsText = highScore > 0 ? `HIGH: ${highScore}` : 'HIGH: 0';
+        ctx.fillText(hsText, 400, 16);
+      }
+
+      function drawStartScreen() {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.font = '64px monospace';
+        ctx.fillText('PONG', 400, 200);
+
+        ctx.fillStyle = '#AAAAAA';
+        ctx.font = '20px monospace';
+        ctx.fillText('Press Enter to Start', 400, 350);
+      }
+
+      function drawGameOverScreen() {
+        drawScores();
+        const winnerText = scorePlayer >= WIN_SCORE ? 'YOU WIN' : 'GAME OVER';
+        ctx.fillStyle = '#FFFFFF';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.font = '48px monospace';
+        ctx.fillText(winnerText, 400, 260);
+
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '24px monospace';
+        // Final score below
+        ctx.fillText(`${scorePlayer} - ${scoreCPU}`, 400, 315);
+
+        ctx.fillStyle = '#AAAAAA';
+        ctx.font = '18px monospace';
+        ctx.fillText('Press Enter to Restart', 400, 365);
+      }
+
+      function drawPausedOverlay() {
+        ctx.save();
+        ctx.fillStyle = '#000000CC';
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = '#FFFFFF';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.font = '36px monospace';
+        ctx.fillText('PAUSED', 400, 300);
+        ctx.restore();
+      }
+
+      function drawPlaying() {
+        // Background
+        ctx.fillStyle = BG;
+        ctx.fillRect(0, 0, W, H);
+
+        // Center line
+        drawCenterLine();
+
+        // Draw paddles & ball
+        drawPaddle(player);
+        drawPaddle(cpu);
+        drawBall();
+
+        // Scores + high score
+        drawScores();
+      }
+
+      // Physics & collisions
+      function paddleHit(paddle) {
+        const paddleCenterY = paddle.y + paddle.h / 2;
+        const ballCenterY = ball.y + ball.size / 2;
+        const offset = (ballCenterY - paddleCenterY) / (paddle.h / 2); // -1..1-ish
+        const angle = offset * (Math.PI / 3); // ±60°
+
+        // Determine direction: if hitting player (left), reflect to right; if hitting cpu (right), reflect to left
+        const dirX = (paddle === player) ? 1 : -1;
+
+        const sp = Math.min(ball.speed, BALL_SPEED_CAP);
+        ball.speed = Math.min(ball.speed + BALL_SPEED_INC, BALL_SPEED_CAP);
+
+        ball.vx = dirX * Math.cos(angle) * ball.speed;
+        ball.vy = Math.sin(angle) * ball.speed;
+      }
+
+      function aabbIntersect(ax, ay, aw, ah, bx, by, bw, bh) {
+        return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+      }
+
+      function update(dt) {
+        if (state !== State.PLAYING) return;
+
+        // Serve delay handling
+        if (serveTimer > 0) {
+          serveTimer -= dt;
+          if (serveTimer <= 0) {
+            handleServeDirectionAfterPoint();
+            serveTimer = 0;
+          } else {
+            // Keep ball at center during delay
+            ball.x = BALL_CENTER_X;
+            ball.y = BALL_CENTER_Y;
+            return;
+          }
+        }
+
+        // Player input
+        const speed = 400;
+        let move = 0;
+        if (keys.has('ArrowUp') || keys.has('w') || keys.has('W')) move -= 1;
+        if (keys.has('ArrowDown') || keys.has('s') || keys.has('S')) move += 1;
+
+        player.vy = move * speed;
+        player.y += player.vy * dt;
+        player.y = clamp(player.y, 0, H - player.h);
+
+        // CPU AI (imperfect)
+        const cpuMax = 300;
+        const targetCenter = (ball.y + ball.size / 2);
+        const cpuCenter = (cpu.y + cpu.h / 2);
+        const error = targetCenter - cpuCenter;
+
+        // Desired velocity toward target (with cap)
+        let desiredVy = clamp(error * 8, -cpuMax, cpuMax); // proportional-ish for responsiveness
+        // Slight smoothing/easing factor 0.08
+        cpu.vy += (desiredVy - cpu.vy) * 0.08;
+        // Ensure cap after smoothing
+        cpu.vy = clamp(cpu.vy, -cpuMax, cpuMax);
+
+        cpu.y += cpu.vy * dt;
+        cpu.y = clamp(cpu.y, 0, H - cpu.h);
+
+        // Move ball
+        ball.x += ball.vx * dt;
+        ball.y += ball.vy * dt;
+
+        // Wall bounce (top/bottom)
+        if (ball.y <= 0) {
+          ball.y = 0;
+          ball.vy *= -1;
+          playWall();
+        } else if (ball.y + ball.size >= H) {
+          ball.y = H - ball.size;
+          ball.vy *= -1;
+          playWall();
+        }
+
+        // Paddle collisions (AABB)
+        const ballA = { x: ball.x, y: ball.y, w: ball.size, h: ball.size };
+        const playerA = { x: player.x, y: player.y, w: player.w, h: player.h };
+        const cpuA = { x: cpu.x, y: cpu.y, w: cpu.w, h: cpu.h };
+
+        // If ball overlaps paddle region, reflect x
+        if (ball.vx < 0 && aabbIntersect(ballA.x, ballA.y, ballA.w, ballA.h, playerA.x, playerA.y, playerA.w, playerA.h)) {
+          // Place ball just to the right of paddle to prevent sticking
+          ball.x = player.x + player.w;
+          paddleHit(player);
+          playHit();
+        } else if (ball.vx > 0 && aabbIntersect(ballA.x, ballA.y, ballA.w, ballA.h, cpuA.x, cpuA.y, cpuA.w, cpuA.h)) {
+          // Place ball just to the left of CPU paddle
+          ball.x = cpu.x - ball.size;
+          paddleHit(cpu);
+          playHit();
+        }
+
+        // Scoring: ball passes left/right edge
+        if (ball.x + ball.size < 0) {
+          // CPU scores
+          scoreCPU += 1;
+          playScoreTone();
+          if (scoreCPU >= WIN_SCORE) {
+            endGame();
+          } else {
+            lastScoredSide = 'cpu';
+            resetBallToCenter();
+            ball.speed = INITIAL_BALL_SPEED;
+            serveTimer = 1.0; // 1-second delay
+          }
+        } else if (ball.x > W) {
+          // Player scores
+          scorePlayer += 1;
+          playScoreTone();
+          if (scorePlayer >= WIN_SCORE) {
+            endGame();
+          } else {
+            lastScoredSide = 'player';
+            resetBallToCenter();
+            ball.speed = INITIAL_BALL_SPEED;
+            serveTimer = 1.0; // 1-second delay
+          }
+        }
+      }
+
+      function render(ts) {
+        const now = ts;
+        const dt = lastTs ? Math.min(0.05, (now - lastTs) / 1000) : 0;
+        lastTs = now;
+
+        // Draw base according to state
+        if (state === State.IDLE) {
+          ctx.fillStyle = BG;
+          ctx.fillRect(0, 0, W, H);
+          drawStartScreen();
+        } else {
+          drawPlaying();
+
+          if (state === State.PAUSED) {
+            drawPausedOverlay();
+          } else if (state === State.GAME_OVER) {
+            // Overwrite with game over screen
+            ctx.fillStyle = BG;
+            ctx.fillRect(0, 0, W, H);
+            // Center line and last positions can remain, but spec wants overlay-style screen.
+            // We'll just draw game over screen fully.
+            drawGameOverScreen();
+          }
+        }
+
+        update(dt);
+        requestAnimationFrame(render);
+      }
+
+      requestAnimationFrame((ts) => {
+        lastTs = ts;
+        // Initial frame: ensure black and start screen
+        ctx.fillStyle = BG;
+        ctx.fillRect(0, 0, W, H);
+        drawStartScreen();
+        requestAnimationFrame(render);
+      });
+    })();
+  </script>
+</body>
+</html>

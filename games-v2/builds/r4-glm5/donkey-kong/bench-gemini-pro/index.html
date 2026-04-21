@@ -1,0 +1,830 @@
+<!--
+  GAME:      Donkey Kong
+  RUN:       r4-glm5
+  BUILDER:   google/gemini-3-pro-preview
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Donkey Kong</title>
+<style>
+    body {
+        margin: 0;
+        background-color: #111;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        height: 100vh;
+        overflow: hidden;
+        color: white;
+        font-family: monospace;
+    }
+    #game-container {
+        position: relative;
+    }
+    canvas {
+        background-color: #000;
+        box-shadow: 0 0 20px rgba(0,0,0,0.5);
+        image-rendering: crisp-edges;
+    }
+    #ui {
+        width: 448px;
+        display: flex;
+        justify-content: space-between;
+        margin-bottom: 5px;
+        font-size: 18px;
+        font-weight: bold;
+    }
+</style>
+</head>
+<body>
+
+<div id="game-container">
+    <div id="ui">
+        <div>SCORE: <span id="score-val">0</span></div>
+        <div>HIGH: <span id="hi-val">0</span></div>
+    </div>
+    <canvas id="gameCanvas" width="448" height="512"></canvas>
+    <div style="margin-top: 5px; display:flex; justify-content:space-between; width: 448px;">
+        <div id="lives-container">LIVES: 3</div>
+        <div id="timer-container">TIME: 4000</div>
+    </div>
+</div>
+
+<script>
+// --- CONSTANTS ---
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const scoreEl = document.getElementById('score-val');
+const hiEl = document.getElementById('hi-val');
+const livesEl = document.getElementById('lives-container');
+const timeEl = document.getElementById('timer-container');
+
+const W = canvas.width;  // 448
+const H = canvas.height; // 512
+
+const ST_TITLE = 0;
+const ST_READY = 1;
+const ST_PLAY = 2;
+const ST_DEAD = 3;
+const ST_CLEAR = 4;
+const ST_OVER = 5;
+const ST_PAUSE = 6;
+
+// Physics
+const GRAVITY = 3;
+const WALK_SPEED = 2;
+const CLIMB_SPEED = 1.5;
+const JUMP_DUR = 20; // frames at 60fps
+const JUMP_H = 45;
+
+// Variables
+let state = ST_TITLE;
+let stateTimer = 0;
+let score = 0;
+let highScore = parseInt(localStorage.getItem('dk_hi')) || 0;
+let lives = 3;
+let levelNum = 1; // 1 to 4 loop
+let timeBonus = 4000;
+let timeTickTimer = 0;
+
+hiEl.innerText = highScore;
+
+// Ents
+let mario = null;
+let dk = { x: 60, y: 80, w: 48, h: 48, throwTimer: 0 };
+let pauline = { x: 280, y: 50, w: 16, h: 24 };
+let oilDrum = { x: 30, y: H - 40 - 24, w: 24, h: 24, animTimer: 0 }; // Baseline bot plat y=H-40
+
+let platforms = [];
+let ladders = [];
+let barrels = [];
+let fireballs = [];
+let hammers = [];
+let rivets = [];
+
+// Input
+const keys = { ArrowUp:false, ArrowDown:false, ArrowLeft:false, ArrowRight:false, w:false, a:false, s:false, d:false, ' ':false, p:false, r:false };
+let spacePressed = false;
+
+// --- STAGE SETUP ---
+
+function buildStage() {
+    platforms = [];
+    ladders = [];
+    hammers = [];
+    rivets = [];
+    barrels = [];
+    fireballs = [];
+    
+    // Simplification: We will just loop Stage 1 (Girders) dynamics to ensure it's fully playable and solid.
+    // The spec asks for 4 stages but MVP needs "At least Stage 1 fully playable". Single reliable stage is safer for one-shot constraint.
+    
+    let platThick = 16;
+    
+    // Row 1 (Bottom, slopes up slightly right) y ~ 472 at left
+    platforms.push({ x: 0, y: H-40, w: W-40, thick: platThick, slope: -0.02 });
+    
+    // Row 2 (slopes down right)
+    platforms.push({ x: 40, y: H-120, w: W-40, thick: platThick, slope: 0.04 });
+    
+    // Row 3 (slopes up right)
+    platforms.push({ x: 0, y: H-200, w: W-40, thick: platThick, slope: -0.04 });
+    
+    // Row 4 (slopes down right)
+    platforms.push({ x: 40, y: H-280, w: W-40, thick: platThick, slope: 0.04 });
+    
+    // Row 5 (slopes up right)
+    platforms.push({ x: 0, y: H-360, w: W-40, thick: platThick, slope: -0.04 });
+    
+    // Top flat rows
+    platforms.push({ x: 0, y: 130, w: 150, thick: platThick, slope: 0 }); // DK platform
+    platforms.push({ x: 220, y: 130, w: W, thick: platThick, slope: 0 }); // Middle upper
+    platforms.push({ x: 250, y: 74, w: W, thick: platThick, slope: 0 }); // Pauline platform
+
+    // Ladders defined by connect points to make climbing strict
+    function addLad(x, yT, yB, broken=false) {
+        if (!broken) ladders.push({ x: x, topY: yT, botY: yB, broken: false });
+        else {
+            ladders.push({ x: x, topY: yT, botY: yT + 20, broken: true });
+            ladders.push({ x: x, topY: yB - 20, botY: yB, broken: true });
+        }
+    }
+
+    // Connect R1 to R2
+    addLad(W-80, H-120 + (W-80-40)*0.04, H-40 - (W-80)*0.02);
+    addLad(W-140, H-120 + (W-140-40)*0.04, H-40 - (W-140)*0.02, true);
+
+    // R2 to R3
+    addLad(80, H-200 - 80*0.04, H-120 + (80-40)*0.04);
+    addLad(150, H-200 - 150*0.04, H-120 + (150-40)*0.04, true);
+
+    // R3 to R4
+    addLad(W-80, H-280 + (W-80-40)*0.04, H-200 - (W-80)*0.04);
+    addLad(W-180, H-280 + (W-180-40)*0.04, H-200 - (W-180)*0.04);
+
+    // R4 to R5
+    addLad(80, H-360 - 80*0.04, H-280 + (80-40)*0.04);
+    addLad(130, H-360 - 130*0.04, H-280 + (130-40)*0.04, true);
+    
+    // R5 to Top
+    addLad(W-80, 130, H-360 - (W-80)*0.04);
+    
+    // Top to Pauline
+    addLad(280, 74, 130);
+    addLad(320, 74, 130);
+
+    // Hammers
+    hammers.push({ x: 30, y: H-250, active: true, w:24, h:16 });
+    hammers.push({ x: W-60, y: H-320, active: true, w:24, h:16 });
+}
+
+function getPlatformY(x, p) {
+    if (x >= p.x && x <= p.x + p.w) {
+        return p.y + (x - p.x) * p.slope;
+    }
+    return p.y; // fallback
+}
+
+function getPlatformAt(x, yBot) {
+    let best = null;
+    let bestDist = 15; // Snap tolerance
+    for (let p of platforms) {
+        if (x >= p.x && x <= p.x + p.w) {
+            let py = p.y + (x - p.x) * p.slope;
+            let dist = py - yBot;
+            if (dist >= -5 && dist < bestDist) {
+                bestDist = dist;
+                best = p;
+            }
+        }
+    }
+    return best;
+}
+
+function findLadderAtExtremes(x, yBot, tol=8) {
+    // Check if at bottom or top of a valid climbing ladder
+    for (let l of ladders) {
+        if (l.broken) continue;
+        if (Math.abs(x - l.x) <= tol) {
+            if (Math.abs(yBot - l.botY) <= 5) return { ladder: l, type: 'bot' };
+            if (Math.abs(yBot - l.topY) <= 5) return { ladder: l, type: 'top' };
+            
+            // Mid climbing
+            if (yBot <= l.botY + 5 && yBot >= l.topY - 5) return { ladder: l, type: 'mid' };
+        }
+    }
+    return null;
+}
+
+// --- INIT ---
+
+function resetMario() {
+    mario = {
+        x: 60,
+        y: H - 40 - 20,
+        w: 14, h: 20,
+        vx: 0, vy: 0,
+        facing: 1, // 1 R, -1 L
+        state: 'stand', // stand, walk, climb, jump, fall, dead
+        jumpFrame: 0,
+        jumpStartY: 0,
+        climbLadder: null,
+        animFrame: 0, animTimer: 0,
+        hammerTimer: 0,
+        invuln: 0 // Optional brief safe
+    };
+}
+
+function startLevel() {
+    buildStage();
+    resetMario();
+    timeBonus = Math.max(2000, 5000 - levelNum * 500);
+    dk.throwTimer = 0;
+    
+    state = ST_READY;
+    stateTimer = 2.0;
+}
+
+function startGame() {
+    score = 0;
+    scoreEl.innerText = score;
+    lives = 3;
+    levelNum = 1;
+    startLevel();
+}
+
+// --- INPUT ---
+window.addEventListener('keydown', e => {
+    let k = e.key;
+    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(k)) e.preventDefault();
+    
+    if (k === 'ArrowLeft' || k.toLowerCase() === 'a') keys.ArrowLeft = true;
+    if (k === 'ArrowRight' || k.toLowerCase() === 'd') keys.ArrowRight = true;
+    if (k === 'ArrowUp' || k.toLowerCase() === 'w') keys.ArrowUp = true;
+    if (k === 'ArrowDown' || k.toLowerCase() === 's') keys.ArrowDown = true;
+    
+    if (k === ' ') {
+        keys[' '] = true;
+        if (!spacePressed) {
+            spacePressed = true;
+            if (state === ST_TITLE) startGame();
+            else if (state === ST_PLAY && mario.state !== 'jump' && mario.state !== 'climb' && mario.state !== 'fall') {
+                mario.state = 'jump';
+                mario.jumpFrame = 0;
+                mario.jumpStartY = mario.y;
+            }
+        }
+    }
+    if (k.toLowerCase() === 'r') {
+        if (state === ST_OVER || state === ST_PAUSE) startGame();
+    }
+    if (k.toLowerCase() === 'p' || k === 'Escape') {
+        if (state === ST_PLAY) state = ST_PAUSE;
+        else if (state === ST_PAUSE) state = ST_PLAY;
+    }
+});
+
+window.addEventListener('keyup', e => {
+    let k = e.key;
+    if (k === 'ArrowLeft' || k.toLowerCase() === 'a') keys.ArrowLeft = false;
+    if (k === 'ArrowRight' || k.toLowerCase() === 'd') keys.ArrowRight = false;
+    if (k === 'ArrowUp' || k.toLowerCase() === 'w') keys.ArrowUp = false;
+    if (k === 'ArrowDown' || k.toLowerCase() === 's') keys.ArrowDown = false;
+    if (k === ' ') { keys[' '] = false; spacePressed = false; }
+});
+
+// --- ENTITY UPDATES ---
+
+function addScore(pts) {
+    score += pts;
+    scoreEl.innerText = score;
+    if (score > highScore) {
+        highScore = score;
+        hiEl.innerText = highScore;
+        localStorage.setItem('dk_hi', highScore);
+    }
+}
+
+function updateMario(dt) {
+    if (mario.state === 'dead') return;
+    
+    // Hammer degrade
+    if (mario.hammerTimer > 0) {
+        mario.hammerTimer -= dt;
+        if (mario.hammerTimer <= 0) mario.hammerTimer = 0;
+    }
+
+    // Anim timer
+    mario.animTimer += dt;
+    if (mario.animTimer > 0.1) {
+        mario.animTimer = 0;
+        mario.animFrame = (mario.animFrame + 1) % 3;
+    }
+
+    let yBot = mario.y + mario.h;
+    let xc = mario.x + mario.w/2;
+    
+    // CLIMBING LOGIC
+    if (mario.hammerTimer <= 0) {
+        let lData = findLadderAtExtremes(xc, yBot);
+        
+        if (mario.state !== 'jump' && mario.state !== 'fall') {
+            if ((keys.ArrowUp && lData && (lData.type === 'bot' || lData.type === 'mid')) ||
+                (keys.ArrowDown && lData && (lData.type === 'top' || lData.type === 'mid'))) {
+                
+                mario.state = 'climb';
+                mario.x = lData.ladder.x - mario.w/2; // Center on ladder
+            }
+        }
+        
+        if (mario.state === 'climb') {
+            let l = lData ? lData.ladder : mario.climbLadder;
+            if (!l) l = findLadderAtExtremes(xc, yBot, 16)?.ladder; // looser active grab
+            
+            if (l) {
+                mario.climbLadder = l;
+                if (keys.ArrowUp) mario.y -= CLIMB_SPEED;
+                else if (keys.ArrowDown) mario.y += CLIMB_SPEED;
+                
+                // Climb exit conditions
+                yBot = mario.y + mario.h;
+                if (yBot <= l.topY) {
+                    mario.y = l.topY - mario.h;
+                    mario.state = 'stand';
+                    mario.climbLadder = null;
+                } else if (yBot >= l.botY && keys.ArrowDown) {
+                    mario.y = l.botY - mario.h;
+                    mario.state = 'stand';
+                    mario.climbLadder = null;
+                }
+                return; // Stop applying standard physics while climbing
+            } else {
+                // Slipped off
+                mario.state = 'fall';
+            }
+        }
+    }
+
+    // JUMP ARC
+    if (mario.state === 'jump') {
+        mario.jumpFrame++;
+        let prog = mario.jumpFrame / JUMP_DUR;
+        let h = Math.sin(prog * Math.PI) * JUMP_H;
+        
+        // Horizontal momentum during jump
+        if (keys.ArrowLeft) { mario.x -= WALK_SPEED * 0.8; mario.facing = -1; }
+        if (keys.ArrowRight) { mario.x += WALK_SPEED * 0.8; mario.facing = 1; }
+        
+        mario.y = mario.jumpStartY - h;
+        
+        if (mario.jumpFrame >= JUMP_DUR) {
+            mario.state = 'fall';
+        }
+    } 
+    // STAND/WALK/FALL PHYSICS
+    else if (mario.state !== 'climb') {
+        let p = getPlatformAt(xc, yBot);
+        
+        if (!p) {
+            mario.state = 'fall';
+            mario.y += GRAVITY;
+        } else {
+            // Grounded
+            mario.state = 'stand';
+            let targetY = getPlatformY(xc, p) - mario.h;
+            
+            // Snap to floor smoothly if falling, or strictly if walking
+            if (mario.y < targetY - 5) {
+                mario.y += GRAVITY; // still falling slightly
+                mario.state = 'fall';
+            } else {
+                mario.y = targetY; // Snapped
+                
+                if (keys.ArrowLeft) {
+                    mario.x -= WALK_SPEED;
+                    mario.facing = -1;
+                    mario.state = 'walk';
+                } else if (keys.ArrowRight) {
+                    mario.x += WALK_SPEED;
+                    mario.facing = 1;
+                    mario.state = 'walk';
+                }
+            }
+        }
+    }
+    
+    // Screen bounds
+    if (mario.x < 0) mario.x = 0;
+    if (mario.x > W - mario.w) mario.x = W - mario.w;
+    
+    // Death by fall pit
+    if (mario.y > H) triggerDeath();
+    
+    checkItemCollisions();
+}
+
+function triggerDeath() {
+    if (mario.state === 'dead') return;
+    mario.state = 'dead';
+    stateObj = ST_DEAD; // Local flag to pause standard updates immediately
+    state = ST_DEAD;
+    stateTimer = 2.0;
+}
+
+function checkItemCollisions() {
+    // Hammers
+    for (let h of hammers) {
+        if (h.active && AABB(mario.x, mario.y, mario.w, mario.h, h.x, h.y, h.w, h.h)) {
+            h.active = false;
+            mario.hammerTimer = 6.0; // 6 seconds
+        }
+    }
+
+    // Pauline Win Check
+    if (AABB(mario.x, mario.y, mario.w, mario.h, pauline.x, pauline.y, pauline.w, pauline.h)) {
+        addScore(timeBonus);
+        state = ST_CLEAR;
+        stateTimer = 3.0;
+    }
+}
+
+function updateEnemies(dt) {
+    let speedMult = 1.0 + (levelNum - 1) * 0.15;
+
+    // DK throws
+    dk.throwTimer -= dt;
+    if (dk.throwTimer <= 0) {
+        dk.throwTimer = Math.random() * 1.5 + 2.0;
+        
+        barrels.push({
+            x: dk.x + 40,
+            y: dk.y + 20,
+            w: 16, h: 16,
+            state: 'roll', // roll, fall, ladder
+            dir: 1, // 1 right, -1 left
+            spd: (Math.random() + 1.5) * speedMult,
+            ladder: null,
+            animRot: 0,
+            jumpedOver: false
+        });
+    }
+
+    // Update Barrels
+    for (let i = barrels.length - 1; i >= 0; i--) {
+        let b = barrels[i];
+        let xb = b.x + b.w/2;
+        let yb = b.y + b.h;
+        
+        if (b.state === 'roll') {
+            let p = getPlatformAt(xb, yb);
+            if (p) {
+                b.dir = p.slope >= 0 ? 1 : -1;
+                // Actually follow slope perfectly by relying on physics
+                let nextX = b.x + b.spd * b.dir;
+                b.x = nextX;
+                b.y = getPlatformY(nextX + b.w/2, p) - b.h;
+                
+                // Screen bounce
+                if (b.x < 0) { b.x = 0; b.dir *= -1; }
+                if (b.x > W - b.w) { b.x = W - b.w; b.state = 'fall'; } // Fall off end cap
+                
+                // Ladder check
+                let ld = findLadderAtExtremes(xb, yb);
+                if (ld && ld.type === 'top' && !ld.ladder.broken && Math.random() < 0.25) {
+                    b.state = 'ladder';
+                    b.ladder = ld.ladder;
+                    b.x = ld.ladder.x - b.w/2;
+                }
+            } else {
+                b.state = 'fall';
+            }
+            
+            b.animRot += b.spd * 0.1 * b.dir;
+            
+        } else if (b.state === 'ladder') {
+            b.y += 2 * speedMult;
+            if (b.y + b.h >= b.ladder.botY) {
+                b.state = 'roll';
+                // Find next platform to orient
+                let np = getPlatformAt(b.x + b.w/2, b.y + b.h);
+                if (np) b.y = getPlatformY(b.x + b.w/2, np) - b.h;
+            }
+        } else if (b.state === 'fall') {
+            b.y += GRAVITY;
+            let p = getPlatformAt(xb, b.y + b.h);
+            if (p && b.y + b.h - getPlatformY(xb, p) > 0) {
+                b.state = 'roll';
+                b.y = getPlatformY(xb, p) - b.h;
+                b.dir = Math.random() < 0.5 ? 1 : -1; // random dir on hard drop
+            }
+        }
+
+        // Barrel Cleanup
+        if (b.y > H + 50) barrels.splice(i, 1);
+    }
+}
+
+function AABB(x1, y1, w1, h1, x2, y2, w2, h2) {
+    return x1 < x2 + w2 && x1 + w1 > x2 && y1 < y2 + h2 && y1 + h1 > y2;
+}
+
+function checkDamageCollisions() {
+    if (mario.state === 'dead') return;
+
+    let mw = mario.w, mh = mario.h;
+    
+    // Hammer hit zone expanding bounding box
+    let hBox = null;
+    if (mario.hammerTimer > 0) {
+        hBox = {
+            x: mario.facing === 1 ? mario.x + mw : mario.x - 20,
+            y: mario.y - 10,
+            w: 20, h: 30
+        };
+    }
+
+    for (let i = barrels.length - 1; i >= 0; i--) {
+        let b = barrels[i];
+        
+        // Jump over check (Points)
+        if (!b.jumpedOver && mario.state === 'jump') {
+            if (Math.abs((mario.x + mw/2) - (b.x + b.w/2)) < 20) {
+                if (mario.y + mh <= b.y + 10) {
+                    addScore(100);
+                    b.jumpedOver = true;
+                }
+            }
+        }
+
+        // Hammer Kill
+        if (hBox && Math.floor(mario.animFrame) === 1) { // Smash frame roughly
+            if (AABB(hBox.x, hBox.y, hBox.w, hBox.h, b.x, b.y, b.w, b.h)) {
+                addScore(500);
+                barrels.splice(i, 1);
+                continue;
+            }
+        }
+
+        // Death Collision
+        if (AABB(mario.x + 2, mario.y + 2, mw - 4, mh - 4, b.x + 2, b.y + 2, b.w - 4, b.h - 4)) {
+            triggerDeath();
+            break;
+        }
+    }
+}
+
+function update(dt) {
+    if (state === ST_TITLE || state === ST_PAUSE || state === ST_OVER) return;
+
+    if (state === ST_READY) {
+        stateTimer -= dt;
+        if (stateTimer <= 0) state = ST_PLAY;
+        return;
+    }
+
+    if (state === ST_DEAD) {
+        stateTimer -= dt;
+        if (stateTimer <= 0) {
+            lives--;
+            livesEl.innerText = `LIVES: ${lives}`;
+            if (lives <= 0) state = ST_OVER;
+            else startLevel(); // Restart stage
+        }
+        return;
+    }
+
+    if (state === ST_CLEAR) {
+        stateTimer -= dt;
+        if (stateTimer <= 0) {
+            levelNum++;
+            startLevel();
+        }
+        return;
+    }
+
+    // --- PLAY STATE ---
+    timeTickTimer += dt;
+    if (timeTickTimer >= 1.0) {
+        timeTickTimer = 0;
+        timeBonus -= 100;
+        if (timeBonus < 0) timeBonus = 0;
+        timeEl.innerText = `TIME: ${timeBonus}`;
+        if (timeBonus === 0) triggerDeath();
+    }
+
+    oilDrum.animTimer += dt;
+
+    updateMario(dt);
+    updateEnemies(dt);
+    checkDamageCollisions();
+}
+
+
+// --- RENDERING ---
+
+function drawRect(x, y, w, h, c) {
+    ctx.fillStyle = c;
+    ctx.fillRect(Math.floor(x), Math.floor(y), w, h);
+}
+
+function render() {
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+
+    if (state === ST_TITLE) {
+        ctx.fillStyle = '#FFF';
+        ctx.font = 'bold 40px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText("DONKEY KONG", W/2, H/3);
+        
+        ctx.font = '20px monospace';
+        let blink = Math.floor(performance.now() / 500) % 2 === 0;
+        if (blink) ctx.fillText("PRESS SPACE TO START", W/2, H/2 + 20);
+        return;
+    }
+
+    // Platforms
+    ctx.fillStyle = '#C02020'; // Red framework
+    for (let p of platforms) {
+        ctx.save();
+        ctx.translate(p.x, p.y);
+        ctx.rotate(Math.atan(p.slope));
+        // Draw girder thickness
+        ctx.fillRect(0, 0, p.w / Math.cos(Math.atan(p.slope)), p.thick);
+        
+        // Detail lines
+        ctx.strokeStyle = '#000';
+        ctx.beginPath();
+        for(let i=10; i<p.w; i+=20) {
+            ctx.moveTo(i, 0); ctx.lineTo(i-5, p.thick);
+            ctx.moveTo(i, 0); ctx.lineTo(i+5, p.thick);
+        }
+        ctx.stroke();
+        ctx.restore();
+    }
+
+    // Ladders
+    ctx.fillStyle = '#0FF';
+    for (let l of ladders) {
+        if (l.broken && Math.floor(performance.now() / 150) % 2 === 0) continue; // broken flash visual context
+        ctx.fillRect(l.x - 6, l.topY, 2, l.botY - l.topY);
+        ctx.fillRect(l.x + 4, l.topY, 2, l.botY - l.topY);
+        for(let ry = l.topY + 5; ry < l.botY; ry += 10) {
+            ctx.fillRect(l.x - 6, ry, 12, 2);
+        }
+    }
+
+    // Items
+    for (let h of hammers) {
+        if (h.active) {
+            ctx.fillStyle = '#8B4513';
+            ctx.fillRect(h.x + 10, h.y, 4, 16);
+            ctx.fillStyle = '#777';
+            ctx.fillRect(h.x + 4, h.y, 16, 8);
+        }
+    }
+
+    // Objects
+    // Oil Drum
+    drawRect(oilDrum.x, oilDrum.y, oilDrum.w, oilDrum.h, '#00A');
+    if (Math.floor(oilDrum.animTimer * 10) % 2 === 0) {
+        ctx.fillStyle = '#F00'; ctx.fillRect(oilDrum.x+4, oilDrum.y-10, 16, 10);
+        ctx.fillStyle = '#FF0'; ctx.fillRect(oilDrum.x+8, oilDrum.y-8, 8, 8);
+    }
+
+    // Pauline
+    drawRect(pauline.x, pauline.y, pauline.w, pauline.h, '#F0F');
+    drawRect(pauline.x+4, pauline.y-6, 8, 6, '#FDC'); // face
+
+    // DK
+    drawRect(dk.x, dk.y, dk.w, dk.h, '#8B4513');
+    drawRect(dk.x + 10, dk.y + 10, 28, 20, '#D2B48C'); // Chest/face combo simple
+    // Arms animating throw
+    ctx.fillStyle = '#8B4513';
+    if (dk.throwTimer < 0.5) {
+        ctx.fillRect(dk.x - 10, dk.y - 10, 15, 40); // Arm up
+        ctx.fillRect(dk.x + dk.w + 5, dk.y + 10, 15, 30); // Arm side
+    } else {
+        ctx.fillRect(dk.x - 10, dk.y + 10, 15, 30); // Arm down
+        ctx.fillRect(dk.x + dk.w + 5, dk.y + 10, 15, 30); // Arm down
+    }
+
+    // Barrels
+    for (let b of barrels) {
+        ctx.save();
+        ctx.translate(b.x + b.w/2, b.y + b.h/2);
+        if (b.state === 'roll') ctx.rotate(b.animRot);
+        
+        ctx.fillStyle = '#D2691E';
+        ctx.beginPath(); ctx.arc(0, 0, b.w/2, 0, Math.PI*2); ctx.fill();
+        ctx.strokeStyle = '#000';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        // Bands
+        ctx.moveTo(-b.w/2 + 2, -b.h/2 + 2); ctx.lineTo(-b.w/2 + 2, b.h/2 - 2);
+        ctx.moveTo(b.w/2 - 2, -b.h/2 + 2); ctx.lineTo(b.w/2 - 2, b.h/2 - 2);
+        ctx.stroke();
+        
+        ctx.restore();
+    }
+
+    // Mario
+    if (mario && state !== ST_DEAD) {
+        ctx.save();
+        ctx.translate(Math.floor(mario.x) + mario.w/2, Math.floor(mario.y) + mario.h/2);
+        ctx.scale(mario.facing, 1);
+        
+        // Pants / Body
+        ctx.fillStyle = '#0000FF'; // Blue overalls
+        ctx.fillRect(-mario.w/2, 0, mario.w, mario.h/2);
+        
+        // Shirt / Arms
+        ctx.fillStyle = '#FF0000'; // Red shirt
+        ctx.fillRect(-mario.w/2, -mario.h/2 + 4, mario.w, mario.h/2 - 4);
+        
+        // Head / Hat
+        ctx.fillRect(-mario.w/2, -mario.h/2 - 4, mario.w, 4); // Hat bill
+        ctx.fillStyle = '#FFCCCB'; // Skin
+        ctx.fillRect(-mario.w/2 + 2, -mario.h/2, mario.w - 4, 6); // Face
+        
+        // Legs anim
+        ctx.fillStyle = '#000'; // shoes
+        if (mario.state === 'walk' && mario.animFrame === 1) {
+            ctx.fillRect(-mario.w/2, mario.h/2, 6, 4); // back leg stretched
+            ctx.fillRect(mario.w/2 - 4, mario.h/2, 6, 4); // front leg
+        } else {
+            ctx.fillRect(-mario.w/2 + 2, mario.h/2, 4, 4); // standard
+            ctx.fillRect(mario.w/2 - 6, mario.h/2, 4, 4);
+        }
+
+        // Hammer Drawing
+        if (mario.hammerTimer > 0) {
+            ctx.rotate(mario.animFrame === 1 ? Math.PI/4 : -Math.PI/4);
+            ctx.fillStyle = '#8B4513';
+            ctx.fillRect(-2, -18, 4, 20); // HANDLE
+            ctx.fillStyle = '#777';
+            ctx.fillRect(-10, -22, 20, 8); // HEAD
+        }
+
+        ctx.restore();
+    } else if (state === ST_DEAD && mario) {
+        // Spin death
+        ctx.save();
+        ctx.translate(Math.floor(mario.x) + mario.w/2, Math.floor(mario.y) + mario.h/2);
+        ctx.rotate((2.0 - stateTimer) * Math.PI * 4); // Spin rapidly
+        ctx.fillStyle = '#FF0000';
+        ctx.fillRect(-mario.w/2, -mario.h/2, mario.w, mario.h);
+        ctx.fillStyle = '#0000FF';
+        ctx.fillRect(-mario.w/2, 0, mario.w, mario.h/2);
+        ctx.restore();
+    }
+
+    // Overlays
+    if (state === ST_READY) {
+        ctx.fillStyle = '#FFF'; ctx.font = 'bold 30px monospace'; ctx.textAlign='center';
+        ctx.fillText("READY!", W/2, H/2);
+    } else if (state === ST_PAUSE) {
+        ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0,0,W,H);
+        ctx.fillStyle = '#FFF'; ctx.font = 'bold 30px monospace'; ctx.textAlign='center';
+        ctx.fillText("PAUSED", W/2, H/2);
+    } else if (state === ST_OVER) {
+        ctx.fillStyle = 'rgba(0,0,0,0.8)'; ctx.fillRect(0,0,W,H);
+        ctx.fillStyle = '#F00'; ctx.font = 'bold 40px monospace'; ctx.textAlign='center';
+        ctx.fillText("GAME OVER", W/2, H/2);
+        let blink = Math.floor(performance.now() / 500) % 2 === 0;
+        if (blink) {
+            ctx.fillStyle = '#FFF'; ctx.font = '20px monospace';
+            ctx.fillText("PRESS R TO RESTART", W/2, H/2 + 40);
+        }
+    } else if (state === ST_CLEAR) {
+        ctx.fillStyle = 'rgba(0,0,0,0.7)'; ctx.fillRect(0,0,W,H);
+        ctx.fillStyle = '#0F0'; ctx.font = 'bold 30px monospace'; ctx.textAlign='center';
+        ctx.fillText("STAGE COMPLETE!", W/2, H/2 - 20);
+        ctx.fillStyle = '#FF0'; ctx.font = '20px monospace';
+        ctx.fillText(`BONUS +${timeBonus}`, W/2, H/2 + 20);
+    }
+}
+
+// --- MAIN LOOP ---
+let _lastTime = 0;
+function loop(timestamp) {
+    if (!_lastTime) _lastTime = timestamp;
+    let dt = (timestamp - _lastTime) / 1000;
+    _lastTime = timestamp;
+    
+    if (dt > 0.1) dt = 0.1; // lag guard
+    
+    update(dt);
+    render();
+    
+    requestAnimationFrame(loop);
+}
+
+requestAnimationFrame(loop);
+
+</script>
+</body>
+</html>

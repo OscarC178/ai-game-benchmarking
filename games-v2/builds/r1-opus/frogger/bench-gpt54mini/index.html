@@ -1,0 +1,170 @@
+<!--
+  GAME:      Frogger
+  RUN:       r1-opus
+  BUILDER:   openai/gpt-5.4-mini
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Frogger</title>
+<style>
+  html,body{margin:0;width:100%;height:100%;background:#000;display:flex;align-items:center;justify-content:center;overflow:hidden;}
+  canvas{display:block;background:#000;image-rendering:pixelated;}
+</style>
+</head>
+<body>
+<canvas id="c" width="644" height="740"></canvas>
+<script>
+(()=>{
+const W=644,H=740,CELL=46,OX=0,OY=26;
+const ROWS={home:0,river1:1,river2:2,river3:3,river4:4,river5:5,median:6,road1:7,road2:8,road3:9,road4:10,road5:11,start:12,hud:13};
+const keys=Object.create(null),prev=Object.create(null),buf=[];
+const canvas=document.getElementById('c'),ctx=canvas.getContext('2d');
+let last=performance.now(),state='TITLE',paused=false,blink=0,titlePulse=0;
+let score=0,best=+localStorage.getItem('frogger_best')||0,lives=3,level=1,extraGiven=false,timeLimit=30,timeLeft=30,farthestRow=12,deathT=0,respawnT=0,levelClearT=0,gameOverT=0,timerWarnT=0,bonusFlyT=0,flySlot=-1,flyOn=false,crocT=0,levelFlash=0;
+let frog=null, hop={active:false,t:0,from:null,to:null,dir:null}, slots=[], vehicles=[], logs=[], turtles=[], snake=null, crocs=[], particles=[];
+let audio=null, hopLatch=false;
+function acq(){if(audio)return; try{audio=new (window.AudioContext||window.webkitAudioContext)();}catch(e){audio=null;}}
+function tone(seq){if(!audio)return; const t=audio.currentTime; for(const s of seq){const o=audio.createOscillator(),g=audio.createGain(); o.type=s.type||'sine'; o.frequency.setValueAtTime(s.f0,t+(s.dl||0)/1000); if(s.f1!=null)o.frequency.exponentialRampToValueAtTime(s.f1,t+(s.dl||0+s.du)/1000); g.gain.setValueAtTime(s.g||0.2,t+(s.dl||0)/1000); g.gain.exponentialRampToValueAtTime(0.001,t+(s.dl||0+s.du)/1000); o.connect(g).connect(audio.destination); o.start(t+(s.dl||0)/1000); o.stop(t+(s.dl||0+s.du)/1000+0.02);} }
+const S={hop:()=>tone([{f0:300,du:30,g:0.12,type:'square'}]),home:()=>tone([{f0:523,du:80,g:0.2,type:'sine'},{f0:784,du:80,g:0.2,dl:80,type:'sine'}]),level:()=>tone([{f0:523,du:70,g:0.22,type:'sine'},{f0:659,du:70,g:0.22,dl:70,type:'sine'},{f0:784,du:70,g:0.22,dl:140,type:'sine'},{f0:1047,du:70,g:0.22,dl:210,type:'sine'}]),vehicle:()=>tone([{f0:150,du:150,g:0.25,type:'square'},{f0:120,du:50,dl:10,g:0.08,type:'noise'}]),splash:()=>tone([{f0:700,du:100,g:0.12,type:'sine'},{f0:200,du:180,g:0.18,type:'sawtooth'}]),tick:()=>tone([{f0:800,du:15,g:0.1,type:'square'}]),fly:()=>tone([{f0:880,du:100,g:0.18,type:'sine'},{f0:1320,du:100,g:0.18,dl:50,type:'sine'}]),extra:()=>tone([{f0:880,du:80,g:0.18,type:'sine'},{f0:1100,du:80,g:0.18,dl:80,type:'sine'}]),frogDeath:()=>tone([{f0:150,du:150,g:0.25,type:'square'},{f0:80,du:50,dl:20,g:0.12,type:'noise'}])};
+function clamp(v,a,b){return v<a?a:v>b?b:v;}
+function cellX(c){return c*CELL;} function cellY(r){return OY+r*CELL;}
+function mid(c){return c*CELL+CELL/2;}
+function mkFrog(){return {col:7,row:12,x:mid(7),y:cellY(12)+CELL/2,drawX:mid(7),drawY:cellY(12)+CELL/2,alive:true,dir:'up',timer:30,carryX:mid(7),carryY:cellY(12)+CELL/2,inv:0,far:12,deadPhase:0,deathReason:'',hopQueue:null};}
+function resetLevel(keepScore=true){if(!keepScore){score=0; lives=3; level=1; extraGiven=false;} slots=[false,false,false,false,false]; flyOn=false; flySlot=-1; bonusFlyT=0; levelFlash=0; initLaneObjects(); frog=mkFrog(); timeLimit=Math.max(20,30-(level-1)*2); timeLeft=timeLimit; farthestRow=12; hop.active=false; hop.t=0; hopQueue=null;}
+function initLaneObjects(){vehicles=[]; logs=[]; turtles=[]; crocs=[]; // vehicles
+const laneCfg=[
+ {row:7,type:'sedan',w:42,h:36,color:'#FFCC00',dir:-1,speed:80,gap:140,count:6},
+ {row:8,type:'race',w:42,h:36,color:'#FF4444',dir:1,speed:130,gap:160,count:5},
+ {row:9,type:'truck',w:88,h:36,color:'#CCCCCC',dir:-1,speed:60,gap:200,count:4},
+ {row:10,type:'sedan',w:42,h:36,color:'#FF8800',dir:1,speed:100,gap:120,count:6},
+ {row:11,type:'race',w:42,h:36,color:'#FF44FF',dir:-1,speed:140,gap:180,count:5},
+];
+ laneCfg.forEach((l,li)=>{const base=li*33.5; for(let i=0;i<l.count;i++){vehicles.push({lane:li,row:l.row,type:l.type,w:l.w,h:l.h,color:l.color,dir:l.dir,speed:l.speed*levelSpeed(),x:i*(l.w+l.gap)+ (l.dir===1?-i*10:0),y:cellY(l.row)+5});}});
+ // logs and turtles
+ const logCfg=[
+  {row:1,w:138,h:40,dir:1,speed:70,gap:220,count:3,color:'#8B4513',kind:'log'},
+  {row:3,w:184,h:40,dir:1,speed:50,gap:210,count:3,color:'#A0522D',kind:'log'},
+  {row:5,w:92,h:40,dir:1,speed:100,gap:180,count:4,color:'#6B3410',kind:'log'},
+  {row:2,w:138,h:32,dir:-1,speed:60,gap:240,count:4,kind:'turtle'},
+  {row:4,w:92,h:32,dir:-1,speed:90,gap:220,count:4,kind:'turtle'}
+ ];
+ logCfg.forEach((l,idx)=>{for(let i=0;i<l.count;i++){if(l.kind==='log'){logs.push({row:l.row,w:l.w,h:l.h,dir:l.dir,speed:l.speed*riverSpeed(),x:i*(l.w+l.gap)+(l.dir===1?-i*20:0),y:cellY(l.row)+3,color:l.color,bark:i%3,kind:'log'});} else {const dive=(i===1); turtles.push({row:l.row,w:l.w,h:l.h,dir:l.dir,speed:l.speed*riverSpeed(),x:i*(l.w+l.gap)+(l.dir===1?-i*10:0),y:cellY(l.row)+6,state:'surfaced',t:0,cycle:0,offset:Math.random()*4,dive:dive,kind:'turtle'});}}});
+ // snake/croc reset
+ snake=null; crocs=[]; if(level>=4){for(let i=0;i<2;i++) crocs.push({type:'home',slot:(i===0?1:3),x:0,y:0,t:rand(0,6),open:false,alive:true,duration:6});}
+ if(level>=3){spawnSnake();}
+}
+function levelSpeed(){return level===1?1:level===2?1.15:level===3?1.3:level===4?1.45:level===5?1.6:Math.min(2.5,1.6+(level-5)*0.1)}
+function riverSpeed(){return level===1?1:level===2?1.1:level===3?1.2:level===4?1.3:level===5?1.4:Math.min(2,1.4+(level-5)*0.1)}
+function levelTimer(){return Math.max(20,30-(level-1)*2)}
+function spawnSnake(){if(!logs.length) return; const candidates=logs.filter(l=>l.row===1||l.row===3||l.row===5); if(!candidates.length) return; const l=candidates[(Math.random()*candidates.length)|0]; snake={x:l.x+20,y:l.y+10,w:30,h:14,row:l.row,log:l,life:8+Math.random()*7,t:0}; }
+function init(){makeStars(); resetLevel(false); state='TITLE';}
+function makeStars(){stars=[]; for(let i=0;i<60;i++) stars.push({x:Math.random()*W,y:Math.random()*740,s:Math.random()*0.7+0.2,c:Math.random()<0.6?'#fff':'#99f',sp:0.3+Math.random()*0.7});}
+let stars=[];
+function zoneColor(r){if(r===0) return '#226622'; if(r>=1&&r<=5) return '#003388'; if(r===6) return '#332244'; if(r>=7&&r<=11) return '#1a1a1a'; if(r===12) return '#33AA33'; return '#000';}
+function rowOfY(y){return Math.floor((y-OY)/CELL);} 
+function centerOfFrog(){return {x:frog.x,y:frog.y}}
+function startHop(dir){if(!frog || hop.active || frog.deadPhase>0 || state==='GAME_OVER' || state==='PAUSED') return; const d=dir; let nc=frog.col, nr=frog.row; if(d==='left') nc--; if(d==='right') nc++; if(d==='up') nr--; if(d==='down') nr++; if(nc<0||nc>13||nr>12) return; hop.active=true; hop.t=0; hop.from={col:frog.col,row:frog.row,x:frog.x,y:frog.y}; hop.to={col:nc,row:nr,x:mid(nc),y:cellY(nr)+CELL/2}; hop.dir=d; frog.dir=d; S.hop();}
+function queueInput(dir){if(hop.active){if(!frog.hopQueue) frog.hopQueue=dir;} else startHop(dir);}
+function kill(reason){if(frog.deadPhase>0||state==='GAME_OVER' || state==='DEATH') return; frog.deadPhase=0.001; frog.deathReason=reason; deathT=0; respawnT=0; state='DEATH'; if(reason==='water') S.splash(); else S.frogDeath(); spawnParticles(frog.x,frog.y);} 
+function spawnParticles(x,y){for(let i=0;i<5;i++) particles.push({x,y,ang:Math.random()*Math.PI*2,sp:40+Math.random()*50,t:0,d:0.3});}
+function placeOnStart(){frog=mkFrog(); timeLeft=levelTimer(); farthestRow=12; hop.active=false; frog.hopQueue=null; frog.inv=0;}
+function completeHome(slotIdx){slots[slotIdx]=true; score+=50; if(flyOn && flySlot===slotIdx){score+=200; flyOn=false; flySlot=-1; S.fly();} const bonus=Math.floor(timeLeft)*10; score+=bonus; S.home(); if(score>best){best=score; localStorage.setItem('frogger_best',best);} if(slots.every(Boolean)){score+=1000; if(score>best){best=score; localStorage.setItem('frogger_best',best);} levelClearT=1.5; state='LEVEL_CLEAR'; levelFlash=1; S.level(); } else {respawnT=1; state='RESPAWN'; } }
+function platformUnderFrog(){const x=frog.x, y=frog.y, r=rowOfY(y); if(r===1||r===3||r===5){const arr=logs.filter(l=>l.row===r).concat(crocs.filter(c=>c.kind==='river'&&c.row===r)); for(const p of arr){if(x>=p.x && x<=p.x+p.w){return p;}}}
+ if(r===2||r===4){for(const t of turtles){if(t.row!==r || t.state==='submerged') continue; if(x>=t.x && x<=t.x+t.w) return t;}} return null; }
+function onRiverDeathCheck(){const r=rowOfY(frog.y); if(r<1||r>5) return false; const p=platformUnderFrog(); if(!p) {kill('water'); return true;} return false; }
+function onRoadDeathCheck(){const r=rowOfY(frog.y); if(r<7||r>11) return false; const rect={x:frog.x-15,y:frog.y-15,w:30,h:30}; for(const v of vehicles){if(v.row!==r) continue; if(rectsIntersect(rect,{x:v.x,y:v.y,w:v.w,h:v.h})) {kill('vehicle'); return true;}} return false; }
+function rectsIntersect(a,b){return a.x<a.w?false:false}
+function rectsIntersect(r1,r2){return r1.x<r2.x+r2.w && r1.x+r1.w>r2.x && r1.y<r2.y+r2.h && r1.y+r1.h>r2.y}
+function landCheck(){const r=rowOfY(frog.y); if(r===0){let matched=-1; const cx=frog.x; const centers=[1,4,7,10,13].map(c=>mid(c)); for(let i=0;i<5;i++){if(Math.abs(cx-centers[i])<=20){matched=i; break;}} if(matched>=0){if(slots[matched]) {kill('filled'); return;} if(crocs.some(c=>c.kind==='home'&&c.slot===matched && c.alive && c.open)){kill('croc'); return;} completeHome(matched); return;} kill('foliage'); return;} if(r===1||r===2||r===3||r===4||r===5){if(onRiverDeathCheck()) return;} if(r>=7&&r<=11){if(onRoadDeathCheck()) return;} }
+function timerColor(){if(timeLeft>10) return '#00CC00'; if(timeLeft>5) return '#FFCC00'; return '#FF4444';}
+function updateTimer(dt){if(state==='PLAYING'||state==='TITLE'){} if(state==='PLAYING'){timeLeft-=dt; if(timeLeft<=0){kill('timer');}}}
+function updateHop(dt){if(!hop.active) return; hop.t+=dt; const t=hop.t/0.08; const f=clamp(t,0,1); frog.drawX=hop.from.x+(hop.to.x-hop.from.x)*f; frog.drawY=hop.from.y+(hop.to.y-hop.from.y)*f; if(frog.drawY<cellY(12)+CELL/2) frog.dir=hop.dir; if(hop.t>=0.08){frog.col=hop.to.col; frog.row=hop.to.row; frog.x=hop.to.x; frog.y=hop.to.y; frog.drawX=frog.x; frog.drawY=frog.y; hop.active=false; landCheck(); if(frog.hopQueue){const q=frog.hopQueue; frog.hopQueue=null; startHop(q);} } }
+function updateLaneObjects(dt){const vehSpeedMul=levelSpeed(); const rivSpeedMul=riverSpeed(); for(const v of vehicles){v.x+=v.speed*vehSpeedMul*dt*v.dir; const span=v.w+ (v.type==='truck'?260:180); if(v.dir===-1 && v.x+v.w<-120) v.x = 660 + rand(0,200); if(v.dir===1 && v.x>660+120) v.x = -v.w - rand(0,200); }
+ for(const l of logs){l.x+=l.speed*dt*l.dir*rivSpeedMul; if(l.dir===1 && l.x>660+200) l.x = -l.w-rand(0,250); if(l.dir===-1 && l.x+l.w<-200) l.x = 660+rand(0,250); }
+ for(const t of turtles){t.x+=t.speed*dt*t.dir*rivSpeedMul; t.t+=dt; if(t.dir===-1 && t.x+t.w<-200) t.x=660+rand(0,250); if(t.dir===1 && t.x>660+200) t.x=-t.w-rand(0,250); if(t.dive){const c=t.t%4; if(c<4){} }
+   const cycle=t.t%7; // 4 visible, 0.5 sink, 2 submerged, 0.5 surface
+   if(cycle<4){t.state='surfaced'; t.alpha=1; t.yy=0;} else if(cycle<4.5){t.state='sinking'; t.alpha=1-((cycle-4)/0.5)*0.6; t.yy=((cycle-4)/0.5)*4;} else if(cycle<6.5){t.state='submerged'; t.alpha=0; t.yy=4;} else {t.state='surfacing'; t.alpha=0.4+((cycle-6.5)/0.5)*0.6; t.yy=4-((cycle-6.5)/0.5)*4; }
+ }
+ // snake follows a log
+ if(level>=3){if(!snake || !logs.length){if(!snake && Math.random()<dt*0.08) spawnSnake();} else {snake.t+=dt; if(snake.t>snake.life){snake=null;} else {snake.x += snake.log.speed*dt*snake.log.dir*riverSpeed(); snake.y=snake.log.y+11; if(snake.x< -30 || snake.x>660) snake=null;}}}
+ for(const c of crocs){c.t+=dt; c.open=((Math.floor(c.t/0.3)%2)===0); if(c.kind==='home'){c.x=mid([1,4,7,10,13][c.slot])-22; c.y=cellY(0)+18; if(c.t>c.duration) c.alive=false; } }
+ particles=particles.filter(p=>{p.t+=dt; p.x+=Math.cos(p.ang)*p.sp*dt; p.y+=Math.sin(p.ang)*p.sp*dt; return p.t<p.d;});
+}
+function updateTitle(dt){titlePulse+=dt; blink+=dt; updateLaneObjects(dt); if(!frog) frog=mkFrog(); if(!hop.active){frog.drawX=frog.x; frog.drawY=frog.y;} }
+function updatePlay(dt){updateLaneObjects(dt); if(state==='RESPAWN'){respawnT-=dt; if(respawnT<=0){placeOnStart(); state='PLAYING';} return;} updateTimer(dt); if(hop.active) updateHop(dt); else {frog.drawX=frog.x; frog.drawY=frog.y; if(frog.row>=1&&frog.row<=5){const p=platformUnderFrog(); if(p){frog.x += p.speed*dt*p.dir* (p.kind==='turtle'?1:1); if(frog.x<-20||frog.x>660) kill('carry'); if(p.kind==='turtle'&&p.state==='submerged') kill('water'); if(p.kind==='turtle' && p.state==='sinking'){} } else kill('water'); } }
+ // vehicle collision every frame
+ if(state==='PLAYING' && frog.deadPhase===0 && !hop.active){const rect={x:frog.x-15,y:frog.y-15,w:30,h:30}; const r=rowOfY(frog.y); if(r>=7&&r<=11){for(const v of vehicles){if(v.row===r && rectsIntersect(rect,{x:v.x,y:v.y,w:v.w,h:v.h})){kill('vehicle'); break;}}}}
+ if(state==='PLAYING' && rowOfY(frog.y)===0 && !hop.active) {landCheck();}
+ // fly spawn after first fill
+ if(slots.some(Boolean) && !flyOn){bonusFlyT += dt; if(bonusFlyT>=5){bonusFlyT=0; if(Math.random()<0.3){const empty=slots.map((s,i)=>!s?i:-1).filter(i=>i>=0); if(empty.length){flySlot=empty[(Math.random()*empty.length)|0]; flyOn=true; crocT=8;}} }} if(flyOn){crocT-=dt; if(crocT<=0){flyOn=false; flySlot=-1;}}
+ // snake/croc spawn timers
+ if(level>=3 && !snake && Math.random()<dt*(1/Math.max(10,20-level*2))){spawnSnake();}
+ if(level>=4){for(const c of crocs){if(c.kind==='home' && !c.alive) continue;}}
+ if(levelClearT>0){levelClearT-=dt; if(levelClearT<=0){level++; resetLevel(true); timeLimit=levelTimer(); timeLeft=timeLimit; state='PLAYING';}}
+ if(state==='DEATH'){deathT+=dt; if(deathT>=0.5 && respawnT===0){respawnT=1; state='RESPAWN'; deathT=0; if(lives<=0) state='GAME_OVER';}}
+ if(levelFlash>0) levelFlash-=dt;
+ if(timerWarnT>0) timerWarnT-=dt;
+ if(timeLeft<5 && state==='PLAYING' && timerWarnT<=0){S.tick(); timerWarnT=0.5;}
+ if(score>=10000 && !extraGiven){lives=Math.min(6,lives+1); extraGiven=true; S.extra();}
+}
+function titleLoop(dt){updateTitle(dt); if(state==='TITLE'){if(hop.active) updateHop(dt);}}
+function hopFaceDraw(){ctx.save(); ctx.translate(frog.drawX,frog.drawY); if(frog.dir==='left') ctx.scale(-1,1); if(frog.dir==='down') ctx.rotate(Math.PI); if(frog.dir==='up'){} const t=hop.active?hop.t:0.08; let squeeze=1, stretch=1, dx=0,dy=0; if(hop.active){if(t<0.03){squeeze=1.2; stretch=0.8;} else if(t<0.06){squeeze=0.95; stretch=1.15; dy=-6;} else {squeeze=1; stretch=1;}} ctx.fillStyle='#22CC22'; ctx.strokeStyle='#114411'; ctx.lineWidth=2; ctx.beginPath(); const w=28*stretch,h=24*squeeze; ctx.roundRect(-w/2,-h/2,w,h,8); ctx.fill(); ctx.stroke(); ctx.fillStyle='#114411'; ctx.fillRect(-12,-2,24,4); ctx.fillRect(-20,-8,6,10); ctx.fillRect(14,-8,6,10); ctx.fillRect(-20,2,6,10); ctx.fillRect(14,2,6,10); ctx.fillStyle='#AAFFAA'; ctx.beginPath(); ctx.arc(-8,-12,4,0,Math.PI*2); ctx.arc(8,-12,4,0,Math.PI*2); ctx.fill(); ctx.restore(); }
+function renderFrogIcon(x,y,s=1,ghost=false){ctx.save(); ctx.translate(x,y); ctx.scale(s,s); ctx.fillStyle=ghost?'#22CC22':'#22CC22'; ctx.beginPath(); ctx.roundRect(-8,-8,16,16,4); ctx.fill(); ctx.restore();}
+function drawWaterRipple(){ctx.save(); ctx.strokeStyle='#0055BB'; ctx.lineWidth=1; const t=performance.now()/1000; for(let y=1;y<=5;y++){const base=OY+y*CELL+CELL/2; ctx.beginPath(); for(let x=0;x<=W;x+=10){const yy=base+Math.sin(x/40+t*2+y)*2; if(x===0) ctx.moveTo(x-((performance.now()/100)%10),yy); else ctx.lineTo(x,yy);} ctx.stroke();} ctx.restore();}
+function drawBackground(){// zones
+for(let r=0;r<=12;r++){ctx.fillStyle=zoneColor(r); ctx.fillRect(0,cellY(r),W,CELL);} // median pebble dots
+ctx.fillStyle='#443355'; for(let i=0;i<16;i++) ctx.fillRect((i*47)%W,cellY(6)+((i*19)%CELL),2,2);
+// road lane markings
+ctx.fillStyle='#444'; for(let r=7;r<=11;r++){for(let x=0;x<W;x+=16) ctx.fillRect(x,cellY(r)+CELL/2,8,1);} // start texture
+ctx.fillStyle='rgba(17,68,17,0.35)'; for(let x=0;x<W;x+=46) ctx.fillRect(x,cellY(12)+8,1,30);
+// home slot openings
+for(let i=0;i<5;i++){const cx=mid([1,4,7,10,13][i]); ctx.fillStyle='#226622'; ctx.fillRect(cx-22,cellY(0),44,42); ctx.fillStyle='#001a00'; ctx.fillRect(cx-20,cellY(0)+6,40,30); ctx.fillStyle='#33AA33'; ctx.beginPath(); ctx.ellipse(cx,cellY(0)+24,10,6,0,0,Math.PI*2); ctx.fill(); }
+}
+function drawRoadObjects(){for(const v of vehicles){ctx.save(); ctx.translate(v.x,v.y); ctx.fillStyle=v.color; ctx.beginPath(); ctx.roundRect(0,0,v.w,v.h,8); ctx.fill(); ctx.fillStyle='rgba(255,255,255,0.35)'; ctx.fillRect(v.dir===1?v.w-16:6,8,10,16); ctx.restore();}}
+function drawLogs(){for(const l of logs){ctx.save(); ctx.translate(l.x,l.y); ctx.fillStyle=l.color; ctx.beginPath(); ctx.roundRect(0,0,l.w,l.h,10); ctx.fill(); ctx.strokeStyle='#5C2D0A'; ctx.lineWidth=1; for(let i=1;i<l.w;i+=32){ctx.beginPath(); ctx.moveTo(i,8); ctx.lineTo(i+8,8); ctx.stroke();} ctx.fillStyle='#6B3410'; ctx.beginPath(); ctx.arc(l.w*0.25,l.h*0.5,3,0,Math.PI*2); ctx.arc(l.w*0.7,l.h*0.35,4,0,Math.PI*2); ctx.fill(); ctx.restore();}}
+function drawTurtles(){for(const t of turtles){if(t.state==='submerged') continue; ctx.save(); ctx.globalAlpha=t.alpha||1; ctx.translate(t.x,t.y+(t.yy||0)); for(let i=0;i<(t.w/38)|0;i++){const xx=i*38; ctx.fillStyle='#00AA44'; ctx.beginPath(); ctx.roundRect(xx,0,38,32,12); ctx.fill(); ctx.fillStyle='#33CC66'; ctx.beginPath(); ctx.moveTo(xx+19,6); ctx.lineTo(xx+28,15); ctx.lineTo(xx+19,24); ctx.lineTo(xx+10,15); ctx.closePath(); ctx.strokeStyle='#33CC66'; ctx.stroke(); ctx.fill(); ctx.fillStyle='#116622'; ctx.fillRect(xx+3,12,4,3); ctx.fillRect(xx+31,12,4,3); ctx.fillRect(xx+16,28,6,4); } ctx.restore();}}
+function drawSnake(){if(!snake) return; ctx.save(); ctx.translate(snake.x,snake.y); ctx.fillStyle='#CC2222'; ctx.beginPath(); ctx.moveTo(-15,-4); ctx.quadraticCurveTo(-8,-10,-4,-4); ctx.quadraticCurveTo(0,2,4,-4); ctx.quadraticCurveTo(8,-10,15,-4); ctx.lineTo(15,4); ctx.quadraticCurveTo(8,10,4,4); ctx.quadraticCurveTo(0,-2,-4,4); ctx.quadraticCurveTo(-8,10,-15,4); ctx.closePath(); ctx.fill(); ctx.restore();}
+function drawCroc(){for(const c of crocs){if(!c.alive) continue; const x=mid([1,4,7,10,13][c.slot])-22, y=cellY(0)+14; ctx.save(); ctx.translate(x,y); if(c.kind==='home'){ctx.fillStyle='#225522'; if(c.open){ctx.fillStyle='#88aa22';} ctx.beginPath(); ctx.roundRect(0,0,44,18,6); ctx.fill(); ctx.fillStyle='#114411'; ctx.fillRect(4,4,36,10); if(c.open){ctx.fillStyle='#ff4444'; ctx.beginPath(); ctx.moveTo(8,2); ctx.lineTo(22,12); ctx.lineTo(36,2); ctx.fill();} else {ctx.fillStyle='#001a00'; ctx.fillRect(8,6,28,4);} } ctx.restore();}}
+function drawSlots(){for(let i=0;i<5;i++){const cx=mid([1,4,7,10,13][i]); if(slots[i]){renderFrogIcon(cx,cellY(0)+22,0.9,false);} if(flyOn && flySlot===i){ctx.save(); ctx.translate(cx,cellY(0)+22); const s=1+0.1*Math.sin(performance.now()/53); ctx.scale(s,s); ctx.fillStyle=(Math.floor(performance.now()/250)%2?'#FF4444':'#FFD700'); ctx.shadowColor='#fff'; ctx.shadowBlur=8; ctx.beginPath(); ctx.ellipse(0,0,6,4,0,0,Math.PI*2); ctx.fill(); ctx.restore();} }
+}
+function drawFoliageOverlay(){ctx.save(); ctx.fillStyle='rgba(34,102,34,0.8)'; ctx.fillRect(0,cellY(0),W,16); for(let i=0;i<14;i++){const x=i*46; ctx.fillStyle=(i%2?'#338833':'#226622'); ctx.fillRect(x,cellY(0),46,10);} ctx.fillStyle='#114411'; for(let i=0;i<18;i++) ctx.fillRect((i*37)%W,cellY(0)+6,8,4); ctx.restore();}
+function drawParticles(){ctx.save(); ctx.strokeStyle='#fff'; ctx.lineWidth=1; for(const p of particles){const a=1-p.t/p.d; ctx.globalAlpha=a; ctx.beginPath(); ctx.moveTo(p.x,p.y); ctx.lineTo(p.x+Math.cos(p.ang)*10,p.y+Math.sin(p.ang)*10); ctx.stroke();} ctx.restore();}
+function drawFrog(){if(!frog) return; if(frog.deadPhase>0 || state==='DEATH'){ctx.save(); ctx.translate(frog.drawX,frog.drawY); ctx.fillStyle='#FF4444'; ctx.globalAlpha=0.95; ctx.beginPath(); ctx.roundRect(-14,-12,28,18,6); ctx.fill(); ctx.restore(); return;} hopFaceDraw(); }
+function drawHUD(){ctx.fillStyle='#000'; ctx.fillRect(0,0,W,26); ctx.fillStyle='#FFF'; ctx.font='16px monospace'; ctx.textAlign='left'; ctx.fillText('Score: '+score,16,20); ctx.textAlign='center'; ctx.font='14px monospace'; ctx.fillStyle='#888'; ctx.fillText('Best: '+best,350,20); ctx.textAlign='right'; ctx.fillStyle='#AAA'; ctx.fillText('Lv '+level,620,20);
+ctx.fillStyle='#000'; ctx.fillRect(0,700,W,40); ctx.fillStyle='#AAA'; ctx.font='11px monospace'; ctx.textAlign='left'; ctx.fillText('TIME',260,724); ctx.strokeStyle='#333'; ctx.strokeRect(300,718,200,10); const pct=clamp(timeLeft/timeLimit,0,1); ctx.fillStyle=timerColor(); ctx.fillRect(300,718,200*pct,10); for(let i=0;i<Math.min(5,lives-1);i++) renderFrogIcon(16+i*20,720,0.45,false); }
+function timerColor(){if(timeLeft>10) return '#00CC00'; if(timeLeft>5) return '#FFCC00'; return '#FF4444';}
+function render(){ctx.clearRect(0,0,W,H); drawBackground(); drawWaterRipple(); drawLogs(); drawTurtles(); drawRoadObjects(); if(snake) drawSnake(); drawCroc(); drawSlots(); drawFrog(); drawFoliageOverlay(); drawParticles(); drawHUD(); if(state==='TITLE'){drawTitle();} if(state==='PAUSED'){ctx.fillStyle='rgba(0,0,0,0.7)'; ctx.fillRect(0,OY, W, CELL*13); ctx.fillStyle='#FFF'; ctx.textAlign='center'; ctx.font='36px monospace'; ctx.fillText('PAUSED',W/2,370); ctx.font='14px monospace'; ctx.fillStyle='#AAA'; ctx.fillText('P to resume',W/2,398);} if(state==='GAME_OVER'){drawGameOver();} if(state==='LEVEL_CLEAR'){drawLevelClear();} }
+function drawTitle(){ctx.save(); ctx.textAlign='center'; ctx.font='48px monospace'; ctx.fillStyle=(Math.floor(titlePulse*2)%2===0?'#22CC22':'#FFFF44'); ctx.fillText('FROGGER',W/2,250); // animated frog demo
+const phase=Math.floor((performance.now()/500)%3); const fx=W/2, fy=330; ctx.translate(fx,fy); if(phase===0){drawMiniFrog(-10,0,0.8,0.8);} else if(phase===1){drawMiniFrog(0,-8,0.95,1.1);} else drawMiniFrog(0,0,0.9,0.9); ctx.restore(); ctx.save(); ctx.textAlign='center'; ctx.font='18px monospace'; ctx.globalAlpha=0.4+0.6*(0.5+0.5*Math.sin(blink*4)); ctx.fillStyle='#AAA'; ctx.fillText('Press Enter to Start',W/2,450); ctx.globalAlpha=1; ctx.font='14px monospace'; ctx.fillStyle='#555'; ctx.fillText('Best: '+best,W/2,490); ctx.restore(); }
+function drawMiniFrog(dx,dy,sx,sy){ctx.save(); ctx.translate(dx,dy); ctx.scale(sx,sy); ctx.fillStyle='#22CC22'; ctx.beginPath(); ctx.roundRect(-14,-12,28,18,6); ctx.fill(); ctx.fillStyle='#AAFFAA'; ctx.beginPath(); ctx.arc(-8,-12,3,0,Math.PI*2); ctx.arc(8,-12,3,0,Math.PI*2); ctx.fill(); ctx.restore(); }
+function drawLevelClear(){ctx.save(); ctx.fillStyle='rgba(0,0,0,0.35)'; ctx.fillRect(0,OY,W,CELL*13); ctx.fillStyle='#FFF'; ctx.textAlign='center'; ctx.font='36px monospace'; ctx.fillText('LEVEL CLEAR',W/2,360); ctx.restore();}
+function drawGameOver(){ctx.save(); ctx.fillStyle='rgba(0,0,0,0.4)'; ctx.fillRect(0,OY,W,CELL*13); ctx.textAlign='center'; ctx.font='40px monospace'; ctx.fillStyle='#FF4444'; ctx.fillText('GAME OVER',W/2,300); ctx.font='24px monospace'; ctx.fillStyle='#FFF'; ctx.fillText('Score: '+score,W/2,350); if(score>=best){ctx.globalAlpha=0.5+0.5*Math.sin(performance.now()/120); ctx.fillStyle='#FFD700'; ctx.font='18px monospace'; ctx.fillText('NEW BEST!',W/2,385); ctx.globalAlpha=1;} ctx.fillStyle='#AAA'; ctx.font='16px monospace'; ctx.fillText('Level reached: '+level,W/2,415); if(Math.floor(performance.now()/250)%2===0){ctx.fillStyle='#888'; ctx.fillText('Enter to restart',W/2,460);} ctx.restore(); }
+function respawn(){frog=mkFrog(); timeLimit=levelTimer(); timeLeft=timeLimit; state='PLAYING';}
+function levelComplete(){score+=1000; if(score>best){best=score; localStorage.setItem('frogger_best',best);} state='LEVEL_CLEAR'; levelClearT=1.5; levelFlash=1; S.level();}
+function timeBonus(){score+=Math.floor(timeLeft)*10; if(score>best){best=score; localStorage.setItem('frogger_best',best);} }
+function hopForwardScore(){if(frog.row<frog.far){score+=10; frog.far=frog.row; if(score>best){best=score; localStorage.setItem('frogger_best',best);}} }
+function update(dt){if(paused) return; if(state==='TITLE'){titlePulse+=dt; blink+=dt; updateLaneObjects(dt); if(hop.active) updateHop(dt); return;} if(state==='PLAYING'){updateLaneObjects(dt); updateHop(dt); updateTimer(dt); if(state==='PLAYING'&&!hop.active){if(rowOfY(frog.y)>=1&&rowOfY(frog.y)<=5){const p=platformUnderFrog(); if(p){frog.x+=p.speed*dt*p.dir; if(frog.x<-20||frog.x>660) kill('carry'); if(p.kind==='turtle'&&p.state==='submerged') kill('water'); if(p.kind==='turtle'&&p.state==='sinking'){} } else kill('water'); } } if(frog.deadPhase===0 && hop.active===false){const r=rowOfY(frog.y); if(r>=7&&r<=11) onRoadDeathCheck();}
+ if(timeLeft<=0) kill('timer'); if(state==='PLAYING' && frog.deadPhase===0 && !hop.active) {if(rowOfY(frog.y)===0) landCheck();} if(flyOn){bonusFlyT+=dt; if(bonusFlyT>8){flyOn=false; flySlot=-1; bonusFlyT=0;}} if(level>=3 && !snake && Math.random()<dt/12) spawnSnake(); if(level>=4){for(const c of crocs){c.t+=dt; c.open=((Math.floor(c.t/0.3)%2)===0); if(c.t>6) c.alive=false;}} if(state==='PLAYING' && slots.every(Boolean)) levelComplete(); if(score>=10000 && !extraGiven){lives=Math.min(6,lives+1); extraGiven=true; S.extra();} }
+ else if(state==='DEATH'){deathT+=dt; if(deathT>=0.5){respawnT+=dt; if(respawnT>=1){lives--; if(lives<=0){state='GAME_OVER'; setTimeout(()=>{},0);} else {state='RESPAWN'; respawnT=0;}}}} else if(state==='RESPAWN'){updateLaneObjects(dt); respawnT+=dt; if(respawnT>=1){respawn(); respawnT=0;}} else if(state==='LEVEL_CLEAR'){levelClearT-=dt; updateLaneObjects(dt); if(levelClearT<=0){level++; resetLevel(true); respawn(); state='PLAYING';}} else if(state==='GAME_OVER'){updateLaneObjects(dt); if(keys['Enter']&&!prev.Enter){state='TITLE'; score=0; lives=3; level=1; extraGiven=false; resetLevel(false);}} if(levelFlash>0) levelFlash-=dt; if(timerWarnT>0) timerWarnT-=dt; if(timeLeft<5 && timerWarnT<=0 && state==='PLAYING'){S.tick(); timerWarnT=0.5;} }
+function updateHop(dt){if(!hop.active) return; hop.t+=dt; frog.drawX=hop.from.x + (hop.to.x-hop.from.x)*(hop.t/0.08); frog.drawY=hop.from.y + (hop.to.y-hop.from.y)*(hop.t/0.08); if(hop.t>=0.08){frog.col=hop.to.col; frog.row=hop.to.row; frog.x=hop.to.x; frog.y=hop.to.y; frog.drawX=frog.x; frog.drawY=frog.y; hop.active=false; hop.t=0; hopQueue=null; if(frog.row<frog.far){frog.far=frog.row; score+=10; if(score>best){best=score; localStorage.setItem('frogger_best',best);}} if(frog.row===0) {landCheck();} if(frog.hopQueue){const q=frog.hopQueue; frog.hopQueue=null; queueInput(q);} }}
+function updateLaneObjects(dt){const rMul=riverSpeed(),vMul=levelSpeed(); // vehicles
+for(const v of vehicles){v.x += v.speed*vMul*dt*v.dir; if(v.dir<0 && v.x+v.w<-60) v.x = 660+rand(0,220); if(v.dir>0 && v.x>660+60) v.x = -v.w-rand(0,220);}
+for(const l of logs){l.x += l.speed*rMul*dt*l.dir; if(l.dir>0 && l.x>660+220) l.x=-l.w-rand(0,260); if(l.dir<0 && l.x+l.w<-220) l.x=660+rand(0,260);} 
+for(const t of turtles){t.x += t.speed*rMul*dt*t.dir; t.t=(t.t||0)+dt; if(t.dir<0 && t.x+t.w<-220) t.x=660+rand(0,260); if(t.dir>0 && t.x>660+220) t.x=-t.w-rand(0,260); if(t.dive){const cyc=t.t%7; if(cyc<4){t.state='surfaced'; t.alpha=1; t.yy=0;} else if(cyc<4.5){t.state='sinking'; t.alpha=1-((cyc-4)/0.5)*0.6; t.yy=((cyc-4)/0.5)*4;} else if(cyc<6.5){t.state='submerged'; t.alpha=0; t.yy=4;} else {t.state='surfacing'; t.alpha=0.4+((cyc-6.5)/0.5)*0.6; t.yy=4-((cyc-6.5)/0.5)*4;}}}
+if(snake){const s=snake; s.x += s.log.speed*rMul*dt*s.log.dir; if(s.x<-40||s.x>660) snake=null;}
+for(const c of crocs){if(!c.alive) continue; c.t+=dt; if(c.kind==='home'){c.x=mid([1,4,7,10,13][c.slot])-22; c.y=cellY(0)+14; c.open=((Math.floor(c.t/0.3)%2)===0); if(c.t>6) c.alive=false;}}
+particles=particles.filter(p=>{p.t+=dt; p.x+=Math.cos(p.ang)*p.sp*dt; p.y+=Math.sin(p.ang)*p.sp*dt; return p.t<p.d;}); drawWave(dt); }
+let waveScroll=0; function drawWave(dt){waveScroll+=dt*10;}
+function drawRiverLines(){ctx.save(); ctx.strokeStyle='#0055BB'; ctx.lineWidth=1; for(let y=1;y<=5;y++){const base=cellY(y)+CELL/2; ctx.beginPath(); for(let x=0;x<=W;x+=10){const yy=base+Math.sin((x+waveScroll)/40 + performance.now()/500*2)*2; if(x===0) ctx.moveTo(x,yy); else ctx.lineTo(x,yy);} ctx.stroke();} ctx.restore();}
+function drawAll(){ctx.clearRect(0,0,W,H); drawBackground(); drawRiverLines(); drawLogs(); drawTurtles(); drawRoadObjects(); if(snake) drawSnake(); drawCroc(); drawSlots(); drawFrog(); drawFoliageOverlay(); drawParticles(); drawHUD(); if(state==='TITLE') drawTitle(); if(state==='PAUSED'){ctx.fillStyle='rgba(0,0,0,0.7)'; ctx.fillRect(0,OY,W,CELL*13); ctx.fillStyle='#fff'; ctx.textAlign='center'; ctx.font='36px monospace'; ctx.fillText('PAUSED',W/2,370); ctx.font='14px monospace'; ctx.fillStyle='#AAA'; ctx.fillText('P to resume',W/2,398);} if(state==='GAME_OVER') drawGameOver(); if(state==='LEVEL_CLEAR') drawLevelClear(); }
+function loop(now){const dt=Math.min(0.05,(now-last)/1000); last=now; if(state!=='PAUSED') update(dt); drawAll(); prev={...keys}; requestAnimationFrame(loop)}
+addEventListener('keydown',e=>{if(!keys[e.code]){ if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','KeyW','KeyA','KeyS','KeyD'].includes(e.code)){ if(hop.active){if(!frog.hopQueue) frog.hopQueue=e.code;} else {const d=e.code==='ArrowUp'||e.code==='KeyW'?'up':e.code==='ArrowDown'||e.code==='KeyS'?'down':e.code==='ArrowLeft'||e.code==='KeyA'?'left':'right'; startHop(d);} S.hop(); } } keys[e.code]=true; acq(); if(['Enter','KeyP','Escape'].includes(e.code)) e.preventDefault(); if(e.code==='Enter'){if(state==='TITLE'){state='PLAYING'; resetLevel(false); respawn(); timeLimit=levelTimer(); timeLeft=timeLimit; score=0; lives=3; level=1; extraGiven=false;}} if((e.code==='KeyP'||e.code==='Escape') && state!=='TITLE' && state!=='GAME_OVER'){paused=!paused; state=paused?'PAUSED':'PLAYING';} });
+addEventListener('keyup',e=>{keys[e.code]=false;});
+init(); requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,794 @@
+<!--
+  GAME:      Tetris
+  RUN:       r2-gpt54
+  BUILDER:   openai/gpt-5.4
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tetris</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background: #111111;
+      overflow: hidden;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+    body {
+      display: grid;
+      place-items: center;
+    }
+    canvas {
+      display: block;
+      background: #111111;
+      image-rendering: pixelated;
+      box-shadow: 0 0 42px rgba(0,0,0,0.45), 0 0 72px rgba(255,255,255,0.04);
+    }
+  </style>
+</head>
+<body>
+<canvas id="game" width="800" height="600"></canvas>
+<script>
+(() => {
+  'use strict';
+
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  const WIDTH = 800;
+  const HEIGHT = 600;
+  const CELL = 28;
+  const BOARD_X = 240;
+  const BOARD_Y = 20;
+  const COLS = 10;
+  const ROWS = 20;
+  const HIDDEN_ROWS = 2;
+  const TOTAL_ROWS = ROWS + HIDDEN_ROWS;
+  const PREVIEW_X = 560;
+  const PREVIEW_Y = 60;
+  const PREVIEW_W = 112;
+  const PREVIEW_H = 112;
+  const LOCK_DELAY = 0.5;
+  const MAX_LOCK_RESETS = 3;
+  const LINE_CLEAR_FLASH = 0.12;
+  const SOFT_DROP_POINTS = 1;
+  const HARD_DROP_POINTS = 2;
+  const DT_CAP = 0.05;
+
+  const STATES = {
+    TITLE: 'TITLE',
+    PLAYING: 'PLAYING',
+    PAUSED: 'PAUSED',
+    GAME_OVER: 'GAME_OVER',
+    LINE_CLEAR: 'LINE_CLEAR'
+  };
+
+  const COLORS = {
+    I: '#26D8FF',
+    O: '#FFD93D',
+    T: '#A85CFF',
+    S: '#45D96D',
+    Z: '#FF5A5A',
+    J: '#4C7BFF',
+    L: '#FF9A3D'
+  };
+
+  const PIECES = {
+    I: [
+      [[0,1],[1,1],[2,1],[3,1]],
+      [[2,0],[2,1],[2,2],[2,3]],
+      [[0,2],[1,2],[2,2],[3,2]],
+      [[1,0],[1,1],[1,2],[1,3]]
+    ],
+    O: [
+      [[1,0],[2,0],[1,1],[2,1]],
+      [[1,0],[2,0],[1,1],[2,1]],
+      [[1,0],[2,0],[1,1],[2,1]],
+      [[1,0],[2,0],[1,1],[2,1]]
+    ],
+    T: [
+      [[1,0],[0,1],[1,1],[2,1]],
+      [[1,0],[1,1],[2,1],[1,2]],
+      [[0,1],[1,1],[2,1],[1,2]],
+      [[1,0],[0,1],[1,1],[1,2]]
+    ],
+    S: [
+      [[1,0],[2,0],[0,1],[1,1]],
+      [[1,0],[1,1],[2,1],[2,2]],
+      [[1,1],[2,1],[0,2],[1,2]],
+      [[0,0],[0,1],[1,1],[1,2]]
+    ],
+    Z: [
+      [[0,0],[1,0],[1,1],[2,1]],
+      [[2,0],[1,1],[2,1],[1,2]],
+      [[0,1],[1,1],[1,2],[2,2]],
+      [[1,0],[0,1],[1,1],[0,2]]
+    ],
+    J: [
+      [[0,0],[0,1],[1,1],[2,1]],
+      [[1,0],[2,0],[1,1],[1,2]],
+      [[0,1],[1,1],[2,1],[2,2]],
+      [[1,0],[1,1],[0,2],[1,2]]
+    ],
+    L: [
+      [[2,0],[0,1],[1,1],[2,1]],
+      [[1,0],[1,1],[1,2],[2,2]],
+      [[0,1],[1,1],[2,1],[0,2]],
+      [[0,0],[1,0],[1,1],[1,2]]
+    ]
+  };
+
+  const SPAWN_X = { I: 3, O: 3, T: 3, S: 3, Z: 3, J: 3, L: 3 };
+  const SCORING = { 1: 100, 2: 300, 3: 500, 4: 800 };
+  const KICKS_STANDARD = [[0,0],[-1,0],[1,0],[-2,0],[2,0],[0,-1]];
+  const KICKS_I = [[0,0],[-1,0],[1,0],[-2,0],[2,0],[0,-1],[-1,-1],[1,-1]];
+
+  const keys = Object.create(null);
+  const prevKeys = Object.create(null);
+
+  let board = createBoard();
+  let state = STATES.TITLE;
+  let previousState = STATES.TITLE;
+  let lastTime = 0;
+  let gravityTimer = 0;
+  let lockTimer = 0;
+  let lockResets = 0;
+  let lineClearTimer = 0;
+  let clearingRows = [];
+  let bag = [];
+  let active = null;
+  let nextPiece = null;
+  let score = 0;
+  let best = loadBest();
+  let lines = 0;
+  let level = 1;
+  let flashTimer = 0;
+  let particles = [];
+  let audioCtx = null;
+  let moveHold = { dir: 0, elapsed: 0, initialDelayDone: false };
+
+  function resize() {
+    const scale = Math.min(window.innerWidth / WIDTH, window.innerHeight / HEIGHT);
+    canvas.style.width = `${Math.floor(WIDTH * scale)}px`;
+    canvas.style.height = `${Math.floor(HEIGHT * scale)}px`;
+  }
+
+  function createBoard() {
+    return Array.from({ length: TOTAL_ROWS }, () => Array(COLS).fill(null));
+  }
+
+  function loadBest() {
+    try {
+      const n = parseInt(localStorage.getItem('tetris_best') || '0', 10);
+      return Number.isFinite(n) ? n : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  function saveBest() {
+    try { localStorage.setItem('tetris_best', String(best)); } catch {}
+  }
+
+  function updateBest() {
+    if (score > best) {
+      best = score;
+      saveBest();
+    }
+  }
+
+  function ensureAudio() {
+    if (!audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) {
+        try { audioCtx = new AC(); } catch {}
+      }
+    }
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+  }
+
+  function tone(freq, duration, gainValue, type = 'square', endFreq = null, delay = 0) {
+    if (!audioCtx) return;
+    try {
+      const t = audioCtx.currentTime + delay;
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, t);
+      if (endFreq !== null) osc.frequency.linearRampToValueAtTime(endFreq, t + duration);
+      gain.gain.setValueAtTime(gainValue, t);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + duration);
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start(t);
+      osc.stop(t + duration);
+    } catch {}
+  }
+
+  const sfx = {
+    move() { tone(220, 0.03, 0.03, 'triangle', 180); },
+    rotate() { tone(420, 0.05, 0.035, 'triangle', 640); },
+    lock() { tone(160, 0.06, 0.05, 'square', 110); },
+    line(n) {
+      if (n === 4) {
+        tone(523, 0.07, 0.05, 'triangle');
+        tone(659, 0.07, 0.05, 'triangle', null, 0.08);
+        tone(784, 0.09, 0.05, 'triangle', null, 0.16);
+      } else {
+        tone(360, 0.06, 0.04, 'triangle', 520);
+      }
+    },
+    gameOver() { tone(220, 0.2, 0.06, 'sawtooth', 90); },
+    start() { tone(330, 0.05, 0.04, 'triangle', 520); },
+    drop() { tone(180, 0.04, 0.04, 'square', 120); }
+  };
+
+  function clamp(v, min, max) {
+    return Math.max(min, Math.min(max, v));
+  }
+
+  function justPressed(code) {
+    return !!keys[code] && !prevKeys[code];
+  }
+
+  function gravityIntervalMs() {
+    const table = [1000, 850, 700, 550, 420, 340, 280, 230, 190, 160, 135, 115, 100];
+    return table[Math.min(level - 1, table.length - 1)] || 100;
+  }
+
+  function shuffleBag() {
+    const arr = ['I','O','T','S','Z','J','L'];
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
+  function pullPiece() {
+    if (bag.length === 0) bag = shuffleBag();
+    return bag.shift();
+  }
+
+  function cellsFor(type, rotation, x, y) {
+    return PIECES[type][rotation].map(([cx, cy]) => ({ x: x + cx, y: y + cy }));
+  }
+
+  function validPlacement(type, rotation, x, y) {
+    const cells = cellsFor(type, rotation, x, y);
+    for (const cell of cells) {
+      if (cell.x < 0 || cell.x >= COLS || cell.y >= TOTAL_ROWS) return false;
+      if (cell.y >= 0 && board[cell.y][cell.x]) return false;
+    }
+    return true;
+  }
+
+  function spawnPiece() {
+    const type = nextPiece || pullPiece();
+    nextPiece = pullPiece();
+    active = {
+      type,
+      rotation: 0,
+      x: SPAWN_X[type],
+      y: -1
+    };
+    gravityTimer = 0;
+    lockTimer = 0;
+    lockResets = 0;
+    if (!validPlacement(active.type, active.rotation, active.x, active.y)) {
+      state = STATES.GAME_OVER;
+      updateBest();
+      ensureAudio();
+      sfx.gameOver();
+    }
+  }
+
+  function startGame() {
+    board = createBoard();
+    bag = [];
+    nextPiece = pullPiece();
+    score = 0;
+    lines = 0;
+    level = 1;
+    gravityTimer = 0;
+    lockTimer = 0;
+    lineClearTimer = 0;
+    clearingRows = [];
+    flashTimer = 0;
+    particles = [];
+    moveHold = { dir: 0, elapsed: 0, initialDelayDone: false };
+    spawnPiece();
+    state = STATES.PLAYING;
+    ensureAudio();
+    sfx.start();
+  }
+
+  function grounded(piece = active) {
+    return !validPlacement(piece.type, piece.rotation, piece.x, piece.y + 1);
+  }
+
+  function movePiece(dx, dy) {
+    if (!active) return false;
+    if (validPlacement(active.type, active.rotation, active.x + dx, active.y + dy)) {
+      active.x += dx;
+      active.y += dy;
+      if (dy === 0) resetLockIfNeeded();
+      return true;
+    }
+    return false;
+  }
+
+  function resetLockIfNeeded() {
+    if (!grounded()) {
+      lockTimer = 0;
+      return;
+    }
+    if (lockResets < MAX_LOCK_RESETS) {
+      lockTimer = 0;
+      lockResets += 1;
+    }
+  }
+
+  function tryRotate() {
+    if (!active) return;
+    const nextRot = (active.rotation + 1) % 4;
+    const kicks = active.type === 'I' ? KICKS_I : KICKS_STANDARD;
+    for (const [dx, dy] of kicks) {
+      if (validPlacement(active.type, nextRot, active.x + dx, active.y + dy)) {
+        active.rotation = nextRot;
+        active.x += dx;
+        active.y += dy;
+        resetLockIfNeeded();
+        ensureAudio();
+        sfx.rotate();
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function lockPiece() {
+    const cells = cellsFor(active.type, active.rotation, active.x, active.y);
+    for (const cell of cells) {
+      if (cell.y >= 0 && cell.y < TOTAL_ROWS) board[cell.y][cell.x] = active.type;
+    }
+    ensureAudio();
+    sfx.lock();
+    checkLines();
+  }
+
+  function checkLines() {
+    clearingRows = [];
+    for (let y = 0; y < TOTAL_ROWS; y++) {
+      if (board[y].every(Boolean)) clearingRows.push(y);
+    }
+    if (clearingRows.length) {
+      lineClearTimer = LINE_CLEAR_FLASH;
+      state = STATES.LINE_CLEAR;
+      ensureAudio();
+      sfx.line(clearingRows.length);
+      for (const row of clearingRows) spawnRowParticles(row);
+    } else {
+      spawnPiece();
+    }
+  }
+
+  function clearLinesNow() {
+    const count = clearingRows.length;
+    clearingRows.sort((a, b) => a - b);
+    for (const row of clearingRows) {
+      board.splice(row, 1);
+      board.unshift(Array(COLS).fill(null));
+    }
+    score += (SCORING[count] || 0) * level;
+    lines += count;
+    level = Math.floor(lines / 10) + 1;
+    updateBest();
+    clearingRows = [];
+    state = STATES.PLAYING;
+    spawnPiece();
+  }
+
+  function hardDrop() {
+    if (!active) return;
+    let dropped = 0;
+    while (movePiece(0, 1)) dropped++;
+    score += dropped * HARD_DROP_POINTS;
+    updateBest();
+    ensureAudio();
+    sfx.drop();
+    lockPiece();
+  }
+
+  function softDropTick() {
+    if (movePiece(0, 1)) {
+      score += SOFT_DROP_POINTS;
+      updateBest();
+    }
+  }
+
+  function spawnRowParticles(boardRow) {
+    const y = BOARD_Y + (boardRow - HIDDEN_ROWS) * CELL + CELL / 2;
+    if (y < BOARD_Y || y > BOARD_Y + ROWS * CELL) return;
+    for (let i = 0; i < 22; i++) {
+      const x = BOARD_X + (i / 22) * (COLS * CELL);
+      particles.push({
+        x,
+        y,
+        vx: (Math.random() - 0.5) * 120,
+        vy: (Math.random() - 0.5) * 60,
+        life: 0.18 + Math.random() * 0.18,
+        maxLife: 0.35,
+        color: '#ffffff'
+      });
+    }
+  }
+
+  function updateParticles(dt) {
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.life -= dt;
+      if (p.life <= 0) particles.splice(i, 1);
+    }
+  }
+
+  function handleTapInput() {
+    if (justPressed('ArrowLeft') || justPressed('KeyA')) {
+      if (movePiece(-1, 0)) { ensureAudio(); sfx.move(); }
+      moveHold = { dir: -1, elapsed: 0, initialDelayDone: false };
+    }
+    if (justPressed('ArrowRight') || justPressed('KeyD')) {
+      if (movePiece(1, 0)) { ensureAudio(); sfx.move(); }
+      moveHold = { dir: 1, elapsed: 0, initialDelayDone: false };
+    }
+    if (justPressed('ArrowUp') || justPressed('KeyW')) tryRotate();
+    if (justPressed('Space')) hardDrop();
+  }
+
+  function processHorizontal(dt) {
+    let dir = 0;
+    if (keys.ArrowLeft || keys.KeyA) dir -= 1;
+    if (keys.ArrowRight || keys.KeyD) dir += 1;
+    if (dir === 0) {
+      moveHold = { dir: 0, elapsed: 0, initialDelayDone: false };
+      return;
+    }
+    if (moveHold.dir !== dir) {
+      moveHold = { dir, elapsed: 0, initialDelayDone: false };
+      return;
+    }
+    moveHold.elapsed += dt;
+    const das = 0.14;
+    const arr = 0.05;
+    if (!moveHold.initialDelayDone && moveHold.elapsed >= das) {
+      if (movePiece(dir, 0)) { ensureAudio(); sfx.move(); }
+      moveHold.elapsed = das;
+      moveHold.initialDelayDone = true;
+    } else if (moveHold.initialDelayDone) {
+      while (moveHold.elapsed >= das + arr) {
+        if (movePiece(dir, 0)) { ensureAudio(); sfx.move(); }
+        moveHold.elapsed -= arr;
+      }
+    }
+  }
+
+  function updatePlaying(dt) {
+    handleTapInput();
+    processHorizontal(dt);
+
+    const soft = keys.ArrowDown || keys.KeyS;
+    gravityTimer += dt;
+    const interval = soft ? 0.05 : gravityIntervalMs() / 1000;
+
+    while (gravityTimer >= interval) {
+      gravityTimer -= interval;
+      if (soft) {
+        if (movePiece(0, 1)) {
+          score += SOFT_DROP_POINTS;
+          updateBest();
+        }
+      } else if (!movePiece(0, 1)) {
+        break;
+      }
+    }
+
+    if (grounded()) {
+      lockTimer += dt;
+      if (lockTimer >= LOCK_DELAY) lockPiece();
+    } else {
+      lockTimer = 0;
+    }
+  }
+
+  function update(dt) {
+    if (flashTimer > 0) flashTimer = Math.max(0, flashTimer - dt);
+    updateParticles(dt);
+
+    if (state === STATES.LINE_CLEAR) {
+      lineClearTimer -= dt;
+      if (lineClearTimer <= 0) clearLinesNow();
+      return;
+    }
+    if (state !== STATES.PLAYING) return;
+    updatePlaying(dt);
+  }
+
+  function handleActions() {
+    const startPressed = justPressed('Enter');
+    if (startPressed) ensureAudio();
+    if (state === STATES.TITLE && startPressed) {
+      startGame();
+      return;
+    }
+    if (state === STATES.GAME_OVER && startPressed) {
+      startGame();
+      return;
+    }
+    if (justPressed('KeyP')) {
+      if (state === STATES.PLAYING || state === STATES.LINE_CLEAR) {
+        previousState = state;
+        state = STATES.PAUSED;
+      } else if (state === STATES.PAUSED) {
+        state = previousState;
+      }
+      ensureAudio();
+      sfx.start();
+    }
+  }
+
+  function blockShade(color, amount) {
+    const c = color.startsWith('#') ? color.slice(1) : color;
+    const n = parseInt(c, 16);
+    const r = clamp(((n >> 16) & 255) + amount, 0, 255);
+    const g = clamp(((n >> 8) & 255) + amount, 0, 255);
+    const b = clamp((n & 255) + amount, 0, 255);
+    return `rgb(${r},${g},${b})`;
+  }
+
+  function drawCell(x, y, type, alpha = 1, ghost = false) {
+    const px = BOARD_X + x * CELL;
+    const py = BOARD_Y + (y - HIDDEN_ROWS) * CELL;
+    if (y < HIDDEN_ROWS) return;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    if (ghost) {
+      ctx.strokeStyle = blockShade(COLORS[type], 50);
+      ctx.lineWidth = 2;
+      ctx.strokeRect(px + 4, py + 4, CELL - 8, CELL - 8);
+    } else {
+      ctx.fillStyle = COLORS[type];
+      ctx.fillRect(px + 2, py + 2, CELL - 4, CELL - 4);
+      ctx.fillStyle = blockShade(COLORS[type], 40);
+      ctx.fillRect(px + 2, py + 2, CELL - 4, 6);
+      ctx.fillStyle = blockShade(COLORS[type], -50);
+      ctx.fillRect(px + 2, py + CELL - 8, CELL - 4, 6);
+    }
+    ctx.restore();
+  }
+
+  function ghostY() {
+    if (!active) return active?.y || 0;
+    let y = active.y;
+    while (validPlacement(active.type, active.rotation, active.x, y + 1)) y++;
+    return y;
+  }
+
+  function drawBoard() {
+    ctx.fillStyle = '#181818';
+    ctx.fillRect(BOARD_X, BOARD_Y, COLS * CELL, ROWS * CELL);
+    ctx.strokeStyle = '#4a4a4a';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(BOARD_X - 1, BOARD_Y - 1, COLS * CELL + 2, ROWS * CELL + 2);
+
+    ctx.strokeStyle = '#222';
+    ctx.lineWidth = 1;
+    for (let x = 1; x < COLS; x++) {
+      ctx.beginPath();
+      ctx.moveTo(BOARD_X + x * CELL + 0.5, BOARD_Y);
+      ctx.lineTo(BOARD_X + x * CELL + 0.5, BOARD_Y + ROWS * CELL);
+      ctx.stroke();
+    }
+    for (let y = 1; y < ROWS; y++) {
+      ctx.beginPath();
+      ctx.moveTo(BOARD_X, BOARD_Y + y * CELL + 0.5);
+      ctx.lineTo(BOARD_X + COLS * CELL, BOARD_Y + y * CELL + 0.5);
+      ctx.stroke();
+    }
+
+    for (let y = HIDDEN_ROWS; y < TOTAL_ROWS; y++) {
+      for (let x = 0; x < COLS; x++) {
+        const type = board[y][x];
+        if (!type) continue;
+        const flashing = state === STATES.LINE_CLEAR && clearingRows.includes(y) && Math.floor(performance.now() / 50) % 2 === 0;
+        if (flashing) drawCell(x, y, type, 0.25);
+        else drawCell(x, y, type);
+      }
+    }
+
+    if (active && state !== STATES.GAME_OVER && state !== STATES.TITLE) {
+      const gy = ghostY();
+      for (const c of cellsFor(active.type, active.rotation, active.x, gy)) drawCell(c.x, c.y, active.type, 0.5, true);
+      for (const c of cellsFor(active.type, active.rotation, active.x, active.y)) drawCell(c.x, c.y, active.type);
+    }
+  }
+
+  function drawPreview() {
+    ctx.fillStyle = '#181818';
+    ctx.fillRect(PREVIEW_X, PREVIEW_Y, PREVIEW_W, PREVIEW_H);
+    ctx.strokeStyle = '#4a4a4a';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(PREVIEW_X - 1, PREVIEW_Y - 1, PREVIEW_W + 2, PREVIEW_H + 2);
+
+    ctx.fillStyle = '#d0d0d0';
+    ctx.font = '18px monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText('NEXT', PREVIEW_X, PREVIEW_Y - 28);
+
+    if (!nextPiece) return;
+    const cells = PIECES[nextPiece][0];
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const [x, y] of cells) {
+      minX = Math.min(minX, x); minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
+    }
+    const width = (maxX - minX + 1) * CELL;
+    const height = (maxY - minY + 1) * CELL;
+    const ox = PREVIEW_X + (PREVIEW_W - width) / 2 - minX * CELL;
+    const oy = PREVIEW_Y + (PREVIEW_H - height) / 2 - minY * CELL;
+    for (const [x, y] of cells) {
+      const px = ox + x * CELL;
+      const py = oy + y * CELL;
+      ctx.fillStyle = COLORS[nextPiece];
+      ctx.fillRect(px + 2, py + 2, CELL - 4, CELL - 4);
+      ctx.fillStyle = blockShade(COLORS[nextPiece], 40);
+      ctx.fillRect(px + 2, py + 2, CELL - 4, 6);
+      ctx.fillStyle = blockShade(COLORS[nextPiece], -50);
+      ctx.fillRect(px + 2, py + CELL - 8, CELL - 4, 6);
+    }
+  }
+
+  function drawHUD() {
+    ctx.fillStyle = '#e0e0e0';
+    ctx.font = '18px monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+
+    const leftX = 64;
+    ctx.fillText('SCORE', leftX, 72);
+    ctx.font = 'bold 28px monospace';
+    ctx.fillText(String(score), leftX, 96);
+
+    ctx.font = '18px monospace';
+    ctx.fillText('BEST', leftX, 164);
+    ctx.font = 'bold 24px monospace';
+    ctx.fillText(String(best), leftX, 188);
+
+    ctx.font = '18px monospace';
+    ctx.fillText('LEVEL', PREVIEW_X, 220);
+    ctx.font = 'bold 28px monospace';
+    ctx.fillText(String(level), PREVIEW_X, 244);
+
+    ctx.font = '18px monospace';
+    ctx.fillText('LINES', PREVIEW_X, 298);
+    ctx.font = 'bold 28px monospace';
+    ctx.fillText(String(lines), PREVIEW_X, 322);
+
+    if (state === STATES.PLAYING || state === STATES.LINE_CLEAR || state === STATES.PAUSED) {
+      ctx.font = '14px monospace';
+      ctx.fillStyle = '#8c8c8c';
+      ctx.fillText('← → / A D  move', PREVIEW_X, 390);
+      ctx.fillText('↑ / W      rotate', PREVIEW_X, 414);
+      ctx.fillText('↓ / S      soft drop', PREVIEW_X, 438);
+      ctx.fillText('Space      hard drop', PREVIEW_X, 462);
+      ctx.fillText('P          pause', PREVIEW_X, 486);
+    }
+  }
+
+  function drawParticles() {
+    for (const p of particles) {
+      ctx.globalAlpha = Math.max(0, p.life / p.maxLife);
+      ctx.fillStyle = p.color;
+      ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawTitle() {
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 56px monospace';
+    ctx.fillText('TETRIS', WIDTH / 2, 120);
+    ctx.font = '20px monospace';
+    ctx.fillStyle = '#d5d5d5';
+    ctx.fillText('Pieces fall from the top of the well.', WIDTH / 2, 220);
+    ctx.fillText('Fill complete horizontal lines to clear them.', WIDTH / 2, 255);
+    ctx.fillText('Keep the stack from reaching the top.', WIDTH / 2, 290);
+    ctx.fillText('Move: ← → / A D   Rotate: ↑ / W   Soft: ↓ / S   Hard: Space', WIDTH / 2, 360);
+    ctx.fillText('Pause: P', WIDTH / 2, 392);
+    if (Math.floor(performance.now() / 450) % 2 === 0) {
+      ctx.font = '26px monospace';
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText('Press Enter to Start', WIDTH / 2, 475);
+    }
+  }
+
+  function drawOverlay(title, sub1, sub2 = '') {
+    ctx.fillStyle = 'rgba(0,0,0,0.62)';
+    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 42px monospace';
+    ctx.fillText(title, WIDTH / 2, HEIGHT / 2 - 42);
+    ctx.font = '22px monospace';
+    ctx.fillStyle = '#d8d8d8';
+    ctx.fillText(sub1, WIDTH / 2, HEIGHT / 2 + 6);
+    if (sub2) {
+      ctx.font = '18px monospace';
+      ctx.fillStyle = '#bcbcbc';
+      ctx.fillText(sub2, WIDTH / 2, HEIGHT / 2 + 44);
+    }
+  }
+
+  function render() {
+    ctx.fillStyle = flashTimer > 0 ? '#1b1b1b' : '#111111';
+    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+    drawBoard();
+    drawPreview();
+    drawHUD();
+    drawParticles();
+
+    if (state === STATES.TITLE) drawTitle();
+    else if (state === STATES.PAUSED) drawOverlay('PAUSED', 'Press P to Resume');
+    else if (state === STATES.GAME_OVER) drawOverlay('GAME OVER', `Score ${score}`, 'Press Enter to Restart');
+  }
+
+  function syncPrevKeys() {
+    const watched = ['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','KeyA','KeyD','KeyW','KeyS','Space','Enter','KeyP'];
+    for (const k of watched) prevKeys[k] = !!keys[k];
+  }
+
+  function frame(ts) {
+    if (!lastTime) lastTime = ts;
+    const dt = Math.min(DT_CAP, (ts - lastTime) / 1000);
+    lastTime = ts;
+
+    handleActions();
+    if (state !== STATES.PAUSED && state !== STATES.TITLE && state !== STATES.GAME_OVER) update(dt);
+    else updateParticles(dt);
+    render();
+    syncPrevKeys();
+    requestAnimationFrame(frame);
+  }
+
+  window.addEventListener('keydown', (e) => {
+    const handled = ['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','KeyA','KeyD','KeyW','KeyS','Space','Enter','KeyP'];
+    if (handled.includes(e.code)) e.preventDefault();
+    keys[e.code] = true;
+    ensureAudio();
+  }, { passive: false });
+
+  window.addEventListener('keyup', (e) => {
+    keys[e.code] = false;
+  });
+
+  window.addEventListener('blur', () => {
+    for (const k in keys) keys[k] = false;
+    if (state === STATES.PLAYING || state === STATES.LINE_CLEAR) state = STATES.PAUSED;
+  });
+
+  window.addEventListener('resize', resize);
+  resize();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
