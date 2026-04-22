@@ -1049,6 +1049,7 @@
       const res = await fetch('/api/data');
       if (!res.ok) throw new Error('Data fetch HTTP ' + res.status);
       state.data = await res.json();
+      hydrateLocalRatings();
       document.getElementById('lib-total').textContent = state.data.meta.total_builds;
       document.getElementById('tab-library-count').textContent = state.data.meta.total_builds;
       wireTabs();
@@ -1447,6 +1448,27 @@
     document.getElementById('r-delete')?.addEventListener('click', () => deleteRating());
   }
 
+  // On static hosting (Vercel/Pages), /api/rate does not exist. We detect this
+  // by caching the server's response to the first POST and falling back to
+  // localStorage for subsequent saves. Local ratings still appear in this
+  // browser, but they don't flow back to the canonical dataset.
+  const LOCAL_RATINGS_KEY = 'guide.local-ratings.v1';
+  const readLocalRatings = () => {
+    try { return JSON.parse(localStorage.getItem(LOCAL_RATINGS_KEY) || '{}'); }
+    catch { return {}; }
+  };
+  const writeLocalRatings = (data) => {
+    try { localStorage.setItem(LOCAL_RATINGS_KEY, JSON.stringify(data)); } catch {}
+  };
+  // Merge any saved local ratings onto the build list once data is loaded.
+  // Call from boot() after state.data is set, so local saves survive reloads.
+  function hydrateLocalRatings() {
+    const local = readLocalRatings();
+    state.data.builds.forEach(b => {
+      if (local[b.id]) { b.human_rating = local[b.id]; b.has_human_rating = true; }
+    });
+  }
+
   async function saveRating() {
     const b = state.currentBuild;
     if (!b) return;
@@ -1467,13 +1489,26 @@
       notes: document.querySelector('#m-rating .rate-notes').value.trim(),
       timestamp: new Date().toISOString(),
     };
-    const res = await fetch('/api/rate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    if (!res.ok) { alert('Save failed'); return; }
-    // Update local data and re-render
+
+    // Try the server first. On static hosting this 404/405s — fall back to localStorage.
+    let saved = false;
+    try {
+      const res = await fetch('/api/rate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      saved = res.ok;
+    } catch (_) { saved = false; }
+
+    if (!saved) {
+      // Static fallback — persist in browser only
+      const local = readLocalRatings();
+      local[b.id] = { ...payload };
+      delete local[b.id].game_id;
+      writeLocalRatings(local);
+    }
+
     delete payload.game_id;
     b.human_rating = payload;
     b.has_human_rating = true;
@@ -1484,12 +1519,24 @@
   async function deleteRating() {
     const b = state.currentBuild;
     if (!b || !confirm('Clear your rating for this game?')) return;
-    const res = await fetch('/api/delete', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ game_id: b.id }),
-    });
-    if (!res.ok) { alert('Delete failed'); return; }
+
+    let deleted = false;
+    try {
+      const res = await fetch('/api/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ game_id: b.id }),
+      });
+      deleted = res.ok;
+    } catch (_) { deleted = false; }
+
+    if (!deleted) {
+      // Static fallback
+      const local = readLocalRatings();
+      delete local[b.id];
+      writeLocalRatings(local);
+    }
+
     b.human_rating = null;
     b.has_human_rating = false;
     applyFilters();
